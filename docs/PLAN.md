@@ -117,8 +117,28 @@ Controls that decide whether results mean anything:
 
 ### Information ladder for data-analysis tasks (RQ4)
 
-| Rung | Model gets | Source of the extra info |
+Full definition and the Blackwell argument: [`LADDER.md`](LADDER.md). Every rung adds information
+the agent cannot compute from the tables (L1 < L2 < L3 < L4):
+
+| Rung | Model gets | Source |
 |---|---|---|
+| L1 | question + file names (the normal prompt) | dataset row |
+| L2 | + which files/columns/filters the computation uses | verified reference solution |
+| L3 | + method (e.g. "Pearson correlation after dropping nulls") | verified reference solution |
+| L4 | + full reference code, final print removed | verified reference solution |
+
+Exploration control, **not a rung**: L1+schema (L1 plus an auto-generated schema dump). It adds
+no information, so a fail at L1 that passes at L1+schema is a skill failure, not an information failure.
+
+- Metric per task and model: **lowest passing rung** (or "never"), from k samples per rung.
+  Headline numbers are aggregate pass-rate curves by rung.
+- Reference solutions: the SFT traces cover only `train`, so we generate one verified solution per
+  `test`/`eval` task (`smol_ladder/gen_solutions.py`, a headless `cmd` agent, re-run offline and graded).
+- DABstep has no public gold code, so only L1 and the L1+schema control there.
+- Hints must not leak the answer. Check with a script that the final value doesn't appear in any hint.
+- Cost: only climb on tasks that fail the rung below.
+
+---|---|---|
 | L1 | question + file names (the normal prompt) | as-is |
 | L2 | + schema / `df.head()` of the relevant files | generated automatically from the data |
 | L3 | + which files/columns/filters matter | extracted from verified solution code |
@@ -208,16 +228,17 @@ On Kaggle, add these as notebook **Secrets** (Add-ons → Secrets), never inline
 - [ ] Evaluate arm C on both benchmarks
 
 ### M6: Error analysis
-- [ ] Build ladder prompts L2–L4 for SmolDataEnvs `test` (L2 automatic; L3/L4 from verified sft code); leak check
+- [ ] Generate verified reference solutions for `test`/`eval` (running)
+- [ ] Build ladder prompts L2–L4 from them + the L1+schema control; leak check
 - [ ] Run the ladder for every arm, only on tasks failed at the rung below; record the lowest passing rung
-- [ ] DABstep: L1 vs L2 (schema) for every arm; the skill-vs-information split for the transfer question
+- [ ] DABstep: L1 vs L1+schema for every arm; the skill-vs-information split for the transfer question
 - [ ] Tool-call analysis: read/inspect calls per trace by arm and rung (does training or information replace exploration?)
 - [ ] Sample ~50 failures per arm per benchmark
 - [ ] Categories, e.g.: wrong column/file, bad join/filter, wrong aggregation, answer formatting, crashed code, gave up/ran out of turns, misread question
 - [ ] Table: failure categories × arm × benchmark
 
 ### M7: Post #2 + release
-- [ ] Write-up: RQ1–RQ4, results table, transfer chart, ladder chart (lowest passing rung per arm), error analysis, limitations
+- [ ] Write-up: RQ1–RQ4, results table, transfer chart, ladder chart (pass rate by rung per arm), error analysis, limitations
 - [ ] Cost accounting (free hours used + $ spent)
 - [ ] Release models, configs, cleaned dataset, harness
 

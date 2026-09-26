@@ -1,6 +1,6 @@
-from sdt.grade import grade
-from sdt.sandbox import run_script
-from sdt.tasks import input_dir, load_split
+from smol_ladder.grade import grade
+from smol_ladder.sandbox import run_script
+from smol_ladder.tasks import input_dir, load_split
 
 
 def test_grader_gold_and_wrong():

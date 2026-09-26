@@ -1452,7 +1452,7 @@ wheels = [
 ]
 
 [[package]]
-name = "smol-data-transfer"
+name = "smol-ladder"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

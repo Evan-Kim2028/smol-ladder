@@ -8,7 +8,7 @@ the agent claimed. Tasks with a result.json are skipped: the run is resumable.
 These solutions feed ladder hints only. Never train on them: they come from
 the held-out splits.
 
-    uv run python -m sdt.gen_solutions --split test --limit 5
+    uv run python -m smol_ladder.gen_solutions --split test --limit 5
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from sdt.grade import grade, last_line
-from sdt.sandbox import run_script
-from sdt.tasks import DATA, input_dir, load_split
+from smol_ladder.grade import grade, last_line
+from smol_ladder.sandbox import run_script
+from smol_ladder.tasks import DATA, input_dir, load_split
 
 MODEL = "stealth/space-bunny-alpha"
 # The agent's `python3` is this venv, which has pandas and friends.
