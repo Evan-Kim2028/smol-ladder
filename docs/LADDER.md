@@ -2,36 +2,51 @@
 
 ## What a rung is
 
-A task has a hidden variable: the intended computation θ, meaning which files, columns, filters
-and method turn the tables into the gold answer. Each rung Lk is a signal s_k about θ. The
-ladder is **Blackwell-ordered**: s_{k-1} is a function of s_k (a garbling). We get this by
-construction: prompt Lk contains prompt L(k-1) verbatim, plus new text. By Blackwell's theorem,
-a Bayes-optimal agent can do no worse at a higher rung on any task. An LLM is not Bayes-optimal,
-so a pass at Lk followed by a fail at L(k+1) is a **monotonicity violation**. We record it as a
-result and do not throw it away.
+A task has a gold answer y* and tables E, which sit in the sandbox at every rung. Each rung Lk is
+a signal s_k, so at rung k the agent sees (s_k, E). The ladder is **Blackwell-ordered** because
+prompt Lk contains prompt L(k-1) verbatim: (s_{k-1}, E) is a function of (s_k, E), a garbling.
+By Blackwell's theorem, a Bayes-optimal agent's **expected** payoff is then weakly higher at
+higher rungs, for every decision problem.
 
-Metric: the lowest rung at which the model first passes (or "never").
+Three things the theorem does not give us, and how the analysis handles each:
+
+1. **It is about expectations, not single tasks.** Even a Bayes-optimal agent can do worse on a
+   particular task at a higher rung. So monotonicity is a claim about **aggregate pass rates**.
+   A single task that passes at Lk and fails at L(k+1) is not a violation by itself. It becomes
+   evidence of one only when it happens systematically across tasks or samples.
+2. **It assumes a Bayes-optimal agent.** An LLM is not one. Drops in aggregate pass rate at a
+   higher rung are the real **monotonicity violations**. We report them as results.
+3. **It says nothing about costly information.** Blackwell compares what the agent knows, not
+   what it costs to find out. The next section is built on this gap.
+
+Metric: the lowest rung at which the model first passes (or "never"), computed from k samples
+per rung, never from a single greedy sample. The headline numbers are aggregate pass-rate
+curves by rung.
 
 ## Information vs. exploration
 
-In a coding task, the full description tells the agent things it cannot find in the repository.
-In a data task the tables sit in the sandbox. Anything the agent can compute from them (schema,
-dtypes, `head()`, value counts) is not new information about θ: an agent that explores learns
-it at L1. So a rung built only from the environment lowers **exploration cost**. It does not
-close an **information gap**. The ladder separates the two on purpose.
+L2 (schema, dtypes, sample rows) is a function of E. So (L2, E) is a function of (L1, E) and the
+reverse also holds: the two rungs are **Blackwell-equivalent**, not ordered. For a Bayes-optimal
+agent L2 is worth nothing. Any gain a real agent gets from L2 comes from reading E being costly
+(tool calls, a turn cap, limited context, mistakes along the way), not from new information.
+So L2 lowers **exploration cost**. It does not close an **information gap**. L3 and above are
+not functions of E: they carry information about which computation the question intends. The
+ladder separates the two on purpose.
+
+In Blackwell terms the ladder is L1 ≡ L2 < L3 < L4 < L5.
 
 | Rung | Adds | Source | Kind |
 |---|---|---|---|
 | L1 | question + file names (the normal prompt) | dataset row | baseline |
-| L2 | schema of the relevant files: columns, dtypes, 3 sample rows | computed from the tables | **environment-derivable (control)** |
-| L3 | which files and columns the computation uses, and which filters it applies | verified reference solution | information about θ |
-| L4 | the method, e.g. "count rows per value of X, take the mode" | verified reference solution | information about θ |
+| L2 | schema of the relevant files: columns, dtypes, 3 sample rows | computed from the tables | **Blackwell-equivalent to L1 (control)** |
+| L3 | which files and columns the computation uses, and which filters it applies | verified reference solution | information |
+| L4 | the method, e.g. "count rows per value of X, take the mode" | verified reference solution | information |
 | L5 | the full reference `solution.py` with its final print removed | verified reference solution | ceiling |
 
 How to read the first passing rung:
-- **L2** is a skill failure: the model could have learned this by looking at the data.
-- **L3/L4** is an information failure: the question underdetermines θ for this model, or the
-  model cannot turn the question into θ.
+- **L2** is a skill (exploration) failure: the model could have learned this from the data.
+- **L3/L4** is an information failure: the question underdetermines the intended computation
+  for this model, or the model cannot turn the question into it.
 - **L5** is an execution or format failure: the model had the program and still failed.
 - **Never passes, even at L5**: a harness bug or a broken task. Inspect by hand.
 
