@@ -52,15 +52,22 @@ API_RETRIES = 5
 LEAK_RE = re.compile(r"SmolDataEnvs|FineEnvs|huggingface\.co/datasets|hf_hub_download", re.I)
 
 
-def jail(work: Path) -> list[str]:
-    """Read-only host for the agent: it may write only its task folder and cmd's state dir.
+def jail(work: Path, inputs: Path) -> list[str]:
+    """Hide $HOME from the agent. It sees the toolchain and venv (read-only), its task's
+    tables (read-only), cmd's state dir, and its own task folder. Nothing else: not this
+    repo, not other tasks' solutions, not the HF cache that holds the gold answers.
     Network stays on because the model is remote."""
+    home = Path.home()
     tmp = work / ".tmp"
     tmp.mkdir(exist_ok=True)
-    state = Path.home() / ".commandcode"
-    return ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--bind", str(tmp), "/tmp", "--bind", str(state), str(state),
-            "--bind", str(work), str(work), "--chdir", str(work), "--die-with-parent"]
+    ro = [home / ".nvm", home / ".local", Path(sys.prefix), inputs]
+    args = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+            "--tmpfs", str(home), "--bind", str(tmp), "/tmp"]
+    for d in ro:
+        args += ["--ro-bind", str(d), str(d)]
+    args += ["--bind", str(home / ".commandcode"), str(home / ".commandcode"),
+             "--bind", str(work), str(work), "--chdir", str(work), "--die-with-parent"]
+    return args
 
 
 def solve(row: dict, split: str, model: str, timeout: int) -> dict:
@@ -71,7 +78,8 @@ def solve(row: dict, split: str, model: str, timeout: int) -> dict:
     if work.exists():
         shutil.rmtree(work)  # half-finished attempt from a crash
     work.mkdir(parents=True)
-    (work / "input").symlink_to(input_dir(row))
+    inputs = input_dir(row)
+    (work / "input").symlink_to(inputs)
 
     prompt = PROMPT.format(
         question=row["question"], files="\n".join(f"- {f}" for f in row["files"])
@@ -80,7 +88,7 @@ def solve(row: dict, split: str, model: str, timeout: int) -> dict:
     for attempt in range(API_RETRIES):
         try:
             p = subprocess.run(
-                jail(work) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
+                jail(work, inputs) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
                  "--no-session", "--max-turns", "40", "--output-format", "json"],
                 cwd=work, env=AGENT_ENV, capture_output=True, text=True, timeout=timeout,
             )
