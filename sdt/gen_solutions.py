@@ -49,6 +49,17 @@ Do not look the answer up online or in any dataset; compute it from the files.""
 LEAK_RE = re.compile(r"SmolDataEnvs|FineEnvs|huggingface\.co/datasets|hf_hub_download", re.I)
 
 
+def jail(work: Path) -> list[str]:
+    """Read-only host for the agent: it may write only its task folder and cmd's state dir.
+    Network stays on because the model is remote."""
+    tmp = work / ".tmp"
+    tmp.mkdir()
+    state = Path.home() / ".commandcode"
+    return ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+            "--bind", str(tmp), "/tmp", "--bind", str(state), str(state),
+            "--bind", str(work), str(work), "--chdir", str(work), "--die-with-parent"]
+
+
 def solve(row: dict, split: str, model: str, timeout: int) -> dict:
     work = DATA / "solutions" / split / row["task_id"]
     result_path = work / "result.json"
@@ -65,7 +76,7 @@ def solve(row: dict, split: str, model: str, timeout: int) -> dict:
     t0 = time.time()
     try:
         p = subprocess.run(
-            ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
+            jail(work) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
              "--no-session", "--max-turns", "40", "--output-format", "json"],
             cwd=work, env=AGENT_ENV, capture_output=True, text=True, timeout=timeout,
         )
