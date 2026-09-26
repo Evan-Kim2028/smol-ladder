@@ -30,7 +30,10 @@ from smol_ladder.tasks import DATA, input_dir, load_split
 
 MODEL = "stealth/space-bunny-alpha"
 # The agent's `python3` is this venv, which has pandas and friends.
-AGENT_ENV = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"}
+# One BLAS/OpenMP thread per agent: an unpinned sklearn fit took 23 of 32 cores.
+THREADS = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")}
+AGENT_ENV = {**os.environ, **THREADS, "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"}
 
 PROMPT = """You are solving a data-analysis question. The input tables are in ./input (read-only).
 
@@ -88,7 +91,7 @@ def solve(row: dict, split: str, model: str, timeout: int) -> dict:
     for attempt in range(API_RETRIES):
         try:
             p = subprocess.run(
-                jail(work, inputs) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
+                ["nice", "-n", "15"] + jail(work, inputs) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
                  "--no-session", "--max-turns", "40", "--output-format", "json"],
                 cwd=work, env=AGENT_ENV, capture_output=True, text=True, timeout=timeout,
             )

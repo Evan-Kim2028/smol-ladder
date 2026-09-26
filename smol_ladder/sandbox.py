@@ -19,7 +19,7 @@ class Run:
 def run_script(script: Path, inputs: Path, timeout: int = 120) -> Run:
     work = script.parent.resolve()
     cmd = [
-        "bwrap",
+        "nice", "-n", "15", "bwrap",
         "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--proc", "/proc",
@@ -31,6 +31,9 @@ def run_script(script: Path, inputs: Path, timeout: int = 120) -> Run:
         "--unshare-pid",
         "--die-with-parent",
         "--setenv", "MPLBACKEND", "Agg",
+        "--setenv", "OMP_NUM_THREADS", "1",
+        "--setenv", "OPENBLAS_NUM_THREADS", "1",
+        "--setenv", "MKL_NUM_THREADS", "1",
         sys.executable, script.name,
     ]
     try:
