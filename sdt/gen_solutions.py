@@ -21,7 +21,7 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from sdt.grade import grade, last_line
@@ -46,6 +46,9 @@ a short label, yes/no, or a comma-separated list. Run `python3 solution.py` to c
 Do not look the answer up online or in any dataset; compute it from the files."""
 
 # Signs the agent went looking for the gold answer instead of computing it.
+API_DOWN = "Unable to connect to the API"
+API_RETRIES = 5
+
 LEAK_RE = re.compile(r"SmolDataEnvs|FineEnvs|huggingface\.co/datasets|hf_hub_download", re.I)
 
 
@@ -53,7 +56,7 @@ def jail(work: Path) -> list[str]:
     """Read-only host for the agent: it may write only its task folder and cmd's state dir.
     Network stays on because the model is remote."""
     tmp = work / ".tmp"
-    tmp.mkdir()
+    tmp.mkdir(exist_ok=True)
     state = Path.home() / ".commandcode"
     return ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--bind", str(tmp), "/tmp", "--bind", str(state), str(state),
@@ -74,16 +77,23 @@ def solve(row: dict, split: str, model: str, timeout: int) -> dict:
         question=row["question"], files="\n".join(f"- {f}" for f in row["files"])
     )
     t0 = time.time()
-    try:
-        p = subprocess.run(
-            jail(work) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
-             "--no-session", "--max-turns", "40", "--output-format", "json"],
-            cwd=work, env=AGENT_ENV, capture_output=True, text=True, timeout=timeout,
-        )
-        transcript, agent_status = p.stdout, f"exit {p.returncode}"
-    except subprocess.TimeoutExpired as e:
-        transcript = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout or ""
-        agent_status = "timeout"
+    for attempt in range(API_RETRIES):
+        try:
+            p = subprocess.run(
+                jail(work) + ["cmd", "-p", prompt, "-m", model, "--yolo", "-t", "--skip-onboarding",
+                 "--no-session", "--max-turns", "40", "--output-format", "json"],
+                cwd=work, env=AGENT_ENV, capture_output=True, text=True, timeout=timeout,
+            )
+            transcript, agent_status = p.stdout, f"exit {p.returncode}"
+        except subprocess.TimeoutExpired as e:
+            transcript = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout or ""
+            agent_status = "timeout"
+        if API_DOWN not in transcript:
+            break
+        # The endpoint refused us; that says nothing about the task. Back off and retry.
+        time.sleep(30 * 2**attempt)
+    else:
+        raise RuntimeError(f"{row['task_id']}: API unreachable after {API_RETRIES} attempts")
     (work / "transcript.jsonl").write_text(transcript)
 
     result = {
@@ -119,8 +129,14 @@ def main() -> None:
     rows = load_split(args.split)[: args.limit]
     done = passed = 0
     with ThreadPoolExecutor(args.workers) as pool:
-        for r in pool.map(lambda row: solve(row, args.split, args.model, args.timeout), rows):
+        futures = [pool.submit(solve, row, args.split, args.model, args.timeout) for row in rows]
+        for f in as_completed(futures):
             done += 1
+            try:
+                r = f.result()
+            except RuntimeError as e:  # no result.json written; the next run retries it
+                print(f"[{done}/{len(rows)}] SKIPPED {e}", flush=True)
+                continue
             passed += r["reward"] >= 1.0
             flag = " LOOKUP?" if r["suspected_lookup"] else ""
             print(f"[{done}/{len(rows)}] {r['task_id']} reward={r['reward']} "
