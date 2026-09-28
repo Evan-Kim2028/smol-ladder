@@ -18,6 +18,7 @@ import json
 import re
 import shutil
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -33,7 +34,15 @@ MODEL = "stealth/space-bunny-alpha"
 # One BLAS/OpenMP thread per agent: an unpinned sklearn fit took 23 of 32 cores.
 THREADS = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")}
-AGENT_ENV = {**os.environ, **THREADS, "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"}
+# Built from a whitelist, not inherited. Passing os.environ through handed the agent 10
+# API keys (OPENROUTER, HF, EXA, ...), which it could read and exfiltrate over the open
+# network. Only the interpreter path and the thread caps are needed.
+AGENT_ENV = {
+    "PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
+    "HOME": str(Path.home()),
+    "LANG": "C.UTF-8",
+    **THREADS,
+}
 
 PROMPT = """You are solving a data-analysis question. The input tables are in ./input (read-only).
 
@@ -64,7 +73,10 @@ def jail(work: Path, inputs: Path) -> list[str]:
     tmp = work / ".tmp"
     tmp.mkdir(exist_ok=True)
     ro = [home / ".nvm", home / ".local", Path(sys.prefix), inputs]
-    args = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+    # --unshare-pid: the agent's python children must not outlive the trial. Without a PID
+    # namespace a timed-out run leaves grandchildren in our namespace still burning cores
+    # (one leaked sklearn fit held 18 of 32 cores for 23 min).
+    args = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-pid",
             "--tmpfs", str(home), "--bind", str(tmp), "/tmp"]
     for d in ro:
         args += ["--ro-bind", str(d), str(d)]
@@ -128,6 +140,35 @@ def solve(row: dict, split: str, model: str, timeout: int) -> dict:
     return result
 
 
+def reap_orphans() -> int:
+    """Kill stragglers of *this* run: processes whose cwd is inside data/solutions.
+
+    The jail now unshares PIDs, but a subprocess that escaped an older run would otherwise
+    keep burning cores indefinitely. Scoped to our own work tree, so other sessions'
+    processes are never touched.
+    """
+    mine = str(DATA / "solutions")
+    me = os.getpid()
+    killed = 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        try:
+            cwd = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        if cwd.startswith(mine):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except OSError:
+                pass
+    return killed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test", choices=["test", "eval", "train"])
@@ -152,6 +193,10 @@ def main() -> None:
             flag = " LOOKUP?" if r["suspected_lookup"] else ""
             print(f"[{done}/{len(rows)}] {r['task_id']} reward={r['reward']} "
                   f"pred={r['prediction'][:40]!r} {r['verify']}{flag}  pass={passed}", flush=True)
+            if done % 25 == 0:
+                stale = reap_orphans()
+                if stale:
+                    print(f"[reaped {stale} stray process(es) from earlier runs]", flush=True)
 
 
 if __name__ == "__main__":
