@@ -63,8 +63,13 @@ def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
     # interpreter prefix and its lib directory back, or the stdlib (encodings, and the
     # site-packages holding pandas) is not importable.
     interpreter = Path(sys.executable).resolve()
+    # inputs is a directory of symlinks into the Kaggle cache, so bind its target too:
+    # bwrap follows neither symlinks nor paths through them on the host side.
     ro = {venv, inputs, package, interpreter.parent, interpreter.parent.parent,
           Path(sys.prefix), Path(sys.base_prefix), Path(sys.base_prefix) / "lib"}
+    for link in sorted(inputs.glob("*")):
+        if link.is_symlink():
+            ro.add(link.resolve().parent)
     # Order matters: the catch-all read-only bind of / must come first, or it shadows the
     # /dev and /proc mounts below and CPython cannot read urandom to seed its hash randomiser.
     args = ["bwrap", "--ro-bind", "/", "/", "--tmpfs", str(Path.home())]
@@ -90,7 +95,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         if prior.get("agent_status") == "exit 0" or not retry_failed:
             return prior
     work.mkdir(parents=True, exist_ok=True)
-    inputs = inputs_of(row)
+    inputs = inputs_of(row)  # fetched here, not inside the jail: kagglehub needs $HOME
     inp = work / "input"
     if not inp.exists():
         inp.symlink_to(inputs.resolve())

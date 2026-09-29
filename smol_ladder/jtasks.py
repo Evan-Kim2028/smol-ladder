@@ -148,11 +148,15 @@ def load_rows(path: Path | str | None = None) -> list[dict]:
 
 
 def input_dir(row: dict) -> Path:
-    """The task's tables, fetched from Kaggle and cached under data/kaggle.
+    """The task's tables, fetched from Kaggle and cached.
 
-    One directory per Kaggle dataset, since many questions share a dataset. Returns a
-    directory holding only the files the task names, so a task never sees columns it was not
-    asked about.
+    Cached outside $HOME. The trial jail mounts a tmpfs over the home directory, so anything
+    under it disappears inside the sandbox: a cache there downloads successfully and then
+    presents the agent with an empty ./input. Symlinks are resolved and bound directly, so the
+    files are reachable wherever they live.
+
+    One directory per task, holding only the files that task names, so a question never sees
+    columns it was not asked about.
     """
     import os
 
@@ -161,15 +165,15 @@ def input_dir(row: dict) -> Path:
     dataset = row.get("kaggle_dataset_name")
     if not dataset:
         raise ValueError(f"{row['task_id']}: no kaggle_dataset_name")
-    cache = DATA / "kaggle"
+    cache = Path(os.environ.get("SMOL_LADDER_CACHE", "/var/tmp/smol-ladder")) / "kaggle"
     cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("KAGGLEHUB_CACHE", str(cache))
-    root = Path(kagglehub.dataset_download(dataset))
     dest = cache / "tasks" / row["task_id"]
     if not dest.exists():
+        root = Path(kagglehub.dataset_download(dataset))
         dest.mkdir(parents=True)
         for name in row["files"]:
-            matches = [p for p in root.rglob(Path(name).name)]
+            matches = list(root.rglob(Path(name).name))
             if not matches:
                 raise FileNotFoundError(f"{row['task_id']}: {name} not in {dataset}")
             (dest / name).symlink_to(matches[0].resolve())
