@@ -39,22 +39,6 @@ SOURCE = (
 RUNGS = ["L1", "L1+schema", "L2", "L3", "L4"]
 
 
-@pytest.fixture
-def row(tmp_path, monkeypatch):
-    """A task row with a real table on disk and a verified reference, so all five rungs build.
-
-    prompt_for reaches the filesystem for two things: the schema control reads the tables, and
-    the reference comes from read_source. Both are stubbed here so the test is about the
-    ladder's shape, not about the Hub.
-    """
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "t.csv").write_text("flag,col_a\n1,3.0\n1,4.0\n0,9.0\n")
-    monkeypatch.setattr(L, "inputs_of", lambda split: (lambda _r: src))
-    monkeypatch.setattr(L, "read_source", lambda row, split: SOURCE)
-    return dict(ROW)
-
-
 def test_every_rung_is_reachable():
     missing = [r for r in RUNGS if r not in L.RUNGS and r != "L1+schema"]
     assert not missing, f"undeclared rungs: {missing}"

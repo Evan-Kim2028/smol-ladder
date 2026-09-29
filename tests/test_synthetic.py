@@ -5,18 +5,6 @@ from smol_ladder.synthetic import (Spec, _fmt, _tolerance, _unique_max, build_ta
                                    leaks, usable_columns, verify)
 
 
-@pytest.fixture
-def frame():
-    # team counts are deliberately unequal: a tied mode is rejected by design, so a fixture
-    # with a tie would make every mode task unverifiable.
-    return pd.DataFrame({
-        "score": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0] * 3,
-        "team": ["a", "b", "a", "b", "a", "b", "c", "c", "c", "c"] * 3,
-        " id": range(30),
-        "#": range(30),
-    })
-
-
 def test_columns_are_split_into_measures_and_keys(frame):
     numeric, categorical = usable_columns(frame)
     assert [n for _, n in numeric] == ["score"]

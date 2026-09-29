@@ -273,8 +273,29 @@ def method_hint(source: str) -> str:
     return ", ".join(sorted(set(top)))
 
 
+def input_files(row: dict, split: str) -> list[str]:
+    """What is actually in ./input, read from the directory rather than the dataset row.
+
+    The dataset row lists the files *the original notebook used*, which is not the same set as
+    the bucket's contents: 56% of synthetic and 28% of SmolDataEnvs tasks had L1 announce one
+    file while `ls ./input` showed several. A prompt that misdescribes the environment is not a
+    rung, it is a confound that every higher rung inherits — and naming a subset of the files is
+    itself a hint about which table the question is about, which is information the schema
+    control exists to isolate.
+
+    Falls back to the row's own list if the directory cannot be read, so a prompt is always
+    buildable.
+    """
+    try:
+        listing = sorted(p.name for p in inputs_of(split)(row).iterdir()
+                         if not p.name.startswith("."))
+    except Exception:
+        listing = []
+    return listing or sorted(row["files"])
+
+
 def prompt_for(row: dict, split: str, rung: str) -> str:
-    files = "\n".join(f"- {f}" for f in row["files"])
+    files = "\n".join(f"- {f}" for f in input_files(row, split))
     base = PROMPT.format(question=row["question"], files=files)
     if rung == "L1":
         return base

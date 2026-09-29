@@ -41,6 +41,35 @@ prompt Lk contains prompt L(k-1) verbatim: (s_{k-1}, E) is a function of (s_k, E
 By Blackwell's theorem, a Bayes-optimal agent's **expected** payoff is then weakly higher at
 higher rungs, for every decision problem.
 
+### Two requirements the ordering actually depends on
+
+The post states the ladder as *"each level contains everything in the one below"* and *"holds
+the task fixed and changes only what the solver sees."* Both are load-bearing, and we violated
+both before `tests/test_blackwell.py` existed to check them.
+
+1. **Garbling, not adjacency.** L1 must be recoverable from every L(k) by dropping the added
+   block. Our L4 did not contain L3 — it replaced L3's block instead of appending — so L4 was a
+   sibling of L3 and "the lowest rung that passes" stopped meaning "the least information that
+   sufficed". Now a test asserts `L(k).startswith(L(k-1))` for every pair, and that L(k) adds a
+   *suffix*.
+
+2. **The task includes the environment.** L1 listed the dataset row's `files`, which is what the
+   original notebook happened to use, not what is in `./input`. On 56% of synthetic and 28% of
+   SmolDataEnvs tasks L1 announced one file while `ls ./input` showed several. That is a prompt
+   asserting something false about the solver's own environment, and every rung inherits it. It
+   is also not neutral: naming a *subset* of the files is a hint about which table the question
+   is about, which is exactly the information the schema control exists to isolate. L1 now reads
+   the directory and lists what is actually there.
+
+   This also fixes a labeling lie. L2's block is "Files read / Columns used / Filters applied",
+   but L1 already gave the file names, so L2 added only columns and filters. The rungs were not
+   a partition of increasing information. L2 is now honestly the first rung that says anything
+   about *the computation*.
+
+A third requirement, from the same post and inherited from its Go ladder: the rungs of one task
+nest by design, so a train/eval split must keep all of a task's rungs on one side. We never
+train on these, but any future use of the ladder as a curriculum inherits the constraint.
+
 Three things the theorem does not give us, and how the analysis handles each:
 
 1. **It is about expectations, not single tasks.** Even a Bayes-optimal agent can do worse on a
