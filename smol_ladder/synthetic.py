@@ -325,9 +325,15 @@ def main() -> None:
     tables = iter_tables(args.max_tables)
     print(f"{len(tables)} readable tables")
     out: list[Spec] = []
-    stats = {"no fair task": 0, "failed verification": 0, "answer leaked": 0, "kept": 0}
+    used: set[str] = set()
+    stats = {"no fair task": 0, "failed verification": 0, "answer leaked": 0,
+             "duplicate id": 0, "kept": 0}
     for path, df in tables:
-        stem = re.sub(r"[^A-Za-z0-9]+", "_", Path(path).parent.name or Path(path).stem)[:48]
+        # The id must key on the *file*, not its parent directory. SmolDataEnvs keeps several
+        # tables under one bucket_prefix, so keying on the parent gave four different CSVs the
+        # same id and 275 tasks collapsed to 201.
+        stem = re.sub(r"[^A-Za-z0-9]+", "_",
+                      Path(path).stem or Path(path).parent.name)[:40]
         for index in range(args.limit):
             spec = build_task(df, path, stem, index)
             if spec is None:
@@ -339,6 +345,10 @@ def main() -> None:
             if not verify(spec, df):
                 stats["failed verification"] += 1
                 continue
+            if spec.task_id in used:
+                stats["duplicate id"] += 1
+                continue
+            used.add(spec.task_id)
             stats["kept"] += 1
             out.append(spec)
 

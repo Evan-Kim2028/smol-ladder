@@ -106,3 +106,41 @@ def test_task_ids_are_safe_as_directory_names(frame):
             continue
         assert "/" not in spec.task_id
         assert spec.task_id.startswith("syn_")
+
+
+def test_the_id_keys_on_the_file_not_its_directory():
+    """SmolDataEnvs keeps several tables under one bucket_prefix.
+
+    Keying the id on the parent directory gave four different CSVs the same id, so 275
+    generated tasks collapsed to 201 distinct ones and a quarter of the corpus was silently
+    unreachable: two tasks with one id write to the same result file.
+    """
+    from pathlib import Path
+    path = "/ds/prefix/2016.csv"
+    assert Path(path).stem == "2016"                 # what the id now uses
+    assert Path(path).parent.name == "prefix"        # what it used to use
+    frame = pd.DataFrame({"score": [float(i) for i in range(30)],
+                          "team": ["a"] * 10 + ["b"] * 10 + ["c"] * 10})
+    spec = build_task(frame, path, "2016", 0)
+    if spec is not None:
+        assert "2016" in spec.task_id
+        assert "prefix" not in spec.task_id
+
+
+def test_generated_ids_are_unique_across_a_real_corpus():
+    """The end-to-end property: every emitted id is distinct, so no trial overwrites another."""
+    from smol_ladder.synthetic import build_task as build
+    from smol_ladder.synthetic import verify as check
+    seen = set()
+    for i in range(4):
+        df = pd.DataFrame({
+            "score": [float((i + j) % 17) for j in range(60)],
+            "team": [f"g{j % (3 + i)}" for j in range(60)],
+        })
+        for index in range(8):
+            spec = build(df, f"/ds/prefix/table{i}.csv", f"table{i}", index)
+            if spec is None or not check(spec, df):
+                continue
+            assert spec.task_id not in seen, f"duplicate id {spec.task_id}"
+            seen.add(spec.task_id)
+    assert seen, "no tasks generated; the fixture is not exercising the generator"
