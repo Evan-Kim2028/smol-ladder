@@ -117,19 +117,38 @@ def call_model(messages: list[dict], model: str, tools: list[dict]) -> dict:
 def run_command(command: str, timeout: int = 150, cwd: str | None = None) -> str:
     """Run a shell command for the agent, never raising.
 
-    A command that exceeds its timeout, or emits bytes that are not valid UTF-8, used to
-    propagate out of the model loop and kill the whole trial. Both are ordinary things for an
-    agent to do, so the model is told what happened and gets to continue.
+    Two things an agent does routinely used to hang the whole trial:
+
+    - a command that outruns its timeout, and
+    - a command that spawns workers of its own (joblib, multiprocessing) which keep the
+      captured pipes open after the parent exits, so a plain communicate() waits on children
+      the model never asked for. One trial sat on joblib for 16 minutes.
+
+    So: own process group, real deadline, kill the group, then drain whatever was written.
     """
+    import os
+    import signal
     import subprocess
+    proc = subprocess.Popen(["bash", "-c", command], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=cwd, start_new_session=True)
     try:
-        p = subprocess.run(["bash", "-c", command], capture_output=True, timeout=timeout,
-                           cwd=cwd)
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return f"[timed out after {timeout}s]"
-    out = p.stdout.decode("utf-8", "replace")
-    err = p.stderr.decode("utf-8", "replace")
-    text = out + ("\n--- stderr ---\n" + err if err else "")
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (ProcessLookupError, PermissionError):
+                break
+            try:
+                proc.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        out, err = proc.communicate()
+        tail = (out or b"").decode("utf-8", "replace")[-2000:]
+        return f"[timed out after {timeout}s]" + (f"\n{tail}" if tail else "")
+    text = out.decode("utf-8", "replace") + \
+        ("\n--- stderr ---\n" + err.decode("utf-8", "replace") if err else "")
     return text[-20_000:]
 
 

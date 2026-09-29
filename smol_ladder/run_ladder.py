@@ -26,6 +26,10 @@ from smol_ladder.ladder import prompt_for, read_source
 from smol_ladder.tasks import DATA, input_dir, load_split
 
 JAIL_RO = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"]
+# A trial is one model loop of at most 40 turns, each shell command capped at 150s. 20 minutes
+# is generous for that; the old 45-minute cap let one stuck trial hold a worker for three
+# quarters of an hour, and with sixteen workers the sweep crawled.
+AGENT_TIMEOUT = 1200
 
 
 def source_for(split: str):
@@ -82,6 +86,39 @@ def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
     return args
 
 
+def _run_jailed(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.CompletedProcess:
+    """Run a jailed command with a real deadline.
+
+    subprocess.run's own timeout is not enough here: on expiry it kills only the direct child,
+    but bwrap's grandchildren still hold the captured pipes open, so the read blocks and the
+    worker never returns. Six trials sat that way for 14 minutes. Popen with a manual wait
+    lets us kill the whole process group and drain what was written.
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        out, err = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
          retry_failed: bool = False, inputs_of=input_dir) -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
@@ -105,6 +142,11 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         "LANG": "C.UTF-8",
         "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
         "NUMEXPR_NUM_THREADS": "1", "VECLIB_MAXIMUM_THREADS": "1",
+        # joblib and multiprocessing ignore the BLAS caps and will happily take every core
+        # (n_jobs=-1). One run had joblib holding 21 of 32 for 16 minutes, which starved the
+        # other fifteen workers. Cap the process pool and default n_jobs to that same ceiling.
+        "LOKY_MAX_CPU_COUNT": "2", "JOBLIB_START_METHOD": "loky",
+        "MKL_DYNAMIC": "FALSE", "NUMEXPR_MAX_THREADS": "1",
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
     }
     script = (
@@ -118,14 +160,16 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     )
     t0 = time.time()
     try:
-        proc = subprocess.run(
+        proc = _run_jailed(
             jail(work, inputs, venv) + [sys.executable, "-c", script, prompt],
-            cwd=work, env=env, capture_output=True, timeout=max_turns * 60 + 300)
+            work, env, timeout=AGENT_TIMEOUT)
         agent_status = f"exit {proc.returncode}"
         stderr = proc.stderr.decode("utf-8", "replace")[-2000:] \
             if isinstance(proc.stderr, bytes) else (proc.stderr or "")[-2000:]
     except subprocess.TimeoutExpired:
         agent_status, stderr = "timeout", ""
+    except Exception as e:  # noqa: BLE001 - one bad trial must not kill the sweep
+        agent_status, stderr = f"error: {type(e).__name__}", str(e)[-2000:]
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
               "agent_seconds": round(time.time() - t0, 1), "prediction": "", "reward": 0.0}
     solution = work / "solution.py"
@@ -137,7 +181,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         # A verification run that hangs is a failed trial, not a crashed harness: the agent
         # wrote a program that never terminates offline. Catch it or the whole run dies.
         try:
-            run = subprocess.run(
+            run = _run_jailed(
                 ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
                  "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
                  "--bind", str(verify), "/tmp/work",
@@ -145,7 +189,9 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
                  "--chdir", "/tmp/work", "--die-with-parent",
                  "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
                  sys.executable, "solution.py"],
-                capture_output=True, timeout=180)
+                verify, {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+                         "HOME": str(verify), "LANG": "C.UTF-8",
+                         "OMP_NUM_THREADS": "1", "MPLBACKEND": "Agg"}, 180)
             out = run.stdout.decode("utf-8", "replace") if isinstance(run.stdout, bytes) \
                 else (run.stdout or "")
         except subprocess.TimeoutExpired:
