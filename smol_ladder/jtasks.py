@@ -95,18 +95,42 @@ def grade_params(mode: str, value: str) -> tuple[float, float]:
 
 
 def load_shard(index: int) -> list[dict]:
+    """Rows from a shard, preferring the local copy so a sweep never re-fetches from the Hub."""
+    from smol_ladder.fetch_shards import read_shard, shard_path
+
+    if shard_path(index).exists():
+        return read_shard(index)
     path = hf_hub_download(DATASET, f"data/non_thinking-{index:05d}-of-{SHARDS:05d}.parquet",
                            repo_type="dataset")
     import pyarrow.parquet as pq
     return pq.ParquetFile(path).read(columns=COLUMNS).to_pylist()
 
 
-def collect(shards: int, limit: int | None) -> list[dict]:
+def smoldataenvs_datasets() -> set[str]:
+    """Kaggle dataset slugs SmolDataEnvs already uses, so we can exclude them by construction."""
+    from smol_ladder.tasks import load_split
+    return {r.get("kaggle_dataset") for r in load_split("test") if r.get("kaggle_dataset")}
+
+
+def collect(shards: int, limit: int | None, exclude_overlap: bool = True) -> tuple[list[dict], Counter]:
+    """Build tasks from the first `shards` local shards.
+
+    Overlap with SmolDataEnvs is excluded explicitly rather than assumed. The two datasets are
+    separate releases and share no task ids, but both are built from public Kaggle datasets, so
+    "non-overlapping" has to mean "not the same underlying table" — otherwise a jupyter-agent
+    task could ask about a table a SmolDataEnvs rung already described, and the two curves would
+    not be independent. Checked on kaggle_dataset slug.
+    """
     out, stats = [], Counter()
+    seen_ids: set[str] = set()
+    banned = smoldataenvs_datasets() if exclude_overlap else set()
     for index in range(shards):
         for row in load_shard(index):
             if row.get("executor_type") != "e2b":
                 stats["not e2b"] += 1
+                continue
+            if row.get("kaggle_dataset_name") in banned:
+                stats["overlaps SmolDataEnvs"] += 1
                 continue
             files = row.get("files_used") or []
             if not files:
@@ -121,6 +145,10 @@ def collect(shards: int, limit: int | None) -> list[dict]:
             # The raw id contains slashes ("0016/712/16712977.ipynb_qa_5"), which would turn
             # one task into a directory tree under data/runs.
             slug = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{row['id']}")
+            if slug in seen_ids:
+                stats["duplicate id"] += 1
+                continue
+            seen_ids.add(slug)
             out.append({
                 "task_id": f"ja_{slug}",
                 "question": (row.get("question") or "").strip(),
@@ -204,9 +232,11 @@ def main() -> None:
     ap.add_argument("--shards", type=int, default=8)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--out", default=str(DATA / "jtasks.jsonl"))
+    ap.add_argument("--allow-overlap", action="store_true",
+                    help="keep rows whose Kaggle dataset SmolDataEnvs also uses")
     args = ap.parse_args()
 
-    rows, stats = collect(args.shards, args.limit)
+    rows, stats = collect(args.shards, args.limit, not args.allow_overlap)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w") as fh:
