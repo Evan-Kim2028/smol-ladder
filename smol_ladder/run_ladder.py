@@ -28,6 +28,21 @@ from smol_ladder.tasks import DATA, input_dir, load_split
 JAIL_RO = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"]
 
 
+def source_for(split: str):
+    """Task rows and their input directories, for either benchmark.
+
+    SmolDataEnvs rows come from the Hub; jupyter-agent rows come from the local extract, and
+    their tables from Kaggle. Everything downstream only needs load_split's shape, so the two
+    sources are interchangeable here.
+    """
+    if split == "jupyter-agent":
+        from smol_ladder.jtasks import input_dir as ja_input_dir
+        from smol_ladder.jtasks import load_rows
+
+        return load_rows(), ja_input_dir
+    return load_split(split), input_dir
+
+
 def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
     """The task's tables, the toolchain, and the solver package. Nothing else.
 
@@ -63,7 +78,7 @@ def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
 
 
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
-         retry_failed: bool = False) -> dict:
+         retry_failed: bool = False, inputs_of=input_dir) -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
@@ -75,9 +90,10 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         if prior.get("agent_status") == "exit 0" or not retry_failed:
             return prior
     work.mkdir(parents=True, exist_ok=True)
+    inputs = inputs_of(row)
     inp = work / "input"
     if not inp.exists():
-        inp.symlink_to(input_dir(row).resolve())
+        inp.symlink_to(inputs.resolve())
     env = {
         "PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
         "HOME": str(work),
@@ -98,7 +114,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     t0 = time.time()
     try:
         proc = subprocess.run(
-            jail(work, input_dir(row), venv) + [sys.executable, "-c", script, prompt],
+            jail(work, inputs, venv) + [sys.executable, "-c", script, prompt],
             cwd=work, env=env, capture_output=True, timeout=max_turns * 60 + 300)
         agent_status = f"exit {proc.returncode}"
         stderr = proc.stderr.decode("utf-8", "replace")[-2000:] \
@@ -138,7 +154,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
 
 
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
-                max_turns: int, retry_failed: bool = False) -> list[dict]:
+                max_turns: int, retry_failed: bool = False, inputs_of=input_dir) -> list[dict]:
     """Climb the ladder for one task: stop at the first rung that passes.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
@@ -154,7 +170,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
             continue
         work = DATA / "runs" / split / row["task_id"] / rung.replace("+", "_")
         r = once(row, prompt_for(row, split, prompt_rung), work, venv, model, max_turns,
-                 retry_failed)
+                 retry_failed, inputs_of)
         r["rung"] = prompt_rung
         (work / "result.json").write_text(json.dumps(r, indent=1))
         out.append(r)
@@ -165,7 +181,8 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="test", choices=["test", "eval", "train"])
+    ap.add_argument("--split", default="test",
+                    choices=["test", "eval", "train", "jupyter-agent"])
     ap.add_argument("--rungs", default="L1", help="comma-separated, e.g. L1,L1+schema,L2,L3,L4")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--workers", type=int, default=20)
@@ -175,14 +192,15 @@ def main() -> None:
                     help="re-run trials whose agent crashed; a clean pass is never re-rolled")
     args = ap.parse_args()
 
-    rows = load_split(args.split)[: args.limit]
+    rows, inputs_of = source_for(args.split)
+    rows = rows[: args.limit]
     rungs = args.rungs.split(",")
     venv = Path(sys.prefix)
     (DATA / "runs" / args.split).mkdir(parents=True, exist_ok=True)
     done = 0
     with ThreadPoolExecutor(args.workers) as pool:
         futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
-                               args.max_turns, args.retry_failed) for row in rows]
+                               args.max_turns, args.retry_failed, inputs_of) for row in rows]
         for f in as_completed(futures):
             done += 1
             for r in f.result():

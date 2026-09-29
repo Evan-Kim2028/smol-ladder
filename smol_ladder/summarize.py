@@ -33,10 +33,15 @@ def collect(split: str) -> dict[str, dict[str, dict]]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="test", choices=["test", "eval", "train"])
+    ap.add_argument("--split", default="test",
+                    choices=["test", "eval", "train", "jupyter-agent"])
     args = ap.parse_args()
 
-    rows = {r["task_id"]: r for r in load_split(args.split)}
+    if args.split == "jupyter-agent":
+        from smol_ladder.jtasks import load_rows
+        rows = {r["task_id"]: r for r in load_rows()}
+    else:
+        rows = {r["task_id"]: r for r in load_split(args.split)}
     runs = collect(args.split)
     total = len(rows)
     n_ref = sum(read_source(r, args.split) is not None for r in rows.values())

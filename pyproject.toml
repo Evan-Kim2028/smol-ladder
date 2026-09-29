@@ -4,8 +4,18 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
   "huggingface_hub>=1.0",
-  "pandas", "pyarrow", "numpy", "scipy", "scikit-learn", "statsmodels",
-  "matplotlib", "seaborn", "tabulate", "math-verify", "openpyxl",
+  "pandas",
+  "pyarrow",
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "statsmodels",
+  "matplotlib",
+  "seaborn",
+  "tabulate",
+  "math-verify",
+  "openpyxl",
+  "kagglehub>=1.0.2",
 ]
 
 [tool.pytest.ini_options]
