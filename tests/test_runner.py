@@ -67,3 +67,30 @@ def test_agent_command_reports_a_timeout_instead_of_raising():
     from smol_ladder.or_agent import run_command
     out = run_command("sleep 300", timeout=3)
     assert "timed out" in out
+
+
+def test_the_control_runs_without_a_reference(monkeypatch, tmp_path):
+    """The L1+schema control is built from the tables alone.
+
+    Gating it on a verified reference would discard the L1-vs-control comparison on exactly
+    the tasks whose reference we failed to build, which is most of the interesting failures.
+    """
+    import smol_ladder.run_ladder as runner
+
+    ran: list[str] = []
+    monkeypatch.setattr(runner, "read_source", lambda row, split: None)
+
+    def fake_once(row, prompt, work, venv, model, max_turns, retry_failed, inputs_of):
+        ran.append(work.name)
+        return {"reward": 0.0, "agent_status": "exit 0", "prediction": ""}
+
+    monkeypatch.setattr(runner, "once", fake_once)
+    monkeypatch.setattr(runner, "prompt_for", lambda row, split, rung: "p")
+    row = {"task_id": "t1", "question": "q", "files": [], "answer": "1"}
+
+    out = runner.task_trials(row, "test", ["L1_schema", "L2"], tmp_path, "m", 5,
+                             runs_root=tmp_path / "runs")
+
+    assert ran == ["L1_schema"], f"control should run without a reference, ran {ran}"
+    # and the rung that genuinely needs one is reported as skipped, not silently passed off
+    assert out[1]["skipped"] == "no verified reference"

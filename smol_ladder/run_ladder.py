@@ -205,21 +205,28 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
 
 
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
-                max_turns: int, retry_failed: bool = False, inputs_of=input_dir) -> list[dict]:
+                max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
+                runs_root: Path | None = None) -> list[dict]:
     """Climb the ladder for one task: stop at the first rung that passes.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
     the "L1+schema" control, since "+" would need quoting in a comma-separated list.
     """
     out = []
+    root = runs_root or (DATA / "runs" / split)
     have_source = read_source(row, split) is not None
     for rung in rungs:
         prompt_rung = rung.replace("_schema", "+schema")
-        if prompt_rung != "L1" and not have_source:
+        # The control is built from the tables alone, so it needs no reference. Gating it on
+        # one would throw away the L1-vs-L1+schema comparison on every task whose reference we
+        # failed to build, which is most of the failures we care about.
+        needs_reference = prompt_rung in {"L2", "L3", "L4"}
+        if needs_reference and not have_source:
             out.append({"task_id": row["task_id"], "rung": prompt_rung, "reward": 0.0,
                         "skipped": "no verified reference"})
             continue
-        work = DATA / "runs" / split / row["task_id"] / rung.replace("+", "_")
+        work = root / row["task_id"] / rung.replace("+", "_")
+        work.mkdir(parents=True, exist_ok=True)
         r = once(row, prompt_for(row, split, prompt_rung), work, venv, model, max_turns,
                  retry_failed, inputs_of)
         r["rung"] = prompt_rung

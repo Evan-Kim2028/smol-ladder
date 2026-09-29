@@ -280,24 +280,29 @@ def prompt_for(row: dict, split: str, rung: str) -> str:
     source = read_source(row, split)
     if source is None:
         return base
+    facts = code_facts(source)
+    l2_block = (
+        f"Files read: {', '.join(facts['files']) or 'the tables above'}\n"
+        f"Columns used: {', '.join(facts['columns']) or '(discover them yourself)'}\n"
+        f"Filters applied: {'; '.join(facts['filters']) or '(none)'}"
+    )
     if rung == "L2":
-        facts = code_facts(source)
-        detail = (
-            f"Files read: {', '.join(facts['files']) or 'the tables above'}\n"
-            f"Columns used: {', '.join(facts['columns']) or '(discover them yourself)'}\n"
-            f"Filters applied: {'; '.join(facts['filters']) or '(none)'}"
-        )
-        return base + f"\n\nNotes on the intended computation:\n\n{detail}"
+        return base + f"\n\nNotes on the intended computation:\n\n{l2_block}"
     if rung == "L3":
-        facts = code_facts(source)
         return (base
-                + f"\n\nNotes on the intended computation:\n\n"
-                + f"Files read: {', '.join(facts['files']) or 'the tables above'}\n"
-                + f"Columns used: {', '.join(facts['columns']) or '(discover them yourself)'}\n"
-                + f"Filters applied: {'; '.join(facts['filters']) or '(none)'}\n"
+                + "\n\nNotes on the intended computation:\n\n"
+                + f"{l2_block}\n"
                 + f"Method: {method_hint(source)}")
     if rung == "L4":
-        return (base + HINT_HEADER + "\n```python\n"
+        # Cumulative: L4 must extend L3 verbatim, or the rungs are not Blackwell-ordered and
+        # "the lowest rung that passes" stops meaning "the least information that sufficed".
+        # Dropping L3's block here made L4 a sibling of L3 rather than a superset, which is
+        # the whole ordering claim the ladder rests on.
+        return (base
+                + "\n\nNotes on the intended computation:\n\n"
+                + f"{l2_block}\n"
+                + f"Method: {method_hint(source)}"
+                + HINT_HEADER + "\n```python\n"
                 + redact_literals(strip_output(source), str(row["answer"])) + "\n```")
     raise ValueError(rung)
 
