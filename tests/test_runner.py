@@ -69,6 +69,33 @@ def test_agent_command_reports_a_timeout_instead_of_raising():
     assert "timed out" in out
 
 
+def test_a_backgrounded_command_does_not_defeat_the_timeout(tmp_path):
+    """`nohup ... &` is what an agent reaches for to keep a long job running.
+
+    The detached grandchild holds the write end of the captured pipe, so communicate() blocks
+    on a descriptor nothing will close. A trial sat 31 minutes against a 20-minute cap
+    because of exactly this. The deadline has to win.
+    """
+    script = "nohup sleep 300 >/dev/null 2>&1 & echo started"
+    start = time.time()
+    try:
+        _run_jailed(["bash", "-c", script], tmp_path,
+                    {"PATH": "/usr/bin:/bin"}, 5)
+    except subprocess.TimeoutExpired:
+        pass
+    elapsed = time.time() - start
+    assert elapsed < 45, f"took {elapsed:.0f}s for a 5s timeout"
+
+
+def test_the_agent_shell_survives_a_backgrounded_command():
+    from smol_ladder.or_agent import run_command
+    start = time.time()
+    out = run_command("nohup sleep 300 >/dev/null 2>&1 & echo started", timeout=5)
+    elapsed = time.time() - start
+    assert elapsed < 45, f"run_command took {elapsed:.0f}s for a 5s timeout"
+    assert isinstance(out, str)
+
+
 def test_the_control_runs_without_a_reference(monkeypatch, tmp_path):
     """The L1+schema control is built from the tables alone.
 

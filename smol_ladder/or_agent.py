@@ -144,9 +144,16 @@ def run_command(command: str, timeout: int = 150, cwd: str | None = None) -> str
                 break
             except subprocess.TimeoutExpired:
                 continue
-        out, err = proc.communicate()
-        tail = (out or b"").decode("utf-8", "replace")[-2000:]
-        return f"[timed out after {timeout}s]" + (f"\n{tail}" if tail else "")
+        # Close our ends before draining: a command that backgrounds a job leaves a
+        # grandchild holding the write end, and communicate() would block on it forever.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        proc.wait(timeout=5)
+        return f"[timed out after {timeout}s]"
     text = out.decode("utf-8", "replace") + \
         ("\n--- stderr ---\n" + err.decode("utf-8", "replace") if err else "")
     return text[-20_000:]

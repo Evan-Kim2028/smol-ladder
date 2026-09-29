@@ -103,9 +103,18 @@ def _run_jailed(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subproces
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Kill the group, then close our ends of the pipes before draining. An agent that
+        # backgrounds a job (`nohup ... &`) leaves a grandchild holding the write end, so
+        # communicate() blocks on a descriptor nothing will ever close. The 20-minute cap
+        # was not firing for 31 because of exactly this.
         _kill_group(proc)
-        out, err = proc.communicate()
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
