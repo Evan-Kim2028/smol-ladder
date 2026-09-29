@@ -115,21 +115,41 @@ def _run_jailed(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subproces
                 except OSError:
                     pass
         raise
+    finally:
+        # Reap. bwrap exits via --die-with-parent, so it can outlive Popen's own wait by a
+        # moment; without this the runner accumulated 25 zombies and 63 threads and stopped
+        # scheduling new work entirely.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the whole group, then always reap.
+
+    The reap is the part that matters and the part that is easy to skip: killpg raises
+    ProcessLookupError when the leader is already gone, and returning there leaves its exit
+    status uncollected. Thirty workers x one uncollected child each is how the runner ended up
+    with 25 zombies and 63 threads, at which point it stopped scheduling anything.
+    """
     import signal
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(os.getpgid(proc.pid), sig)
         except (ProcessLookupError, PermissionError):
-            return
+            break
         try:
             proc.wait(timeout=5)
             return
         except subprocess.TimeoutExpired:
             continue
+    # Either the group is already gone or SIGKILL did not land: collect the status anyway.
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
@@ -233,8 +253,12 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
         # The control is built from the tables alone, so it needs no reference. Gating it on
         # one would throw away the L1-vs-L1+schema comparison on every task whose reference we
         # failed to build, which is most of the failures we care about.
-        needs_reference = prompt_rung in {"L2", "L3", "L4"}
-        if needs_reference and not have_source:
+        #
+        # L2-L4 need one, and a task without one is skipped rather than run: prompt_for now
+        # marks those rungs as adding nothing, so running them would re-measure L1 and spend a
+        # trial to learn it again. The article's own table calls this case "Nothing new".
+        needs_reference = prompt_rung in {"L2", "L3", "L4"} and not have_source
+        if needs_reference:
             out.append({"task_id": row["task_id"], "rung": prompt_rung, "reward": 0.0,
                         "skipped": "no verified reference"})
             continue

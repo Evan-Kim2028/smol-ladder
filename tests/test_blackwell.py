@@ -91,3 +91,51 @@ def test_dropping_the_hint_recovers_l1_from_every_rung(row):
         assert higher.startswith(l1), f"{rung} does not contain L1 verbatim"
         # the extra information is a suffix, so removing it leaves L1 exactly
         assert higher[: len(l1)] == l1
+
+
+def test_no_rung_is_byte_identical_to_the_one_below(row):
+    """The article's own table has a column for this: "Nothing new, because the cut already
+    left them."
+
+    A rung that adds no information is not a rung — it re-measures the rung below and spends a
+    trial to learn the same thing twice. It must not happen by accident, and when a task truly
+    has no reference the prompt must say so rather than silently repeat L1.
+    """
+    for rung, below in (("L2", "L1"), ("L3", "L2"), ("L4", "L3")):
+        assert L.prompt_for(row, "test", rung) != L.prompt_for(row, "test", below), \
+            f"{rung} is identical to {below}"
+
+
+def test_a_task_without_a_reference_says_so(monkeypatch):
+    """SmolDataEnvs has no reference for 69/250 tasks. Their L2-L4 must be marked, not faked."""
+    monkeypatch.setattr(L, "read_source", lambda row, split: None)
+    row = {"task_id": "t", "question": "Q?", "files": ["t.csv"], "answer": "1",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0, "difficulty_tier": 1,
+           "bucket_prefix": "x", "split": "test"}
+    l2 = L.prompt_for(row, "test", "L2")
+    assert "No reference solution" in l2
+    assert l2 != L.prompt_for(row, "test", "L1")
+
+
+def test_synthetic_rungs_are_live():
+    """A synthetic task's spec is its reference, so every rung must add something.
+
+    Before this, all 275 synthetic tasks had a read_source of None, prompt_for fell back to the
+    bare L1 text, and L2/L3/L4 were byte-identical to L1 — 80/80 dead rungs, so the control run
+    was measuring the same prompt four times.
+    """
+    rows, _ = source_for("synthetic")
+    for row in rows[:20]:
+        assert L.read_source(row, "synthetic") is not None, row["task_id"]
+        prompts = [L.prompt_for(row, "synthetic", r) for r in ("L1", "L2", "L3", "L4")]
+        assert len(set(prompts)) == 4, f"{row['task_id']}: rungs collapsed"
+
+
+def test_synthetic_reference_has_no_print_and_omits_the_answer():
+    """The L4 payload must not evaluate to the answer, and must not name it either."""
+    rows, _ = source_for("synthetic")
+    for row in rows[:20]:
+        source = L.read_source(row, "synthetic")
+        assert "print(" not in source
+        payload = L.redact_literals(L.strip_output(source), str(row["answer"]))
+        assert L.normalise(row["answer"]) not in L.normalise(payload), row["task_id"]

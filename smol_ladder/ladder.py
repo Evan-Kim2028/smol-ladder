@@ -93,13 +93,57 @@ def schema_dump(row: dict, split: str = "test", limit: int = 3) -> str:
     return dump
 
 
-def read_source(row: dict, split: str) -> str | None:
-    """The reference solution that reproduced the gold answer, or None if there is none.
+def synthetic_reference(row: dict) -> str | None:
+    """The generator's own program for a synthetic task, rendered as reference code.
 
-    Solutions live under a directory named after the source, not the split, so the second
-    benchmark ("jupyter-agent") has its own solutions/jupyter-agent tree. The split name is
-    only the SmolDataEnvs split, and is kept for readability at the call site.
+    A synthetic task's specification *is* its provenance: the answer came from executing these
+    ops, not from a model claiming to have found it. That makes it a stronger reference than a
+    model-written solution.py, which was selected for reproducing the gold answer and so
+    carries the model's own idiom — the confound the article warns about when it says a pass
+    must mean the model reasoned rather than recognised its teacher's code.
+
+    Rendered with no print, so it cannot evaluate to the answer, and the answer literal is
+    redacted by the caller exactly as for a model reference.
     """
+    ops = row.get("ops")
+    if not ops:
+        return None
+    lines = ["import pandas as pd", f"df = pd.read_csv('input/{row['files'][0]}')"]
+    chain = ""
+    for op in ops:
+        name, _, arg = op.partition("(")
+        arg = arg.rstrip(")")
+        if name == "filter":
+            column, _, want = arg.partition("==")
+            lines.append(f"sub = df[df['{column}'] == '{want}']")
+            chain = "sub"
+        elif name == "value_counts":
+            lines.append(f"counts = df['{arg}'].value_counts()")
+            chain = "counts"
+        elif name == "argmax":
+            lines.append(f"result = counts.index[0]")
+            chain = "scalar"
+        else:
+            source = "sub" if chain == "sub" else "df"
+            lines.append(f"result = {source}['{arg}'].{name}()")
+            chain = "scalar"
+    return "\n".join(lines)
+
+
+def read_source(row: dict, split: str) -> str | None:
+    """The reference program for a rung, or None if the task has none.
+
+    Two kinds, and the second is the better one. SmolDataEnvs and jupyter-agent supply a
+    model-written solution.py, kept only because it reproduced the gold answer offline. A
+    synthetic task supplies its own specification rendered as code, which is where its answer
+    actually came from, so it is preferred and needs no yield filter at all.
+
+    That preference is not cosmetic. A model reference was *selected* for matching the answer,
+    so it arrives in the model's own idiom; handing it back at L4 measures whether the model
+    recognises its own teacher's code, not whether it needed the information.
+    """
+    if split == "synthetic":
+        return synthetic_reference(row)
     solutions = DATA / "solutions"
     for candidate in (solutions / split, solutions / "jupyter-agent"):
         result = candidate / row["task_id"] / "result.json"
@@ -303,7 +347,12 @@ def prompt_for(row: dict, split: str, rung: str) -> str:
         return base + f"\n\nSchema of the input tables:\n\n{schema_dump(row, split)}"
     source = read_source(row, split)
     if source is None:
-        return base
+        # Falling back to the plain prompt would make this rung byte-identical to L1: the
+        # article's own table has a column for exactly this ("Nothing new, because the cut
+        # already left them"), and a rung that adds no information cannot be a distinct rescue
+        # — it silently re-measures L1. Say so instead of pretending the rung exists.
+        return base + "\n\n(No reference solution is available for this task, so this rung adds " \
+                      "nothing above the question.)"
     facts = code_facts(source)
     l2_block = (
         f"Files read: {', '.join(facts['files']) or 'the tables above'}\n"

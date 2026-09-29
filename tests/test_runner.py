@@ -38,6 +38,32 @@ def test_a_failing_command_reports_its_exit_code(tmp_path):
     assert proc.returncode == 3
 
 
+def test_killing_a_group_leaves_no_zombies(tmp_path):
+    """The bug this catches: killpg on an already-dead leader raised ProcessLookupError and the
+    early return skipped the reap. Thirty workers x one uncollected child each left the runner
+    with 25 zombies and 63 threads, at which point it stopped scheduling work entirely."""
+    import subprocess as sp
+    from smol_ladder.run_ladder import _kill_group
+
+    before = _zombie_count()
+    for _ in range(5):
+        proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(300)"],
+                        stdout=sp.PIPE, stderr=sp.PIPE, start_new_session=True)
+        time.sleep(0.2)
+        _kill_group(proc)
+        proc.stdout.close()
+        proc.stderr.close()
+    # Give the reaper a moment, then confirm the kernel has collected them.
+    time.sleep(0.5)
+    assert _zombie_count() <= before + 1, "killed children were not reaped"
+
+
+def _zombie_count() -> int:
+    import subprocess as sp
+    out = sp.run(["ps", "-eo", "stat="], capture_output=True, text=True).stdout
+    return sum(1 for line in out.splitlines() if line.strip().startswith("Z"))
+
+
 def test_agent_command_with_grandchildren_holding_the_pipes_returns():
     """The hang that actually stalled the run: a model command that spawns workers.
 
