@@ -32,6 +32,31 @@ def test_a_normal_command_returns_its_output(tmp_path):
     assert b"hello" in proc.stdout
 
 
+def test_a_program_can_read_its_input_directory(tmp_path):
+    """The regression: a --tmpfs /tmp plus a nested bind into /tmp/work is order-sensitive.
+
+    bwrap applies the tmpfs after the --bind that created /tmp/work, so the destination is
+    gone and the mount fails with "Unable to mount source on destination". The solution then
+    never runs, stdout is empty, and the trial grades 0.0 while looking like an ordinary
+    failure. The fix is a self-contained work dir: copy the tables in, bind once.
+    """
+    work = tmp_path / "verify"
+    (work / "input").mkdir(parents=True)
+    (work / "input" / "t.csv").write_text("a,b\n1,2\n3,4\n")
+    (work / "solution.py").write_text(
+        "import pandas as pd\n"
+        "df = pd.read_csv('input/t.csv')\n"
+        "print(int(df['a'].sum()))\n")
+    env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "HOME": str(work)}
+    proc = _run_jailed(
+        ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+         "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp", "--bind", str(work), "/tmp/work",
+         "--chdir", "/tmp/work", "--die-with-parent", sys.executable, "solution.py"],
+        work, env, 120)
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert b"4" in proc.stdout, "solution did not run: " + proc.stdout.decode()[:200]
+
+
 def test_a_failing_command_reports_its_exit_code(tmp_path):
     proc = _run_jailed([sys.executable, "-c", "raise SystemExit(3)"], tmp_path,
                        {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin"}, 60)

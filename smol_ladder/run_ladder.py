@@ -211,6 +211,19 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         verify = work / "verify"
         verify.mkdir(exist_ok=True)
         (verify / "solution.py").write_text(solution.read_text())
+        # The input is copied in rather than bind-mounted at /tmp/work/input. A --tmpfs /tmp
+        # plus a nested --ro-bind into /tmp/work is order-sensitive: the tmpfs erases the
+        # /tmp/work the previous --bind created, and bwrap then fails with "Unable to mount
+        # source on destination", so the solution never runs and every such trial grades 0.0.
+        # A plain self-contained work dir has no such ordering to get wrong.
+        tables = verify / "input"
+        if not tables.exists():
+            try:
+                shutil.copytree(inputs, tables, symlinks=True)
+            except Exception:
+                if tables.is_symlink() or tables.exists():
+                    tables.unlink()
+                tables.symlink_to(inputs.resolve())
         # A verification run that hangs is a failed trial, not a crashed harness: the agent
         # wrote a program that never terminates offline. Catch it or the whole run dies.
         try:
@@ -218,7 +231,6 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
                 ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
                  "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
                  "--bind", str(verify), "/tmp/work",
-                 "--ro-bind", str((work / "input").resolve()), "/tmp/work/input",
                  "--chdir", "/tmp/work", "--die-with-parent",
                  "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
                  sys.executable, "solution.py"],
