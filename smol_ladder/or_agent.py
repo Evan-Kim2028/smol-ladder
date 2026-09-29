@@ -114,11 +114,23 @@ def call_model(messages: list[dict], model: str, tools: list[dict]) -> dict:
     raise RuntimeError(f"OpenRouter gave no completion after 5 attempts: {last}")
 
 
-def run_shell(environment: BaseEnvironment, command: str) -> str:
-    result = environment.exec(f"cd /app && timeout {SHELL_TIMEOUT} bash -c "
-                              f"{shlex.quote(command)} 2>&1")
-    out = getattr(result, "output", None) or str(result)
-    return out[-20_000:]
+def run_command(command: str, timeout: int = 150, cwd: str | None = None) -> str:
+    """Run a shell command for the agent, never raising.
+
+    A command that exceeds its timeout, or emits bytes that are not valid UTF-8, used to
+    propagate out of the model loop and kill the whole trial. Both are ordinary things for an
+    agent to do, so the model is told what happened and gets to continue.
+    """
+    import subprocess
+    try:
+        p = subprocess.run(["bash", "-c", command], capture_output=True, timeout=timeout,
+                           cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return f"[timed out after {timeout}s]"
+    out = p.stdout.decode("utf-8", "replace")
+    err = p.stderr.decode("utf-8", "replace")
+    text = out + ("\n--- stderr ---\n" + err if err else "")
+    return text[-20_000:]
 
 
 def _as_file(text: str) -> Path:
@@ -211,7 +223,7 @@ def _build_agent_class():
                       context: AgentContext) -> None:
             import asyncio
 
-            async def run_shell_async(command: str) -> str:
+            async def in_container(command: str) -> str:
                 result = await environment.exec(
                     f"cd /app && timeout {SHELL_TIMEOUT} bash -c "
                     f"{shlex.quote(command)} 2>&1")
@@ -221,8 +233,9 @@ def _build_agent_class():
                 await environment.upload_file(_as_file(code), "/app/solution.py")
 
             loop = asyncio.get_event_loop()
+            # The agent's commands run in the task container, never on this host.
             run_sync = lambda c: loop.run_in_executor(  # noqa: E731
-                None, lambda: asyncio.run(run_shell_async(c)))
+                None, lambda: asyncio.run(in_container(c)))
             write_sync = lambda c: loop.run_in_executor(  # noqa: E731
                 None, lambda: asyncio.run(write_solution_async(c)))
             log = solve_loop(instruction, run_sync, write_sync, self.model_name or MODEL)

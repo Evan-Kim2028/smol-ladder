@@ -62,8 +62,18 @@ def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
     return args
 
 
-def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int) -> dict:
-    """One attempt at one rung: run the solver in the jail, then grade its solution offline."""
+def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
+         retry_failed: bool = False) -> dict:
+    """One attempt at one rung: run the solver in the jail, then grade its solution offline.
+
+    Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
+    asked, so a rerun does not quietly re-roll a genuinely failed task.
+    """
+    cached = work / "result.json"
+    if cached.exists():
+        prior = json.loads(cached.read_text())
+        if prior.get("agent_status") == "exit 0" or not retry_failed:
+            return prior
     work.mkdir(parents=True, exist_ok=True)
     inp = work / "input"
     if not inp.exists():
@@ -80,8 +90,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         "import json,sys;"
         "sys.path.insert(0, %r);"
         "import smol_ladder.or_agent as A;"
-        "log=A.solve_loop(sys.argv[1], lambda c: __import__('subprocess').run("
-        "['bash','-c',c],capture_output=True,text=True,timeout=150).stdout[-8000:],"
+        "log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
         "lambda c: open('solution.py','w').write(c), %r, %d);"
         "open('turns.json','w').write(json.dumps(len(log)))"
         % (str(Path(__file__).resolve().parent.parent), model, max_turns)
@@ -90,9 +99,10 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     try:
         proc = subprocess.run(
             jail(work, input_dir(row), venv) + [sys.executable, "-c", script, prompt],
-            cwd=work, env=env, capture_output=True, text=True, timeout=max_turns * 60 + 300)
+            cwd=work, env=env, capture_output=True, timeout=max_turns * 60 + 300)
         agent_status = f"exit {proc.returncode}"
-        stderr = proc.stderr[-2000:]
+        stderr = proc.stderr.decode("utf-8", "replace")[-2000:] \
+            if isinstance(proc.stderr, bytes) else (proc.stderr or "")[-2000:]
     except subprocess.TimeoutExpired:
         agent_status, stderr = "timeout", ""
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
@@ -103,16 +113,23 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         verify = work / "verify"
         verify.mkdir(exist_ok=True)
         (verify / "solution.py").write_text(solution.read_text())
-        run = subprocess.run(
-            ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
-             "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
-             "--bind", str(verify), "/tmp/work",
-             "--ro-bind", str((work / "input").resolve()), "/tmp/work/input",
-             "--chdir", "/tmp/work", "--die-with-parent",
-             "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
-             sys.executable, "solution.py"],
-            capture_output=True, text=True, timeout=180)
-        lines = [l.strip() for l in run.stdout.splitlines() if l.strip()]
+        # A verification run that hangs is a failed trial, not a crashed harness: the agent
+        # wrote a program that never terminates offline. Catch it or the whole run dies.
+        try:
+            run = subprocess.run(
+                ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
+                 "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
+                 "--bind", str(verify), "/tmp/work",
+                 "--ro-bind", str((work / "input").resolve()), "/tmp/work/input",
+                 "--chdir", "/tmp/work", "--die-with-parent",
+                 "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
+                 sys.executable, "solution.py"],
+                capture_output=True, timeout=180)
+            out = run.stdout.decode("utf-8", "replace") if isinstance(run.stdout, bytes) \
+                else (run.stdout or "")
+        except subprocess.TimeoutExpired:
+            out = ""
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
         result["prediction"] = lines[-1] if lines else ""
         result["reward"] = grade(row, result["prediction"])
     if stderr:
@@ -121,18 +138,24 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
 
 
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
-                max_turns: int) -> list[dict]:
-    """Climb the ladder for one task: stop at the first rung that passes."""
+                max_turns: int, retry_failed: bool = False) -> list[dict]:
+    """Climb the ladder for one task: stop at the first rung that passes.
+
+    Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
+    the "L1+schema" control, since "+" would need quoting in a comma-separated list.
+    """
     out = []
     have_source = read_source(row, split) is not None
     for rung in rungs:
-        if rung != "L1" and not have_source:
-            out.append({"task_id": row["task_id"], "rung": rung, "reward": 0.0,
+        prompt_rung = rung.replace("_schema", "+schema")
+        if prompt_rung != "L1" and not have_source:
+            out.append({"task_id": row["task_id"], "rung": prompt_rung, "reward": 0.0,
                         "skipped": "no verified reference"})
             continue
         work = DATA / "runs" / split / row["task_id"] / rung.replace("+", "_")
-        r = once(row, prompt_for(row, split, rung), work, venv, model, max_turns)
-        r["rung"] = rung
+        r = once(row, prompt_for(row, split, prompt_rung), work, venv, model, max_turns,
+                 retry_failed)
+        r["rung"] = prompt_rung
         (work / "result.json").write_text(json.dumps(r, indent=1))
         out.append(r)
         if r["reward"] >= 1.0:
@@ -148,6 +171,8 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=20)
     ap.add_argument("--model", default="stealth/space-bunny-alpha")
     ap.add_argument("--max-turns", type=int, default=40)
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="re-run trials whose agent crashed; a clean pass is never re-rolled")
     args = ap.parse_args()
 
     rows = load_split(args.split)[: args.limit]
@@ -157,7 +182,7 @@ def main() -> None:
     done = 0
     with ThreadPoolExecutor(args.workers) as pool:
         futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
-                               args.max_turns) for row in rows]
+                               args.max_turns, args.retry_failed) for row in rows]
         for f in as_completed(futures):
             done += 1
             for r in f.result():
