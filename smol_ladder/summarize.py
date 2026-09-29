@@ -14,7 +14,8 @@ import json
 from pathlib import Path
 
 from smol_ladder.ladder import read_source
-from smol_ladder.tasks import DATA, load_split
+from smol_ladder.run_ladder import source_for
+from smol_ladder.tasks import DATA
 
 RUNGS = ["L1", "L1+schema", "L2", "L3", "L4"]
 # The control's directory has no "+" in it; everything else is the rung name verbatim.
@@ -34,17 +35,14 @@ def collect(split: str) -> dict[str, dict[str, dict]]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
-                    choices=["test", "eval", "train", "jupyter-agent"])
+                    choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
     args = ap.parse_args()
 
-    if args.split == "jupyter-agent":
-        from smol_ladder.jtasks import load_rows
-        rows = {r["task_id"]: r for r in load_rows()}
-    else:
-        rows = {r["task_id"]: r for r in load_split(args.split)}
+    rows, _ = source_for(args.split)
+    by_id = {r["task_id"]: r for r in rows}
     runs = collect(args.split)
-    total = len(rows)
-    n_ref = sum(read_source(r, args.split) is not None for r in rows.values())
+    total = len(by_id)
+    n_ref = sum(read_source(r, args.split) is not None for r in by_id.values())
 
     print(f"split={args.split}  tasks={total}  with verified reference={n_ref} "
           f"({n_ref/total:.0%})")
@@ -71,7 +69,7 @@ def main() -> None:
         if rungs["L1"]["reward"] >= 1.0:
             hist["L1"] += 1
             continue
-        if read_source(rows[task], args.split) is None:
+        if read_source(by_id[task], args.split) is None:
             hist["no reference"] += 1
             continue
         climbed += 1

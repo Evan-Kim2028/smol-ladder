@@ -54,10 +54,13 @@ def read_text(path: Path) -> str:
 
 
 def inputs_of(split: str):
-    """The task's input directory, for either benchmark."""
+    """The task's input directory, for any source."""
     if split == "jupyter-agent":
         from smol_ladder.jtasks import input_dir as ja_input_dir
         return ja_input_dir
+    if split == "synthetic":
+        from smol_ladder.jtasks import synthetic_input_dir
+        return synthetic_input_dir
     return input_dir
 
 
@@ -370,14 +373,15 @@ def leaks(row: dict, prompt: str) -> list[str]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
-                    choices=["test", "eval", "train", "jupyter-agent"])
+                    choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--leak-check", action="store_true", default=True)
     ap.add_argument("--no-run-oracle", action="store_true",
                     help="skip running each L4 payload; much faster, but ships unverified rungs")
     args = ap.parse_args()
 
-    rows = load_split(args.split)[: args.limit]
+    from smol_ladder.run_ladder import source_for
+    rows = source_for(args.split)[0][: args.limit]
     out = DATA / "ladder" / args.split
     out.mkdir(parents=True, exist_ok=True)
     stats = {r: 0 for r in RUNGS}

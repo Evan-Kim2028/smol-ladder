@@ -147,6 +147,25 @@ def load_rows(path: Path | str | None = None) -> list[dict]:
     return [json.loads(line) for line in src.read_text().splitlines() if line.strip()]
 
 
+def load_synthetic() -> list[dict]:
+    """Synthetic tasks, in the same row shape as every other source."""
+    src = DATA / "synthetic.jsonl"
+    if not src.exists():
+        raise FileNotFoundError(
+            f"{src} not found; run: uv run python -m smol_ladder.synthetic --max-tables 60")
+    return [json.loads(line) for line in src.read_text().splitlines() if line.strip()]
+
+
+def synthetic_input_dir(row: dict) -> Path:
+    """Synthetic tasks point at an already-cached table, so this is a lookup, not a download.
+
+    The bucket_prefix is the table's parent directory, which is exactly what
+    tasks.input_dir(row) expects for a SmolDataEnvs row.
+    """
+    from smol_ladder.tasks import input_dir
+    return input_dir(row)
+
+
 def input_dir(row: dict) -> Path:
     """The task's tables, fetched from Kaggle and cached.
 

@@ -33,17 +33,21 @@ AGENT_TIMEOUT = 1200
 
 
 def source_for(split: str):
-    """Task rows and their input directories, for either benchmark.
+    """Task rows and their input directories, for any of the three sources.
 
-    SmolDataEnvs rows come from the Hub; jupyter-agent rows come from the local extract, and
-    their tables from Kaggle. Everything downstream only needs load_split's shape, so the two
-    sources are interchangeable here.
+    SmolDataEnvs rows come from the Hub, jupyter-agent rows from the local extract with their
+    tables from Kaggle, and synthetic rows from a specification we executed ourselves. All
+    three return the same row shape, so everything downstream is source-agnostic.
     """
     if split == "jupyter-agent":
         from smol_ladder.jtasks import input_dir as ja_input_dir
         from smol_ladder.jtasks import load_rows
 
         return load_rows(), ja_input_dir
+    if split == "synthetic":
+        from smol_ladder.jtasks import load_synthetic, synthetic_input_dir
+
+        return load_synthetic(), synthetic_input_dir
     return load_split(split), input_dir
 
 
@@ -240,7 +244,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
-                    choices=["test", "eval", "train", "jupyter-agent"])
+                    choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
     ap.add_argument("--rungs", default="L1", help="comma-separated, e.g. L1,L1+schema,L2,L3,L4")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--workers", type=int, default=20)
