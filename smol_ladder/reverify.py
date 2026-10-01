@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -200,9 +200,14 @@ def run(split: str, tag: str | None, workers: int = DEFAULT_WORKERS,
                     "new_verify_status": f"error: {type(e).__name__}", "recovered": False}
 
     records: list[dict] = []
+    # as_completed, not map: map yields in submission order, so one slow trial at the front of
+    # the list holds back every record behind it. On 90 trials against a machine at load 50 that
+    # means the pass appears to do nothing for minutes, and a reader has no way to tell it is
+    # working from one that is wedged. Each record is written to disk by verify_trial as it
+    # finishes, so results are durable either way.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for record in pool.map(one, todo):
-            records.append(record)
+        for future in as_completed([pool.submit(one, trial) for trial in todo]):
+            records.append(future.result())
     for record in records:
         rung = record.get("rung") or "?"
         count(rung, "recovered" if record.get("recovered") else "still_failing")

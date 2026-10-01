@@ -22,7 +22,8 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 | `run_ladder.py` | the runner: one trial per (task, rung, sample), in a jail, graded offline. Saves each trial's full assistant/tool conversation to `<task>/<rung>/transcript.json` by default — `--no-transcript` opts out — and removes the verifier's copy of the task tables once grading is done |
 | `sandbox.py`, `or_agent.py`, `upstream.py` | the offline grading pass; the solver agent; the two upstream 2B protocols |
 | `grade.py` | the SmolDataEnvs grader |
-| `summarize.py` | per-rung pass rates with a bootstrap CI, and a first-passing-rung partition |
+| `summarize.py` | per-rung pass rates with a bootstrap CI, a first-passing-rung partition, and the analyses a ladder curve needs: the same set for every rung, the paired control effect, rerun consistency, the hint-source split, and the ceiling with the curve restricted to tasks that have headroom |
+| `reverify.py` | re-runs the sealed offline grading pass for trials whose first pass failed, with no model calls. Writes a new `reverify.json` beside each trial and never touches `result.json`; `summarize` prefers a re-verification that succeeded and reports the count |
 | `regrade.py` | re-scores stored predictions strict and prefix-normalised, offline. Writes nothing |
 | `regrade_gold.py` | re-scores stored predictions against a *corrected* gold, writing a separate `data/runs/regrade_gold_<tag>.jsonl` with `reward` beside `reward_old`. Never writes into the results tree, and grades trials whose id the corrected corpus dropped against the superseded gold rather than dropping them |
 | `gen_refs.py`, `gen_solutions.py` | generate and verify reference solutions |
@@ -68,6 +69,7 @@ uv run python -m smol_ladder.run_ladder --split test --rungs L1 --samples 2 \
 
 uv run python -m smol_ladder.summarize --split test                 # legacy data/runs/test tree
 uv run python -m smol_ladder.summarize --split test --run-tag v2    # that run's own tree
+uv run python -m smol_ladder.reverify --run-tag v2 --split test      # re-grade what a loaded machine failed to
 uv run python -m smol_ladder.regrade --split test                   # what the ANSWER: prefix costs
 uv run python -m smol_ladder.regrade_gold --split synthetic          # what the old synthetic gold cost
 ```

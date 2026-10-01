@@ -19,33 +19,45 @@ line, model, protocol, rungs, samples, climb setting and reference denominator a
 367 tests pass (as of 2026-10-01), 4 of them marked `slow` because they read a whole split from
 disk; `pytest -m "not slow"` is the ~2-minute quick loop and the full suite ~15.
 
-**Measured, on `test` (250 tasks, `stealth/space-bunny-alpha`):** L1 187/250 = 74.8%; schema control
-23/63 = 36.5% on L1 failures; L2 167/181 = 92.3%; L3 8/14 = 57.1%; L4 6/6 = 100%. Reference funnel:
-**213 of the 250 tasks have a verified reference, and 181 have a rung above L1 actually run** (the
-climb predates the last 32 references). First-passing rung: L1 187, L2 17, L3 3, L4 3, and 40 tasks
-with no rung above L1 run. **16 of the 23 information-rung rescues are also control rescues** (re-measured
-2026-10-01 off `data/runs/test`: 23 control rescues, 23 information-rung rescues, 16 in both, 7
-only each way), so on this split a hint rung and a no-information prompt overlap heavily but are
-far from interchangeable — a third of the hint's value survives the control, and a third of the
-control's is not explained by information at all. `test` L1 by family: `agg` 68.0%, `stat_test` 78.1%,
-label-typed answers 66.3% vs numeric 77.2%, hard tier 61.6%.
+**Measured, on `test`, run `v2` (250 tasks x 5 conditions x 2 samples, `--no-climb`,
+`stealth/space-bunny-alpha`) — as of 2026-10-01, re-measured from `data/runs/v2` by me:** every
+rung on the same 213 referenced tasks reads L1 87.6% [83.6, 91.3], control 88.0%, L2 93.4%,
+L3 95.3%, L4 98.6%; on all 250 L1 is 77.9% [73.1, 82.6] (452/500 trials scored, 48 harness
+failures) and the control 79.4%. **The ladder is not monotone**: L1→L2 11 of 212 paired tasks
+fell and 27 rose (p=0.014), L2→L3 10 fell / 16 rose (p=0.33), L3→L4 3 fell / 13 rose (p=0.021).
+The paired control effect is +1.2% [−2.1, +4.6], p=0.36, i.e. the schema dump buys nothing over L1.
+**154 of the 213 referenced tasks already pass L1 in both samples**, so the full-set curve is near
+ceiling; on the 56 tasks that failed L1 in at least one sample the curve is 22.3% → 97.2% (control
+37.5%), which is the only place a hint effect is visible. Full tables and the caveats:
+`docs/LADDER.md`, "Run v2". **The referenced set is biased toward tasks this model can do**, since
+a reference exists only where this model family already produced a verified solution.
 
-**Measured, jupyter-agent L1 on the v1 pool (2,000 tasks, `stealth/space-bunny-alpha`,
-`logs/ja_L1_full_20261001.log`):** **1,990 of the 2,000 have a result; 838 of those pass, which is
-42.1% of everything attempted and 43.6% of the 1,922 scored** — 68 trials are harness failures
-(67 `agent_status: timeout`, 1 `exit 143`) and leave the denominator, so they are neither passes
-nor model failures. Recomputed off `data/solutions/jupyter-agent` on 2026-10-01 rather than read
-off the log, because the log prints only every tenth task and its final line counts all 840
-attempts at reward 1.0, including the two whose agent run timed out: 840 reward-1.0 results, of
-which 838 are scored trials. So `test` L1 74.8% against jupyter-agent L1 42.1% is the headroom
-this ladder exists to measure, and it is a real difference between the two corpora rather than a
-pool artefact — v3 is the pool built after this run.
+**Tooling fixed on this branch, 2026-10-01.** `summarize` refused v2 without `--allow-mixed`
+because its mixed-prompt check compared prompt hashes across *tasks* rather than within one
+(task, rung) cell — and every rung prompt embeds its own question, so 250 clean tasks read as 250
+ladders. It now checks per (task, rung) on three axes (prompt hash, a ladder fingerprint over the
+six files that write the rungs and grade them, and the hint prompt version), and a launch's
+fingerprint is checked against the results on disk. v2 summarises clean with no override.
+`smol_ladder.reverify` re-runs the sealed offline grading pass for trials whose first pass failed
+(90 of them, all harness failures under load, not model failures) and records the outcome in a new
+`reverify.json`; it never writes `result.json`. Agent timeouts stay harness failures.
 
-**383 of these 2,000 tasks are excluded from `jtasks_v3`.** The corrected overlap firewall fires
-on SmolDataEnvs `test`/`eval` tables by bare dataset name, and those 383 sit on one; 1,617 v1 ids
-survive into v3, 911 of them ladder-grade. So the 42.1% is measured over a population whose
-overlap with the held-out splits was, in v1, only partly removed — the figure to quote for a clean
-pool is the v3 sweep, not this one.
+**jupyter-agent L1 on the v1 pool (2,000 tasks) — claimed 838/1,990 = 42.1%, and as of
+2026-10-01 I cannot re-derive it from disk.** The per-trial results of that sweep do not survive:
+`data/runs/jupyter-agent.bak-pre-rerun-20261001/` holds **692 results over 692 distinct tasks**,
+not 1,990, and `data/runs/summary_jupyter-agent.json` reports `tasks: 0` with an all-zero L1 block.
+The figure is consistent with `logs/ja_L1_full_20261001.log`, which prints every tenth task and ends
+on "done: 2000 tasks, 840 verified references" — but that log line counts *reference* generations,
+not L1 passes, and a log is not a per-trial artefact. **Quote 42.1% as historical, not as a
+measurement**; the number to quote for a clean pool is the v3 sweep, and its per-trial results do
+survive. What is verifiable today: `data/solutions/jupyter-agent` holds **2,005 reference attempts,
+855 of them `keep: true`**.
+
+**383 of the 2,000 v1 tasks are excluded from `jtasks_v3`** (verified on disk 2026-10-01: 1,617 v1
+ids survive into v3, 383 do not). The corrected overlap firewall fires on SmolDataEnvs `test`/`eval`
+tables by bare dataset name and those 383 sit on one. So the 42.1% was measured over a population
+whose overlap with the held-out splits was, in v1, only partly removed — a further reason to quote
+the v3 sweep instead.
 
 **Withdrawn — the 92% schema-control claim is dead.** The numbers audit recomputed every figure in
 the old headline from raw per-trial results and withdrew the `test` table in full: no artefact of the
@@ -98,11 +110,19 @@ split has no measured curve, and regrading the stored 757 trials moves 287 of th
 L4 0/64 → 62/64). The old synthetic numbers were a measurement of a broken gold and are
 superseded; see `docs/LADDER.md` for the before/after table and the 87 owed rung-trials.
 
-**Still open.** jupyter-agent references are accumulating but still far short of the pool: 1,478
-attempts recorded
-on disk, 624 verified, as of 2026-10-01, against 7,518 ladder tasks in v3. 8/181 tasks pass at L1 and
-fail at L2, a real monotonicity violation. 18.9% of tasks flip across four identical L1 runs, so
-"first passing rung" is not identifiable at k=1. No inference stack is installed on this machine.
+**The training pipeline exists and is exercised, but not at the target scale.** `train/` carries
+the exporter, the LoRA SFT trainer, the format converter and the GRPO loop, with
+`docs/TRAINING.md`. As of 2026-10-01 the **only measured training run is an SFT smoke test on
+Qwen3.5-0.8B** (30 steps, 2048 tokens, ~22 min) — chosen because 2B does not fit a LoRA smoke run
+in 6 GB of VRAM. **The GRPO loop has never been run for real**, and no 2B arm (A, B, C, D) has been
+trained. Every timing for 2B in `docs/TRAINING.md` is an extrapolation from the 0.8B measurement.
+
+**Still open.** jupyter-agent references are accumulating but still far short of the pool: 2,005
+attempts on disk, **855 verified**, as of 2026-10-01, against 7,518 tasks in v3 (4,217
+ladder-grade). The ladder is **not monotone** on run v2: 11 of 212 paired tasks fall from L1 to L2
+(p=0.014) and 3 of 209 from L3 to L4 (p=0.021) — a real budget effect, unattributed. 12% of L1
+tasks flip verdict between two samples, so "first passing rung" is not identifiable at k=2 either.
+No inference stack is installed on this machine.
 
 ## Objective
 
@@ -125,9 +145,9 @@ Every outcome is reportable. "Hints do not help RL" is a result, not a failure.
 |---|---|---|---|---|
 | SmolDataEnvs `train` | 5,000 tasks | on disk, graded by `grader.py` | RL tasks + reward | nothing for RL; SFT needs traces we do not have |
 | SmolDataEnvs-sft | 4,677 verified trajectories | **usable for SFT today**; the export keeps **4,673** and drops 4 | SFT traces | nothing — but it is `bash`-protocol; conversion needed if arms must share one tool format |
-| SmolDataEnvs `test` / `eval` | 250 / 144 | held out, never trained on | in-distribution eval | nothing; 69/250 `test` tasks have no usable reference, so L2–L4 are measurable on 181 only |
-| jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** | built and tagged; references being generated | RL tasks + reward; eval (L1 42.1% on the v1 pool, twice the headroom) | verified references (624 as of 2026-10-01); 500 tasks across 144 uncached datasets need downloads |
-| Plain-language hints (L2/L3) | 167/181 `test` refs validate | written, validated, cached | RL curriculum; measurement | 14 fall back to the AST, and 9 of those are label-answers that *are* column names — unfixable; needs generating on jupyter-agent refs |
+| SmolDataEnvs `test` / `eval` | 250 / 144 | held out, never trained on | in-distribution eval | nothing; **as of 2026-10-01, verified from disk: `test` 213/250 and `eval` 118/144 have a verified reference**, so L2–L4 are measurable on those only. In run v2 the 213 referenced tasks were all measured at every rung (`--no-climb`); 154 of them already pass L1 in both samples |
+| jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** (both re-measured from `data/jtasks_v3.jsonl` and `smol_ladder.pool` on 2026-10-01) | built and tagged; references being generated | RL tasks + reward; eval — the `ja3` transcript sweep over the 3,880 ladder-grade tasks whose tables are cached is **in progress** and has no result yet | verified references (855 in `data/solutions/jupyter-agent` as of 2026-10-01, all on the v1 pool); 337 ladder-grade tasks are skipped for uncached datasets |
+| Plain-language hints (L2/L3) | 167/181 `test` refs validate | written, validated, cached; **measured on v2: 20 tasks fall back to the AST per rung** | RL curriculum; measurement | the AST arm is 20 tasks, far too few to read a difference off (L3 85.0% AST vs 96.3% hint — not a finding at that size); needs generating on jupyter-agent refs |
 | Synthetic tasks | **6,956** | **gold repaired and gated; unmeasured** | RL tasks (unlimited supply) | the shipped-file gate now refuses any task whose reference does not grade 1.0 against the file the agent is shipped, and the id cache is committed so a regeneration cannot renumber the corpus. But only **275** of the 6,956 have ever been run, so there is no curve: run a full `--no-climb` grid over the corpus before quoting any synthetic number |
 
 The `jtasks_v3` ladder-grade subset (4,217 tasks) deliberately keeps the method-ambiguous families
@@ -191,12 +211,18 @@ early anyway: it is the long pole for the ladder and it is what validates a task
       corpus is regenerated under the committed id cache, and every spec passes the shipped-file gate
 - [ ] 5b. Run the synthetic split: only 275 of 6,956 tasks have ever been run, so `--no-climb`
       across the corpus before any synthetic number is quoted
+- [x] 5c. Re-measure `test` cleanly at k=2 with `--no-climb` (run `v2`), re-verify the trials
+      whose grading pass failed under load, and report the curve on one task set, the paired
+      control effect, rerun consistency, the hint-source split and the ceiling — `docs/LADDER.md`,
+      "Run v2"
 - [ ] 6. Our own verified SFT traces in the converted format. **The exporter is written and tested;
       the data is not.** Transcripts are saved from now on, and the existing tree cannot yield
       them, so this needs the `ja3` sweep (or `gen_refs` on `train`) before it can be checked off.
 - [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the step-1 model
 - [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises
-- [ ] 9. jupyter-agent references at scale (the 4,217 ladder-grade tasks in `jtasks_v3`)
+- [ ] 9. jupyter-agent references at scale (the 4,217 ladder-grade tasks in `jtasks_v3`).
+      **In progress**: the `ja3` transcript sweep over the 3,880 ladder-grade tasks whose tables
+      are cached is running as of 2026-10-01; it has no result yet and none is claimed here
 - [ ] 10. Ladder measurement of every arm, before and after, same tasks and protocol
 - [ ] 11. Open decisions below, then the write-up
 

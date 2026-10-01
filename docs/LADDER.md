@@ -21,9 +21,11 @@ Three reasons, in the numbers audit's words ([`audits/2026-10-01-numbers.md`](au
 Withdrawn with it: `L1 184/250`, `L2 9/14`, `L3 2/5`, `L4 3/3`, and the "of 19 climbed tasks"
 summary. The audit's superseded-findings table lists each one against its current replacement.
 
-### What the surviving legacy tree shows
+### What the surviving legacy tree shows (SUPERSEDED by run v2 below)
 
-Recomputed on 2026-10-01 by running the summarise tool over the legacy `data/runs/test` tree
+**Superseded.** Kept only as the record of what the earlier tree showed; the v2 section below
+replaces it, and nothing in this subsection should be quoted as a finding. Recomputed on
+2026-10-01 by running the summarise tool over the legacy `data/runs/test` tree
 (`python -m smol_ladder.summarize --split test`). Quoting only what it prints:
 
 | | |
@@ -58,12 +60,208 @@ Two caveats that bound all of the above, both of which the tool reports itself:
   comparable to each other as independent pass rates: L4's tasks are by construction the ones the
   control and L2 both failed.
 
-### A clean re-measurement is in progress
+### Run v2: the clean re-measurement (supersedes the legacy tree above)
 
-The section above is the best reading of the legacy tree, not the study's result. Run tag `v2` is
-measuring this again from scratch: every rung on every task (`--no-climb`, no climbing), 2 samples
-per rung, the plain-language hints, and an answer-free schema control. It will replace this section
-when it lands. Until then nothing here should be quoted as a finding about the ladder.
+The legacy section above is kept for the record and is **superseded**: it was measured at k=1 with
+climbing, on a ladder version that has since changed, so its per-rung denominators are not
+comparable to each other. Everything below is one run, quoted from the tool.
+
+Run `v2`: 250 `test` tasks x {L1, L1+schema, L2, L3, L4} x **2 samples**, `--no-climb` so every
+rung ran on every task and the rungs share a denominator, `stealth/space-bunny-alpha`, `tools`
+protocol, 40-turn cap, plain-language L2/L3 hints, an answer-free schema control. `RUN.json` sits
+beside the tree. **k = 2**, so every figure is a pass probability over two samples, not a single
+greedy result. Intervals are percentile bootstrap over tasks, 10,000 draws, seed 20260101.
+
+```
+uv run python -m smol_ladder.summarize --split test --run-tag v2
+uv run python -m smol_ladder.reverify --run-tag v2 --split test --workers 4 --timeout 900
+```
+
+#### Per rung, each on its own denominator — and that is why this table is not the curve
+
+| rung | pass probability | 95% CI | trials scored | tasks | harness failures |
+|---|---|---|---|---|---|
+| L1 | 77.9% | [73.1, 82.6] | 452/500 | 250 | 48 |
+| L1+schema (control, not a rung) | 79.4% | [74.5, 84.1] | 463/500 | 250 | 37 |
+| L2 | 93.4% | [90.3, 96.2] | 410/426 | 213 | 16 |
+| L3 | 95.3% | [92.7, 97.6] | 406/426 | 213 | 20 |
+| L4 | 98.6% | [97.2, 99.8] | 412/426 | 213 | 14 |
+
+L2–L4 are gated on a verified reference, so they ran on 213 tasks and L1 on all 250. **Reading a
+curve off this table compares two populations**, and the gap between them is partly the reference
+gate rather than the ladder. That is what the next table fixes.
+
+#### Every rung on the same task set: the 213 referenced tasks
+
+| rung | pass probability | 95% CI | trials scored | tasks scored | harness failures |
+|---|---|---|---|---|---|
+| L1 | 87.6% | [83.6, 91.3] | 402/426 | 213 | 24 |
+| L1+schema (control) | 88.0% | [83.8, 91.8] | 408/426 | 213 | 18 |
+| L2 | 93.4% | [90.3, 96.2] | 410/426 | 212 | 16 |
+| L3 | 95.3% | [92.7, 97.6] | 406/426 | 211 | 20 |
+| L4 | 98.6% | [97.2, 99.8] | 412/426 | 211 | 14 |
+
+Tasks scored falls below 213 at L2–L4 because at those rungs some task had *every* sample crash,
+and a task with nothing scored contributes no fraction rather than a zero.
+
+**The 37 tasks with no reference**, where no rung above L1 was ever run, on their own:
+
+| rung | pass probability | 95% CI | trials scored | tasks scored | harness failures |
+|---|---|---|---|---|---|
+| L1 | 6.9% | [0.0, 17.2] | 50/74 | 29 | 24 |
+| L1+schema (control) | 21.9% | [9.4, 34.4] | 55/74 | 32 | 19 |
+
+These are the hard tail of the split, and they are *not* "tasks the model needs more information"
+— nothing above L1 was ever tried on them. They carry 24 of the 48 L1 harness failures, so even
+this 6.9% is measured on a thin set of trials.
+
+#### The control, paired: L1+schema minus L1
+
+Over the 241 tasks where both arms produced a scored sample: **25 rescued, 18 hurt, mean delta
++1.2% [−2.1, +4.6], p = 0.36.**
+
+This is the number to hold next to any L2 gain, and it cuts against the ladder. The control adds
+**no information** — only a schema dump, which is a function of the tables. Its pass probability on
+the referenced set is within noise of L1's (88.0% vs 87.6%), and the paired difference does not
+distinguish itself from zero. So on this run the schema dump bought essentially nothing, which
+means the L1 → L2 rise cannot be dismissed as "cheaper reading": L2 adds something L1+schema does
+not. The paired form is the honest one — 25 up and 18 down is a coin, and the unpaired 79.4% vs
+77.9% reading hides that.
+
+#### Rerun consistency: the noise floor
+
+Share of tasks whose two samples of the same cell agree on pass or fail.
+
+| rung | agree | of tasks measured twice | agreement |
+|---|---|---|---|
+| L1 | 185 | 210 | 88.1% |
+| L1+schema | 199 | 218 | 91.3% |
+| L2 | 188 | 198 | 94.9% |
+| L3 | 187 | 195 | 95.9% |
+| L4 | 197 | 201 | 98.0% |
+
+L1 is the least reproducible rung, which is the expected result and bounds everything else: about
+one L1 task in eight changes verdict on a rerun. Agreement *rises* with each rung, because the
+tasks that survive to L4 are the ones the model nearly always solves. A task needs two scored
+samples to appear here at all, so these denominators are below 213 by the crashed samples.
+
+#### Which hand wrote each rung's text
+
+| rung | AST fallback | model hint |
+|---|---|---|
+| L2 | 20 tasks, 95.0% | 192 tasks, 93.2% |
+| L3 | 20 tasks, 85.0% | 191 tasks, 96.3% |
+| L4 | 19 tasks, 100.0% | 192 tasks, 98.4% |
+
+The AST-fallback arm is 20 tasks, so its interval spans most of the plausible range and the L3 gap
+(85.0% vs 96.3%) is not a finding at this size. What it does say is that the plain-language hints
+are not *hurting* where the AST text was used, and the smaller L3 number on 20 tasks is the
+direction to re-measure with more AST fallbacks rather than to quote.
+
+#### The ceiling, and the curve where a hint can still act
+
+Of the referenced tasks: **154 pass L1 in both samples** — no headroom, L2 cannot improve on a
+pass — **56 failed L1 in at least one sample**, and 32 were measured at L1 once so they belong to
+neither count.
+
+That 154 is the most important caveat in this section. Restricted to the 56 tasks that failed L1
+in at least one sample:
+
+| rung | pass probability | 95% CI | tasks scored | harness failures |
+|---|---|---|---|---|
+| L1 | 22.3% | [16.1, 28.6] | 56 | 0 |
+| L1+schema (control) | 37.5% | [25.9, 49.1] | 56 | 5 |
+| L2 | 73.0% | [59.5, 85.1] | 37 | 2 |
+| L3 | 87.8% | [77.0, 95.9] | 37 | 3 |
+| L4 | 97.2% | [93.1, 100.0] | 36 | 5 |
+
+**This is the result, and it is much stronger than the full-set curve.** Where a hint can act, it
+acts: 22.3% → 97.2%, and the control — which adds no information — moves it only to 37.5%. On the
+full referenced set the same rungs read 87.6% → 98.6% because 154 tasks are already at 1.0 and can
+only contribute a constant. Quoting the full-set curve alone would understate the ladder's effect
+by an order of magnitude, and quoting the headroom curve alone would overstate the population. Both
+belong in every caption.
+
+#### Monotonicity
+
+| pair | paired tasks | fell | rose | unpaired | p |
+|---|---|---|---|---|---|
+| L1 → L2 | 212 | 11 | 27 | 38 | 0.014 |
+| L2 → L3 | 210 | 10 | 16 | 40 | 0.33 |
+| L3 → L4 | 209 | 3 | 13 | 41 | 0.021 |
+
+**The ladder is not monotone on this run, and neither is it clean.** At every step more tasks rose
+than fell, so the aggregate curve rises as Blackwell's theorem requires — but individual tasks fell
+at every transition, significantly so at L1 → L2 and L3 → L4. That is the budget effect this file
+predicted: a higher rung adds text that must be read inside a 40-turn cap, and 11 of 212 tasks got
+that wrong. The L2 → L3 pair is neither significant nor clean (10 down, 16 up), so the middle of
+the ladder is where the effect is least characterised. We report the drops as findings and do not
+attribute them: this run cannot separate a drop caused by the *content* of a hint from one caused
+by its *length*, and the test that would separate them (re-running the same rungs at twice the turn
+cap) has not been run.
+
+#### First passing rung, by majority pass — a partition, and a coarse one
+
+| L1 | L2 | L3 | L4 | not climbable (no reference) | not scored (all trials a harness failure) | sum |
+|---|---|---|---|---|---|---|
+| 176 | 26 | 10 | 3 | 27 | 8 | 250 |
+
+The control is excluded from this table by construction, so a task the control rescued is booked by
+the rung that passed it, or by `never`. 25 of the 242 tasks with a scored L1 pass on a fraction
+within 0.25 of the majority line, so their bucket is close to a coin flip at k=2 and this histogram
+should not be read as a per-task verdict.
+
+#### Harness failures and the re-verification
+
+| status | trials |
+|---|---|
+| agent `exit 0`, `verify timeout` | 82 |
+| agent `exit 0`, `verify exit N` | 8 |
+| agent `timeout` (model loop) | 37 + 4 |
+
+The 90 grading failures were not model failures. The machine was at load average 60–80 while v2
+ran, with three sweeps and two test suites on it, and the sealed offline pass has a 180 s deadline.
+`smol_ladder.reverify` re-runs exactly that pass with a generous deadline, four at a time, `nice`d,
+and writes the outcome to a **new** `reverify.json` beside each trial — never to `result.json`,
+because the first pass failing under load is the evidence. `summarize` prefers a re-verification
+that succeeded and reports the count, so recovered trials re-enter the denominators visibly.
+
+Agent timeouts are **not** re-run: that is the model loop failing, and the fix is the model, not a
+second pass over a program it may never have finished writing. They stay harness failures and stay
+out of every denominator.
+
+`REVERIFY_RECOVERY_PLACEHOLDER`
+
+#### What this run does and does not say
+
+Stated conservatively, including the parts that cut against the ladder:
+
+- **The referenced set is biased toward tasks this model can already do.** A reference exists only
+  where a solution by *this same model family* reproduced the gold answer. The ladder is therefore
+  measured on a population selected for being solvable by the model under test, and the 87.6% L1
+  figure on it is near ceiling before any hint is given. This is a selection effect that no
+  analysis of this run removes.
+- **154 of the referenced tasks carry no information at all.** They pass L1 twice, so every rung
+  reads 1.0 on them. The headline full-set curve is mostly a count of easy tasks.
+- **The control is flat against L1** (+1.2%, p=0.36). This is the good news for the ladder's
+  interpretation and the bad news for the "cheaper reading" story: the L2 gain is not
+  explainable as a schema dump, but it also means the dump is not doing the work people assumed
+  it was doing.
+- **The ladder is not monotone.** 11 tasks fell at L1 → L2 and 3 at L3 → L4, two of the three
+  transitions significant. More rose than fell at every step, so the aggregate direction is right,
+  but a real agent with a turn budget can be made worse by more information.
+- **Nothing here says the ladder is "too easy".** This model already passes most referenced tasks
+  at L1, and the task's difficulty is measured on the referenced set, which is the easy part of the
+  split. The informative test is a **weaker model**: one whose L1 sits near 40% would have room for
+  the rungs to move, and on this run the headroom curve is the only place any effect is visible at
+  all. A curve on a model that already solves the set cannot distinguish a good ladder from a
+  useless one.
+- **k=2 is thin.** One task in eight changes L1 verdict between samples, so per-rung differences
+  under ~5 points should not be read as real, and the first-passing-rung histogram is coarse.
+- **The 37 unreferenced tasks are the hardest part of the split and are unmeasured above L1.**
+  L1 scores 6.9% on them. Any claim about "the ladder over the test split" covers 213 of 250
+  tasks.
+
 
 ## What a rung is
 
