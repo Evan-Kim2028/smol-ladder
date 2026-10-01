@@ -494,9 +494,39 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         lines = [l.strip() for l in out.splitlines() if l.strip()]
         result["prediction"] = lines[-1] if lines else ""
         result["reward"] = grade(row, result["prediction"])
+        # The copy has done its job. Left in place it is ~30 MB per trial of somebody else's
+        # tables: 24 GB across the v2 tree, for programs and results that are a few kilobytes
+        # each. It is dropped on both outcomes -- keeping it only for passes would leave the
+        # failures, which are exactly the trials a regrade revisits, holding all the space.
+        #
+        # The links above point into it, so they go with it. They are not evidence: once the
+        # pass has run, the prediction and the reward in result.json are the measurement, and
+        # the bare-filename layout is reconstructed from the cache by the next run.
+        _drop_verify_copy(verify)
     if stderr:
         result["stderr"] = stderr
     return result
+
+
+def _drop_verify_copy(verify: Path) -> None:
+    """Remove `<trial>/verify/input` and the sibling links that resolve through it.
+
+    Deliberately forgiving: a failure here is a wasted copy, never a lost result, so every step
+    is guarded and the copy is tried first. If the removal fails the trial still returns its
+    prediction and reward, and reclaim.py can collect the copy later -- which is the better
+    outcome for the other reason too, since an unremovable directory is a real directory and the
+    one path in `verify/` a regrade must never be built on.
+    """
+    for item in verify.glob("*"):
+        if item.name == "input" or (item.is_symlink()
+                                    and str(item.readlink()).startswith("input" + os.sep)):
+            try:
+                if item.is_dir() and not item.is_symlink():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink()
+            except OSError:
+                pass
 
 
 def sample_dir(rung_dir: Path, k: int) -> Path:
