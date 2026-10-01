@@ -15,7 +15,7 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 
 | module | what it does |
 |---|---|
-| `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the larger tagged jupyter-agent pool; the rest are the v1 and SmolDataEnvs sources. `tasks.read_tables` is the one table reader the schema dump and the synthetic tables share, so the two cannot drift apart |
+| `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the tagged jupyter-agent pools and writes `data/jtasks_v2.jsonl`; `--out data/jtasks_v3.jsonl` writes the corrected pool, with the overlap firewall firing on SmolDataEnvs `test`/`eval` and matching the bare dataset name instead of the full `owner/name` slug. `--v1-compatible` restores the shipped rule. The rest are the v1 and SmolDataEnvs sources. `tasks.read_tables` is the one table reader the schema dump and the synthetic tables share, so the two cannot drift apart |
 | `ladder.py` | the rungs: prompts, the schema-dump control, and the hint blocks — a validated model hint when one is cached, the AST extraction otherwise |
 | `run_ladder.py` | the runner: one trial per (task, rung, sample), in a jail, graded offline |
 | `sandbox.py`, `or_agent.py`, `upstream.py` | the offline grading pass; the solver agent; the two upstream 2B protocols |
@@ -43,8 +43,16 @@ uv run --with pytest pytest -q tests
 uv run python -m smol_ladder.run_ladder --split test --rungs L1,L1+schema,L2,L3,L4 \
   --samples 4 --no-climb --workers 20
 
-uv run python -m smol_ladder.summarize --split test        # writes data/runs/summary_test.json
-uv run python -m smol_ladder.regrade --split test          # what the ANSWER: prefix costs
+# --run-tag gives the sweep its own results tree, data/runs/TAG/<split>/, plus a RUN.json
+# recording the code, command line, model, protocol, rungs, samples, climb setting and the
+# reference denominator at launch, so one ladder version's results are never silently pooled
+# with another's.
+uv run python -m smol_ladder.run_ladder --split test --rungs L1 --samples 2 \
+  --no-climb --run-tag v2 --workers 20
+
+uv run python -m smol_ladder.summarize --split test                 # legacy data/runs/test tree
+uv run python -m smol_ladder.summarize --split test --run-tag v2    # that run's own tree
+uv run python -m smol_ladder.regrade --split test                   # what the ANSWER: prefix costs
 ```
 
 Sample 0 is the existing `<task>/<rung>/result.json`, so a tree written before `--samples` was
@@ -54,8 +62,14 @@ reused, never re-graded, and never restamped with this run's commit.
 Reference solutions, and a task pool:
 
 ```sh
-uv run python -m smol_ladder.gen_refs --split test --workers 8
-uv run python -m smol_ladder.jtasks_v2                      # data/jtasks_v2.jsonl
+# --attempts N gives every task without a verified reference up to N fresh tries. Only
+# reward >= 1.0 counts as final, so a solution that runs cleanly and prints the wrong answer
+# is retried rather than accepted; each attempt keeps its own attempt_<i>/ directory and is
+# never overwritten.
+uv run python -m smol_ladder.gen_refs --split test --attempts 3 --workers 8
+
+uv run python -m smol_ladder.jtasks_v2                              # data/jtasks_v2.jsonl
+uv run python -m smol_ladder.jtasks_v2 --out data/jtasks_v3.jsonl   # corrected pool
 ```
 
 ## Pointing at a different model server
