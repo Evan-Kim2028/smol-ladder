@@ -212,9 +212,55 @@ the pool was missing. Nothing is deleted; the subset is a selection over tags.
 | of which ungradable | 3,141 | units, derivations, "not explicitly stated" |
 | **available beyond v1** | **7,187** | 4.6x the extract on disk |
 
+**The overlap firewall was wrong in both directions, and `data/jtasks_v3.jsonl` is the corrected
+pool.** v1 and v2 dropped any row whose Kaggle dataset appeared in SmolDataEnvs *at all*. That
+over-fired, because `train` is not held out: 5,000 rows of the same public Kaggle corpus, and a
+jupyter-agent task sharing a table with it measures nothing the ladder has already scored. And it
+under-fired, for two reasons that are worth separating because only one is a bug in the code.
+
+*The 122-vs-471 discrepancy is a reporting error, not a matching failure.* The docs describe
+SmolDataEnvs as "built from 471 Kaggle datasets", and 471 is exactly the size of its **train**
+split. The code banned only the **test** split's 122. `eval` adds 81, and the union over all three
+splits is 526. So the two numbers were never two counts of one set; they were two different
+splits. Nothing was mis-matched, the exclusion just covered a third of the corpus it claimed to.
+
+*What did miss overlaps is the identity rule.* Kaggle identifies a dataset as `owner/name`, and
+both sources spell it that way, so comparing slugs looks right. But the same upload is routinely
+re-uploaded under another owner, and jupyter-agent's own `files_used` paths carry the bare name
+(`kaggle/input/pokemon/...`), not the owner. Full-slug matching therefore missed **121 tasks in
+the shipped v2 pool** that reach a held-out SmolDataEnvs table through a mirror — `abbasit/titanic`
+against SmolDataEnvs' `mhouellemont/titanic`, `alopez247/pokemon` against `abcsds/pokemon`, and
+five more bare names. Added to **1,548 tasks on an `eval` slug the old rule never banned at all**,
+that is **1,669 of v2's 9,187 tasks (18%) built on a table SmolDataEnvs `test` or `eval` has already
+scored** — the contamination the firewall existed to prevent.
+
+v3 fires on `test` and `eval` only, and matches on the bare dataset name, so both errors close at
+once: a mirror of a held-out table is caught, and a task sharing a table with SmolDataEnvs `train`
+is kept and tagged `sde_overlap: "train"` / `shares_table_with_sde_train: true`. The trade is
+deliberate and stated in `smol_ladder.jtasks.dataset_key`: a false positive costs one train-pool
+task that was never held out, a false negative ships a task whose gold answer is already in the
+ladder's own results.
+
+| Stage | v3 count | |
+|---|---|---|
+| rows in all 103 shards | 51,389 | |
+| `executor_type == "e2b"` | 29,561 | the `llm` rows have simulated outputs |
+| excluded: table held out by SDE `test`/`eval` | 19,407 | 169 held-out bare names (170 slugs) |
+| kept but tagged: shares SDE `train` | 8,911 | train-only, 343 bare names |
+| gradable answer | **7,518** | numeric 5,660 / label 1,658 / bool 200 |
+| of which ungradable | 2,636 | units, derivations, "not explicitly stated" |
+| ladder-grade (`is_ladder_grade`) | 4,217 | 860 of them in the hard families |
+
+v3 is smaller than v2 (7,518 vs 9,187) even though it is *less* strict about which split counts,
+because the identity fix is worth more rows than the split change is: 19,407 executed rows are
+excluded, against 17,233 before. Every task in v3 is a task that was already in v2, byte-identical
+apart from the two new fields, so no existing result is invalidated and no `task_id` moved. v1 and
+v2 on disk are untouched; `python -m smol_ladder.jtasks_v2 --v1-compatible` reproduces
+`data/jtasks_v2.jsonl` exactly, which is what pins the comparison.
+
 Tags, all pure functions of the row's own text and files, so the pool tags identically on every
 rebuild: `op_family` (ordered regex, first match wins), `answer_type`, `nondeterministic` with its
-reasons, `ambiguous` with its reasons, `n_files`, and `input_bytes`.
+reasons, `ambiguous` with its reasons, `n_files`, `input_bytes`, and `sde_overlap`.
 
 The two flags come straight from the failure analysis, not from taste. `nondeterministic` fires on
 model fits, seeds, sampling and train/test splits — the cases where the gold is one draw from a
@@ -303,7 +349,9 @@ Two consequences, stated up front rather than buried:
   and 4 `test` questions appear verbatim in the released `SmolDataEnvs-sft` blob, two with the
   same answer. The split is by question, not by table. Arms fine-tuned on SmolDataEnvs-sft
   therefore see the tables the L4 hint is written about. Every cross-arm rung comparison must
-  report this; the clean version partitions the 471 Kaggle datasets, not the 5,394 tasks.
+  report this; the clean version partitions the 471 Kaggle datasets (SmolDataEnvs `train`;
+  `test` and `eval` use 122 and 81, 526 in union), not the 5,394 tasks. This is the same
+  train-is-not-heldout distinction the v3 jupyter-agent firewall turns on.
 - Reference solutions are generated by the same model family under evaluation, so "training
   lowered the rung" cannot be separated from "the model recognises its own teacher's code"
   without a shuffled-reference control (a reference from a *different* task, same table).

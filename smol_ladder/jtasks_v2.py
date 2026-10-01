@@ -26,8 +26,25 @@ reasons, an ambiguity flag with reasons, and its file count and input size. The 
 run should use is a *selection* over those tags, computed on demand by `is_ladder_grade`, so a
 reviewer can change the definition without rebuilding the pool.
 
+**What changed in the overlap firewall, and why the pool moved.** v1 and v2 dropped any row
+whose Kaggle dataset appeared in *any* SmolDataEnvs split, which removed 17,233 of 29,561
+executed rows. That rule was wrong on both sides. It over-fired, because SmolDataEnvs `train`
+is not held out: 5,000 rows of the same public Kaggle corpus, and a jupyter-agent task sharing a
+table with it is not measuring anything the ladder has already scored. And it under-fired,
+because it banned only the `test` split's 122 slugs (the 471 in the docs is SmolDataEnvs
+`train`, and the union over all three splits is 526) and compared full `owner/name` slugs, which
+misses a different owner's mirror of the same table. The shipped `data/jtasks_v2.jsonl`
+therefore holds 1,669 tasks built on a table SmolDataEnvs `test` or `eval` has already scored:
+1,548 on an `eval` slug the old rule never banned, and 121 through a mirror.
+
+So the firewall fires on `test` and `eval` only, matches on the bare dataset name, and every row
+carries `sde_overlap` in {none, train} plus `shares_table_with_sde_train`. `--v1-compatible`
+restores the old rule exactly, so `data/jtasks_v2.jsonl` stays reproducible; the corrected pool
+is written to `data/jtasks_v3.jsonl`, and neither v1 nor v2 on disk is touched.
+
     uv run python -m smol_ladder.jtasks_v2 --report-only      # sizes only, no pool written
-    uv run python -m smol_ladder.jtasks_v2                    # writes data/jtasks_v2.jsonl
+    uv run python -m smol_ladder.jtasks_v2 --out data/jtasks_v3.jsonl
+    uv run python -m smol_ladder.jtasks_v2 --v1-compatible    # the rule v1/v2 shipped under
 """
 
 from __future__ import annotations
@@ -39,7 +56,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from smol_ladder.fetch_shards import SHARDS, read_shard, shard_path
-from smol_ladder.jtasks import DATASET, classify, grade_params, smoldataenvs_datasets
+from smol_ladder.jtasks import (
+    DATASET,
+    HELDOUT_SPLITS,
+    classify,
+    dataset_key,
+    grade_params,
+    smoldataenvs_datasets,
+)
 from smol_ladder.tasks import DATA
 
 #: Measured Kaggle dataset sizes, so a rebuild does not re-hit a rate-limited endpoint and
@@ -283,16 +307,80 @@ def is_ladder_grade(tags: dict) -> bool:
 
 # --- the pool ---------------------------------------------------------------------------
 
-def pool_rows(shards: int, limit: int | None, exclude_overlap: bool = True):
+#: The SmolDataEnvs overlap states a task row can carry. `heldout` is the exclusion verdict,
+#: never a tag on a surviving row, so the tag set a consumer has to handle is `none`/`train`.
+SDE_OVERLAP_TAGS = ("none", "train")
+
+
+def _full_slug(slug: str) -> str:
+    """Dataset identity as v1 and v2 computed it: the whole `owner/name`, unnormalised.
+
+    Kept as a named function so the historical rule is greppable rather than an inline
+    `lambda s: s` that a reader has to infer from the argument it is passed to.
+    """
+    return slug or ""
+
+
+def smoldataenvs_firewall() -> tuple[set[str], set[str]]:
+    """The two identity sets the pool is judged against: (heldout, train-only).
+
+    Held-out is `test` + `eval`. Train-only is `train` minus held-out, so a table that appears
+    in all three splits is fired on rather than double-tagged -- held-out wins, because the
+    question is whether the ladder has already scored that table, and it has.
+
+    Keys are `dataset_key` (the bare name), not the slug, because 121 tasks in the shipped v2
+    pool reach a held-out table through a different owner's mirror of it and a slug comparison
+    misses them.
+    """
+    heldout = {dataset_key(s) for s in smoldataenvs_datasets(HELDOUT_SPLITS)}
+    train = {dataset_key(s) for s in smoldataenvs_datasets(("train",))}
+    return heldout, train - heldout
+
+
+def sde_overlap(slug: str | None, heldout: set[str], train: set[str],
+                key=dataset_key) -> str:
+    """`heldout`, `train`, or `none` -- the one place that decision is made.
+
+    All three are returned, not just the two that survive filtering: the exclusion in
+    `pool_rows` and the tag written onto every row then read the same function, so a row
+    cannot be tagged `none` by one and dropped by the other.
+
+    `key` is a parameter rather than a hardcoded `dataset_key` because `--v1-compatible` has to
+    reproduce the old full-slug rule. Hardcoding the normaliser here made that mode compare
+    full slugs in the banned set against bare names, match nothing, and silently drop no rows
+    at all -- a firewall that quietly disables itself is worse than one that is wrong.
+    """
+    identity = key(slug or "")
+    if not identity:
+        return "none"
+    if identity in heldout:
+        return "heldout"
+    return "train" if identity in train else "none"
+
+
+def pool_rows(shards: int, limit: int | None, exclude_overlap: bool = True,
+              heldout: set[str] | None = None, train_only: set[str] | None = None,
+              key=dataset_key):
     """Every gradable task in the local shards, plus the funnel that got there.
 
-    Same filters as v1, same order, so a v1 id is a v2 id: e2b only, no SmolDataEnvs dataset
-    overlap, at least one named file, a gradable answer, unique slug.
+    Same filters as v1, same order, so a v1 id is a v2 id: e2b only, at least one named file, a
+    gradable answer, unique slug.
+
+    The overlap filter is the one rule that changed. v1 and v2 dropped a row whose Kaggle
+    dataset appears in *any* SmolDataEnvs split, which cost 17,233 of 29,561 executed rows to
+    protect a holdout that the `test` split alone never claimed. Only `test` and `eval` are
+    held out, so only those are firewalled; a task sharing a table with SmolDataEnvs `train`
+    is kept and tagged, because train is training data for the same purpose and a jupyter-agent
+    task on it is not measuring anything already measured.
+
+    `exclude_overlap=False` keeps everything, which is the old `--allow-overlap` behaviour, and
+    still tags each row so the audit can see what the firewall would have removed.
     """
+    if heldout is None or train_only is None:
+        heldout, train_only = smoldataenvs_firewall()
     out: list[dict] = []
     stats: Counter = Counter()
     seen: set[str] = set()
-    banned = smoldataenvs_datasets() if exclude_overlap else set()
     for index in range(shards):
         for row in read_shard(index):
             stats["rows"] += 1
@@ -300,9 +388,12 @@ def pool_rows(shards: int, limit: int | None, exclude_overlap: bool = True):
                 stats["not e2b"] += 1
                 continue
             stats["e2b"] += 1
-            if exclude_overlap and row.get("kaggle_dataset_name") in banned:
-                stats["overlaps SmolDataEnvs"] += 1
+            overlap = sde_overlap(row.get("kaggle_dataset_name"), heldout, train_only, key)
+            if exclude_overlap and overlap == "heldout":
+                stats["held out by SmolDataEnvs test/eval"] += 1
                 continue
+            if overlap == "train":
+                stats["shares SmolDataEnvs train (kept, tagged)"] += 1
             files = row.get("files_used") or []
             if not files:
                 stats["no files"] += 1
@@ -329,6 +420,8 @@ def pool_rows(shards: int, limit: int | None, exclude_overlap: bool = True):
                 "source": DATASET,
                 "kaggle_dataset_name": row.get("kaggle_dataset_name"),
                 "edu_score": row.get("edu_score"),
+                "sde_overlap": overlap,
+                "shares_table_with_sde_train": overlap == "train",
             })
             if limit and len(out) >= limit:
                 return out, stats
@@ -452,30 +545,46 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--shards", type=int, default=SHARDS)
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--allow-overlap", action="store_true",
+                    help="keep rows whose table SmolDataEnvs test/eval holds out (kept, but still "
+                         "tagged sde_overlap=heldout, so the audit can see what was waved through)")
+    ap.add_argument("--v1-compatible", action="store_true",
+                    help="firewall on the SmolDataEnvs test split only and match full slugs: the "
+                         "v1/v2 rule, kept so data/jtasks_v2.jsonl stays reproducible")
     ap.add_argument("--out", default=str(DATA / "jtasks_v2.jsonl"))
-    ap.add_argument("--allow-overlap", action="store_true")
     ap.add_argument("--no-kaggle", action="store_true",
                     help="skip the metadata size lookups; download_gb is then omitted")
     ap.add_argument("--report-only", action="store_true",
                     help="print the funnel and distributions without writing the pool")
     args = ap.parse_args()
 
-    rows, stats = pool_rows(args.shards, args.limit, not args.allow_overlap)
+    if args.v1_compatible:
+        splits, key = ("test",), _full_slug
+    else:
+        splits, key = HELDOUT_SPLITS, dataset_key
+    heldout = {key(s) for s in smoldataenvs_datasets(splits)}
+    train_only = set() if args.v1_compatible else (
+        {key(s) for s in smoldataenvs_datasets(("train",))} - heldout)
+    rows, stats = pool_rows(args.shards, args.limit, not args.allow_overlap,
+                            heldout=heldout, train_only=train_only, key=key)
     index = cache_index()
     tagged = tags_for_rows(rows, index)
 
     print(f"funnel over {args.shards} shards")
-    for key, value in stats.most_common():
-        print(f"  {key:24} {value}")
+    for k, value in stats.most_common():
+        print(f"  {k:36} {value}")
     v1 = existing_ids()
     ids = {r["task_id"] for r in tagged}
     print(f"  v1 ids still present       {len(v1 & ids)}/{len(v1)}")
+    print(f"  SDE heldout slugs {len(heldout)} from {splits}; train-only {len(train_only)}")
 
     print("\nop_family        " + json.dumps(Counter(r["op_family"] for r in tagged).most_common()))
     print("answer_type      " + json.dumps(
         Counter(r["answer_type"] for r in tagged).most_common()))
     print(f"nondeterministic {sum(r['nondeterministic'] for r in tagged)}")
     print(f"ambiguous        {sum(r['ambiguous'] for r in tagged)}")
+    print("sde_overlap      " + json.dumps(
+        Counter(r["sde_overlap"] for r in tagged).most_common()))
     print(f"ladder-grade     {sum(map(is_ladder_grade, tagged))}")
     print(f"n_files          {json.dumps(Counter(r['n_files'] for r in tagged).most_common())}")
 

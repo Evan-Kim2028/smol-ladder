@@ -1,14 +1,17 @@
 """Tasks from jupyter-agent: a second, non-overlapping source for the ladder.
 
 SmolDataEnvs gives 250 test tasks, 181 of which have a verified reference, and the critics were
-right that the ladder is underpowered at that size. jupyter-agent is a completely separate
-source (51,389 rows, its own Kaggle datasets), so tasks from it cannot overlap SmolDataEnvs by
-construction. It is also much noisier, and the noise is the whole problem to solve here.
+right that the ladder is underpowered at that size. jupyter-agent is a separate source (51,389
+rows), but *not* a non-overlapping one: both are built from the same public Kaggle corpus, so
+"non-overlapping" has to be enforced rather than assumed, and the firewall that enforces it lives
+in `smol_ladder.jtasks_v2.smoldataenvs_firewall`. It is also much noisier, and the noise is the
+whole problem to solve here.
 
 This module builds the v1 pool (2,000 tasks, 8 shards). `smol_ladder.jtasks_v2` supersedes it
 with all 103 shards (9,187 tasks) plus the quality tags the audit asked for; v1 is kept because
 data/jtasks.jsonl is what the existing runs on the jupyter-agent split were measured against.
-The two agree on ids, so a v1 run stays comparable to a v2 one.
+The two agree on ids, so a v1 run stays comparable to a v2 one. `data/jtasks_v3.jsonl` supersedes
+v2 with the corrected overlap firewall (7,518 tasks).
 
 Two filters decide what survives:
 
@@ -111,10 +114,46 @@ def load_shard(index: int) -> list[dict]:
     return pq.ParquetFile(path).read(columns=COLUMNS).to_pylist()
 
 
-def smoldataenvs_datasets() -> set[str]:
-    """Kaggle dataset slugs SmolDataEnvs already uses, so we can exclude them by construction."""
+#: The SmolDataEnvs splits, in the order "is this table held out?" has to answer for them.
+#: `test` and `eval` are the held-out splits: a table that appears there has already been
+#: described, scored and written up, so a jupyter-agent task built from it would be measuring
+#: the model on an answer it has already seen. `train` is not held out -- it is 5,000 rows of
+#: the same public Kaggle corpus, and sharing a table with it says nothing about contamination.
+HELDOUT_SPLITS = ("test", "eval")
+ALL_SPLITS = ("train", "test", "eval")
+
+
+def smoldataenvs_datasets(splits: tuple[str, ...] = ("test",)) -> set[str]:
+    """Kaggle dataset slugs SmolDataEnvs uses in `splits`, so we can exclude them by construction.
+
+    The default stays `("test",)` and not the held-out pair: v1 and v2 were both built against
+    it, and their pools are on disk being read by live sweeps. The default is v1/v2's rule, this
+    function is the same rule made addressable, and jtasks_v3 asks for `HELDOUT_SPLITS`
+    explicitly.
+    """
     from smol_ladder.tasks import load_split
-    return {r.get("kaggle_dataset") for r in load_split("test") if r.get("kaggle_dataset")}
+    out: set[str] = set()
+    for split in splits:
+        out.update(r["kaggle_dataset"] for r in load_split(split) if r.get("kaggle_dataset"))
+    return out
+
+
+def dataset_key(slug: str) -> str:
+    """A comparison key for a Kaggle dataset slug, so two spellings of one table collide.
+
+    Kaggle identifies a dataset by `owner/name`, and jupyter-agent's `kaggle_dataset_name`
+    carries the same `owner/name`. But the *table* inside two datasets with different owners
+    is very often the same upload (121 tasks in the shipped v2 pool reach a held-out
+    SmolDataEnvs dataset through a mirror under another owner), so matching on the slug alone
+    lets a mirror slip past the firewall. Both sides are reduced to the bare name -- the
+    directory Kaggle extracts to, and the name jupyter-agent's own `files_used` paths carry --
+    then lowercased.
+
+    Over-broad on purpose: a false positive costs one train-pool task that was never held out,
+    while a false negative ships a task whose gold answer is already in the ladder's own
+    results. The 471-vs-122 bug was exactly the other trade.
+    """
+    return (slug or "").strip().lower().rsplit("/", 1)[-1]
 
 
 def collect(shards: int, limit: int | None, exclude_overlap: bool = True) -> tuple[list[dict], Counter]:

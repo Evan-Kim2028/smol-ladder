@@ -20,15 +20,20 @@ import json
 
 import pytest
 
+from smol_ladder.jtasks import HELDOUT_SPLITS, dataset_key
 from smol_ladder.jtasks_v2 import (
     FAMILIES,
     HARD_FAMILIES,
+    SDE_OVERLAP_TAGS,
+    _full_slug,
     cache_index,
     download_estimate,
     input_bytes,
     is_ladder_grade,
     load_size_cache,
+    pool_rows,
     save_size_cache,
+    sde_overlap,
     tag,
     tags_for_rows,
 )
@@ -226,6 +231,153 @@ def test_tags_never_drop_a_field_the_v1_row_carried():
     assert tagged["answer"] == "3"
     assert tagged["atol"] == 1e-4
     assert json.loads(json.dumps(tagged)) == tagged
+
+
+# --- SmolDataEnvs overlap firewall -----------------------------------------------------
+
+HELDOUT = {"pokemon", "titanic"}
+TRAIN = {"iris", "housing"}
+
+
+def test_a_table_in_smoldataenvs_test_or_eval_is_held_out():
+    assert sde_overlap("abcsds/pokemon", HELDOUT, TRAIN) == "heldout"
+
+
+def test_a_table_only_in_smoldataenvs_train_is_tagged_not_excluded():
+    """The decision this change makes: train is not a holdout, so sharing it is harmless."""
+    assert sde_overlap("uciml/iris", HELDOUT, TRAIN) == "train"
+
+
+def test_an_unrelated_table_has_no_overlap():
+    assert sde_overlap("PromptCloudHQ/imdb-data", HELDOUT, TRAIN) == "none"
+
+
+def test_held_out_wins_when_a_table_is_in_both_train_and_test():
+    """A table in all three splits has already been scored by the ladder, so the strict
+    verdict has to survive the train pass; otherwise the firewall leaks exactly the rows it
+    exists to catch."""
+    both = {"pokemon"}
+    assert sde_overlap("abcsds/pokemon", both, both) == "heldout"
+
+
+def test_a_different_owners_mirror_of_a_held_out_table_is_caught():
+    """`mhouellemont/titanic` and `azeembootwala/titanic` are the same upload. Comparing full
+    slugs let 121 tasks in the shipped v2 pool reach a held-out table through the mirror."""
+    assert sde_overlap("azeembootwala/titanic", HELDOUT, TRAIN) == "heldout"
+
+
+def test_the_identity_rule_is_a_parameter_not_hardcoded():
+    """`--v1-compatible` exists to reproduce the old full-slug rule, and it needs the
+    normaliser to follow it into the set *and* the comparison. When the comparison was
+    hardcoded, that mode compared full slugs against bare names, matched nothing, and
+    excluded zero rows: a firewall that silently disables itself while the report still says
+    "held out by SmolDataEnvs". `pool_rows` must pass the same key it was given."""
+    slug_key = _full_slug
+    assert sde_overlap("abcsds/pokemon", {"abcsds/pokemon"}, set(), slug_key) == "heldout"
+    # The same slug is *not* held out under the new bare-name rule with a full-slug banned set,
+    # which is precisely the mismatch that disabled the old mode.
+    assert sde_overlap("abcsds/pokemon", {"abcsds/pokemon"}, set()) == "none"
+    rows = [{"id": "0001/1/1.ipynb_qa_1", "executor_type": "e2b", "question": "q", "answer": "3",
+             "files_used": ["pokemon.csv"], "kaggle_dataset_name": "abcsds/pokemon"}]
+    monkey_rows = rows
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("smol_ladder.jtasks_v2.read_shard", lambda index: monkey_rows)
+        out, stats = pool_rows(1, None, True, heldout={"abcsds/pokemon"}, train_only=set(),
+                               key=slug_key)
+    assert out == [] and stats["held out by SmolDataEnvs test/eval"] == 1
+
+
+def test_dataset_key_reduces_a_slug_to_its_bare_name():
+    assert dataset_key("abcsds/pokemon") == "pokemon"
+    assert dataset_key("uciml/iris") == "iris"
+    # A slug with no owner is already bare; it must not become empty.
+    assert dataset_key("iris") == "iris"
+    # Case and stray whitespace are the two spellings that actually differ in the wild.
+    assert dataset_key("  ABCsds/Pokemon ") == "pokemon"
+    assert dataset_key(None) == ""
+
+
+def test_a_row_with_no_dataset_is_not_firewalled():
+    """jupyter-agent rows can carry a null `kaggle_dataset_name`. Such a row has no table to
+    overlap with, so it is tagged `none` rather than being treated as a match against an empty
+    key."""
+    assert sde_overlap(None, HELDOUT, TRAIN) == "none"
+    assert sde_overlap("", HELDOUT, TRAIN) == "none"
+
+
+def test_every_tag_value_is_declared():
+    """A consumer switches on this string, so the set has to be a named constant rather than
+    whatever the function happens to return today."""
+    assert set(SDE_OVERLAP_TAGS) == {"none", "train"}
+    assert sde_overlap("a/pokemon", HELDOUT, TRAIN) not in SDE_OVERLAP_TAGS  # excluded rows
+    assert sde_overlap("a/iris", HELDOUT, TRAIN) in SDE_OVERLAP_TAGS
+
+
+def test_the_heldout_splits_are_test_and_eval_and_not_train():
+    assert set(HELDOUT_SPLITS) == {"test", "eval"}
+    assert "train" not in HELDOUT_SPLITS
+
+
+def test_pool_rows_drops_held_out_and_keeps_and_tags_train(monkeypatch):
+    """The whole rule, on the rows themselves: a held-out table leaves the pool, a train
+    table stays and is tagged, and both carry the same task_id they always had."""
+    rows = [
+        {"id": "0001/1/1.ipynb_qa_1", "executor_type": "e2b", "question": "q", "answer": "3",
+         "files_used": ["kaggle/input/pokemon/Pokemon.csv"],
+         "kaggle_dataset_name": "abcsds/pokemon"},
+        {"id": "0002/2/2.ipynb_qa_2", "executor_type": "e2b", "question": "q", "answer": "3",
+         "files_used": ["kaggle/input/iris/iris.csv"],
+         "kaggle_dataset_name": "uciml/iris"},
+        {"id": "0003/3/3.ipynb_qa_3", "executor_type": "e2b", "question": "q", "answer": "3",
+         "files_used": ["kaggle/input/imdb/imdb.csv"],
+         "kaggle_dataset_name": "PromptCloudHQ/imdb-data"},
+    ]
+    monkeypatch.setattr("smol_ladder.jtasks_v2.read_shard", lambda index: rows)
+    out, stats = pool_rows(1, None, True, heldout=HELDOUT, train_only=TRAIN)
+
+    assert [r["task_id"] for r in out] == ["ja_0002_2_2.ipynb_qa_2", "ja_0003_3_3.ipynb_qa_3"]
+    assert stats["held out by SmolDataEnvs test/eval"] == 1
+    assert stats["shares SmolDataEnvs train (kept, tagged)"] == 1
+    kept = {r["task_id"]: r for r in out}
+    assert kept["ja_0002_2_2.ipynb_qa_2"]["sde_overlap"] == "train"
+    assert kept["ja_0002_2_2.ipynb_qa_2"]["shares_table_with_sde_train"] is True
+    assert kept["ja_0003_3_3.ipynb_qa_3"]["sde_overlap"] == "none"
+    assert kept["ja_0003_3_3.ipynb_qa_3"]["shares_table_with_sde_train"] is False
+
+
+def test_allow_overlap_keeps_held_out_rows_but_still_tags_them(monkeypatch):
+    """`--allow-overlap` has to mean what it says without losing the evidence of what it
+    waved through, or a run made with it cannot be audited afterwards."""
+    rows = [{"id": "0001/1/1.ipynb_qa_1", "executor_type": "e2b", "question": "q", "answer": "3",
+             "files_used": ["pokemon.csv"], "kaggle_dataset_name": "abcsds/pokemon"}]
+    monkeypatch.setattr("smol_ladder.jtasks_v2.read_shard", lambda index: rows)
+    out, _ = pool_rows(1, None, False, heldout=HELDOUT, train_only=TRAIN)
+    assert [r["sde_overlap"] for r in out] == ["heldout"]
+    assert out[0]["shares_table_with_sde_train"] is False
+
+
+def test_the_shipped_v2_pool_is_reported_as_contaminated_not_asserted_clean():
+    """data/jtasks_v2.jsonl was built with the weaker rule, so it *does* contain tables the
+    firewall would now reject -- 1,548 tasks on an `eval` slug it never banned, and 121
+    reaching a held-out table through another owner's mirror. This test records that debt
+    rather than forbidding it, and fails only if the count moves, which is the signal that the
+    identity rule changed underneath a pool live sweeps are still reading."""
+    from smol_ladder.jtasks import smoldataenvs_datasets
+    from smol_ladder.tasks import DATA
+
+    path = DATA / "jtasks_v2.jsonl"
+    if not path.exists():
+        pytest.skip("pool not built")
+    heldout = {dataset_key(s) for s in smoldataenvs_datasets(HELDOUT_SPLITS)}
+    contaminated = [r for r in tags_from_file(path)
+                    if dataset_key(r.get("kaggle_dataset_name", "")) in heldout]
+    assert len(contaminated) == 1669, (
+        f"v2 contamination count moved to {len(contaminated)}; v3 exists to fix this, so either "
+        "re-audit the affected tasks or record the new number deliberately")
+
+
+def tags_from_file(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # --- download estimate -----------------------------------------------------------------
