@@ -30,9 +30,10 @@ SYSTEM = """You are solving a data-analysis question.
 
 Work by running Python. The input tables are in ./input (read-only). Use the shell to explore
 the data, then write ./solution.py: a self-contained script that reads only from ./input,
-computes the answer, and prints the final answer as its LAST line of output. The final answer
-is just the value: a number (no commas or units), a short label, yes/no, or a comma-separated
-list. Run `python3 solution.py` to check it works.
+computes the answer, and prints the final answer as its LAST line of output. That last line is
+graded on its own, so it must be the value alone: a number (no commas or units), a short label,
+yes/no, or a comma-separated list. No label, no "Answer:" prefix, no trailing explanation --
+"Answer: 42" grades as 0, "42" grades as 1. Run `python3 solution.py` to check it works.
 
 Compute the answer from the files. Do not look it up online or in any dataset."""
 

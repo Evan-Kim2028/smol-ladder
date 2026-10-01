@@ -36,8 +36,10 @@ Files:
 
 Explore the data with Python as much as you need. Then write ./solution.py: a self-contained
 script that reads only from ./input, computes the answer, and prints the final answer as its
-LAST line of output. The final answer is just the value: a number (no commas or units),
-a short label, yes/no, or a comma-separated list. Run `python3 solution.py` to check it works.
+LAST line of output. That last line is graded on its own, so it must be the value alone: a number
+(no commas or units), a short label, yes/no, or a comma-separated list. No label, no "Answer:"
+prefix, no trailing explanation -- "Answer: 42" grades as 0, "42" grades as 1.
+Run `python3 solution.py` to check it works.
 Do not look the answer up online or in any dataset; compute it from the files."""
 
 HINT_HEADER = "\n\nA verified reference solution to this question is below. It is one correct\n" \
