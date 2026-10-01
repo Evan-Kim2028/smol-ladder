@@ -166,6 +166,54 @@ capped at 0.05. The floor matters: an answer stored as `8.89663104713` with a 1e
 marks a model that printed `8.896631` wrong, which measures the grader, not the agent. The cap
 matters too, or an integer `453` gets a whole-unit tolerance and admits `453.4`.
 
+### The v2 pool
+
+The first extract stopped at 2,000 tasks after 8 of 103 shards, and shipped rows carrying only a
+question and an answer. `data/jtasks_v2.jsonl` keeps the same filters and the same `ja_<slug>` id
+rule, so **every one of the 2,000 v1 task_ids is still present**, and adds the tags the audit said
+the pool was missing. Nothing is deleted; the subset is a selection over tags.
+
+| Stage | count | |
+|---|---|---|
+| rows in all 103 shards | 51,389 | |
+| `executor_type == "e2b"` | 29,561 | the `llm` rows have simulated outputs |
+| excluded: SmolDataEnvs dataset overlap | 17,233 | by `kaggle_dataset` slug, 122 banned |
+| gradable answer | 9,187 | numeric 6,932 / label 2,007 / bool 248 |
+| of which ungradable | 3,141 | units, derivations, "not explicitly stated" |
+| **available beyond v1** | **7,187** | 4.6x the extract on disk |
+
+Tags, all pure functions of the row's own text and files, so the pool tags identically on every
+rebuild: `op_family` (ordered regex, first match wins), `answer_type`, `nondeterministic` with its
+reasons, `ambiguous` with its reasons, `n_files`, and `input_bytes`.
+
+The two flags come straight from the failure analysis, not from taste. `nondeterministic` fires on
+model fits, seeds, sampling and train/test splits — the cases where the gold is one draw from a
+distribution the question does not pin, so a correct agent scores 0 and no information rung can
+fix it. `ambiguous` fires on two independent things: a label answer whose own words never appear
+in the question (gold `North America`, agent says `NA`), and a question that defers to a criterion
+it never states ("based on correlation analysis", "the threshold that separates ...").
+
+| tag | value |
+|---|---|
+| `op_family` | ml_fit 2,528 · count 2,306 · agg 1,260 · stat_test 786 · string 730 · filter 708 · argmax 389 · other 276 · groupby 166 · lookup 21 · join 17 |
+| `answer_type` | numeric 6,932 · label 2,007 · bool 248 |
+| `nondeterministic` | 2,286 (model fit 2,063, random sampling 433) |
+| `ambiguous` | 2,179 (label vocabulary 1,610, unstated threshold 449, unjudged comparison 335) |
+| `n_files` | 1: 7,562 · 2: 1,196 · 3: 224 · ≥4: 205 |
+
+**Ladder-grade subset** — a task that is not nondeterministic, not ambiguous, and has files:
+**5,124 of 9,187** (55.8%). That keeps 1,102 of the 2,000 v1 tasks, so it is a selection and not
+a repopulation. Its family mix is count 1,776 · agg 841 · string 617 · filter 544 · stat_test 495
+· ml_fit 410, i.e. it deliberately keeps the method-ambiguous families (1,055 hard-family tasks)
+and does not tune towards count/agg, because those are the families the ladder has nothing to
+disambiguate.
+
+Inputs are priced, not fetched: **8,668 of 9,187 tasks (94.3%) reuse datasets already in the
+Kaggle cache**, and the remaining 519 tasks across 148 uncached datasets need ~69 GB. No bulk
+download was attempted; sizes come from Kaggle's dataset-view metadata endpoint (~4 KB per
+dataset) and are cached in `data/jl_dataset_sizes.json`, because that endpoint rate-limits and a
+rebuild without the cache reports a *smaller* download cost each time more lookups 429.
+
 ## Construction rules
 
 1. **Cumulative.** Lk = L(k-1) + a new block. Nothing is reworded or dropped. This is what makes

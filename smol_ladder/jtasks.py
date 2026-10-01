@@ -5,6 +5,11 @@ right that the ladder is underpowered at that size. jupyter-agent is a completel
 source (51,389 rows, its own Kaggle datasets), so tasks from it cannot overlap SmolDataEnvs by
 construction. It is also much noisier, and the noise is the whole problem to solve here.
 
+This module builds the v1 pool (2,000 tasks, 8 shards). `smol_ladder.jtasks_v2` supersedes it
+with all 103 shards (9,187 tasks) plus the quality tags the audit asked for; v1 is kept because
+data/jtasks.jsonl is what the existing runs on the jupyter-agent split were measured against.
+The two agree on ids, so a v1 run stays comparable to a v2 one.
+
 Two filters decide what survives:
 
 - ``executor_type == "e2b"``. The ``llm`` rows have their outputs simulated, so their answers
