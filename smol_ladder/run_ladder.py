@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -51,12 +52,19 @@ def source_for(split: str):
     return load_split(split), input_dir
 
 
-def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
-    """The task's tables, the toolchain, and the solver package. Nothing else.
+def jail(work: Path, inputs: Path, venv: Path, scratch: Path | None = None) -> list[str]:
+    """The task's tables, the toolchain, and a writable scratch directory.
 
-    $HOME is a tmpfs, so the HF cache (which holds the gold answers), the repo's data/ dir and
-    every sibling task's solution are gone. Only the solver package is bound back in, because
-    the model loop has to be importable, and it contains no answers.
+    The writable directory is NOT the trial directory. $HOME pointed there, and the agents also
+    run `pip download <pkg> -d .`, so a single trial collected 2.9 GB of cuda wheels next to
+    its own solution.py and the results tree grew to tens of gigabytes. The agent works in
+    scratch; once() copies solution.py back, so the only thing kept in the trial directory is
+    the result.
+
+    The task's tables and the toolchain are bound read-only. Nothing else: not the repo, not the
+    HF cache that holds the gold answers, not a sibling task's solution. Each trial gets its own
+    $HOME, and that is the other half of the isolation -- the repo's real $HOME is a tmpfs, so
+    the HF cache and every sibling solution are gone.
 
     The interpreter is bound by its *resolved* path too: .venv/bin/python3 is a symlink into
     uv's managed CPython, and bwrap execs the literal path, so the run fails without it.
@@ -78,6 +86,15 @@ def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
     for link in sorted(inputs.glob("*")):
         if link.is_symlink():
             ro.add(link.resolve().parent)
+    writable = scratch or work
+    writable.mkdir(parents=True, exist_ok=True)
+    # The agent must see its tables as ./input inside the writable dir.
+    link = writable / "input"
+    if not link.exists():
+        try:
+            link.symlink_to(inputs.resolve())
+        except OSError:
+            pass
     # Order matters: the catch-all read-only bind of / must come first, or it shadows the
     # /dev and /proc mounts below and CPython cannot read urandom to seed its hash randomiser.
     args = ["bwrap", "--ro-bind", "/", "/", "--tmpfs", str(Path.home())]
@@ -85,8 +102,8 @@ def jail(work: Path, inputs: Path, venv: Path) -> list[str]:
         if d.exists():
             args += ["--ro-bind", str(d), str(d)]
     args += ["--dev", "/dev", "--proc", "/proc", "--unshare-pid", "--tmpfs", "/tmp",
-             "--bind", str(work), str(work),
-             "--chdir", str(work), "--die-with-parent"]
+             "--bind", str(writable), str(writable),
+             "--chdir", str(writable), "--die-with-parent"]
     return args
 
 
@@ -153,7 +170,7 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
-         retry_failed: bool = False, inputs_of=input_dir) -> dict:
+         retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run") -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
@@ -166,13 +183,34 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
             return prior
     work.mkdir(parents=True, exist_ok=True)
     inputs = inputs_of(row)  # fetched here, not inside the jail: kagglehub needs $HOME
+    # The trial directory keeps a pointer to the tables, and only that: it is provenance on
+    # disk (a later re-run of a rung, a human reading a failure) and costs one symlink.
     inp = work / "input"
     if not inp.exists():
         inp.symlink_to(inputs.resolve())
+    # One per-trial directory holds everything the agent may write, and once() copies back the
+    # single artifact worth keeping. The trial directory itself is a result we keep, and
+    # $HOME pointed there, so one `pip install xgboost` left 660 MB of wheels beside
+    # solution.py. Redirecting HOME alone was not enough: the agents also run
+    # `pip download <package> -d .`, which writes into the *current* directory, so the cwd has
+    # to move too.
+    trial_scratch = Path(os.environ.get("SMOL_LADDER_SCRATCH", "/var/tmp/smol-ladder/scratch"))
+    trial_scratch = trial_scratch / "trials" / row["task_id"] / rung_label
+    # Cleared on entry so a retry never inherits the previous attempt's files, and again on the
+    # way out: a sweep over hundreds of tasks would otherwise leave every wheel it ever collected.
+    shutil.rmtree(trial_scratch, ignore_errors=True)
+    trial_scratch.mkdir(parents=True, exist_ok=True)
     env = {
         "PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
-        "HOME": str(work),
+        # Per trial, not a shared root: with one $HOME for the whole sweep, concurrent agents
+        # could read each other's pip cache and ~/.cache, and nothing ever cleaned it up.
+        "HOME": str(trial_scratch),
         "LANG": "C.UTF-8",
+        # Inside the jail /tmp is its own tmpfs, but the host needs a real directory: a missing
+        # TMPDIR makes tools fall back to /tmp, which the bwrap invocation below does not bind.
+        "TMPDIR": str(trial_scratch / "tmp"),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_INPUT": "1",
         "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
         "NUMEXPR_NUM_THREADS": "1", "VECLIB_MAXIMUM_THREADS": "1",
         # joblib and multiprocessing ignore the BLAS caps and will happily take every core
@@ -194,8 +232,9 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     t0 = time.time()
     try:
         proc = _run_jailed(
-            jail(work, inputs, venv) + [sys.executable, "-c", script, prompt],
-            work, env, timeout=AGENT_TIMEOUT)
+            jail(work, inputs, venv, trial_scratch)
+            + [sys.executable, "-c", script, prompt],
+            trial_scratch, env, timeout=AGENT_TIMEOUT)
         agent_status = f"exit {proc.returncode}"
         stderr = proc.stderr.decode("utf-8", "replace")[-2000:] \
             if isinstance(proc.stderr, bytes) else (proc.stderr or "")[-2000:]
@@ -203,6 +242,13 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         agent_status, stderr = "timeout", ""
     except Exception as e:  # noqa: BLE001 - one bad trial must not kill the sweep
         agent_status, stderr = f"error: {type(e).__name__}", str(e)[-2000:]
+    # The agent wrote solution.py into scratch; that is the one artifact we keep. Its stdout
+    # is deliberately not the prediction: the agent's last command prints whatever it pleased,
+    # so the number graded is whatever solution.py itself printed when re-run offline below.
+    produced = trial_scratch / "solution.py"
+    if produced.exists():
+        shutil.copy(produced, work / "solution.py")
+    shutil.rmtree(trial_scratch, ignore_errors=True)
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
               "agent_seconds": round(time.time() - t0, 1), "prediction": "", "reward": 0.0}
     solution = work / "solution.py"
@@ -277,7 +323,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
         work = root / row["task_id"] / rung.replace("+", "_")
         work.mkdir(parents=True, exist_ok=True)
         r = once(row, prompt_for(row, split, prompt_rung), work, venv, model, max_turns,
-                 retry_failed, inputs_of)
+                 retry_failed, inputs_of, rung)
         r["rung"] = prompt_rung
         (work / "result.json").write_text(json.dumps(r, indent=1))
         out.append(r)
