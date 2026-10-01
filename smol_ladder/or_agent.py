@@ -241,6 +241,12 @@ def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
     run_shell(command) -> str executes in the task container; write_solution(code) stages
     solution.py. Returns the per-turn log. Kept free of Harbor types so it can be tested
     against a stub and reused outside a trial.
+
+    The log is the only record of *how* the answer was reached, and it is a training set: a
+    verified pass with its conversation is an SFT trajectory, and a verified pass without it is
+    only a program and an answer. Each entry carries the model's message and the tool results that
+    came back, which is exactly the assistant/tool pair structure upstream's dataset stores, so
+    `train.traces` can convert one into the other without guessing.
     """
     ep = ep or endpoint()
     messages: list[dict] = [

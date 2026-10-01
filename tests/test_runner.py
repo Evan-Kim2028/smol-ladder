@@ -106,8 +106,11 @@ def test_once_runs_end_to_end(tmp_path, monkeypatch):
     link = work / "input"
     assert link.is_symlink()
     assert link.resolve() == inputs.resolve()
-    # nothing beyond the result, the prompt, the solution, and the verifier's own working copy
-    allowed = {"input", "solution.py", "verify", "result.json", "turns.json", "prompt.txt"}
+    # nothing beyond the result, the prompt, the solution, the transcript, and the verifier's own
+    # working copy. The transcript is here deliberately: it is the training artifact, and a test
+    # that pinned this set before transcripts existed would have failed loudly the day one did.
+    allowed = {"input", "solution.py", "verify", "result.json", "turns.json", "prompt.txt",
+               "transcript.json"}
     assert {p.name for p in work.iterdir()} <= allowed, sorted(p.name for p in work.iterdir())
 
     # the prediction is solution.py's own output when re-run offline, not the agent's stdout
@@ -186,6 +189,105 @@ def test_each_trial_gets_its_own_home(tmp_path, monkeypatch):
 
     assert len(set(homes)) == 3, f"two trials shared a HOME: {homes}"
     assert all(h.endswith(("t1/L1", "t2/L1", "t1/L2")) for h in homes), homes
+
+
+def test_once_keeps_the_transcript(tmp_path, monkeypatch):
+    """The artifact whose absence made every sweep untrainable.
+
+    once() used to copy only solution.py out of the per-trial scratch and then delete the scratch,
+    so the assistant/tool conversation that produced a verified answer was thrown away and a
+    verified trial was just a program and a number. A transcript is an SFT trajectory; without one
+    the whole runs tree is a results log. Default-on, and --no-transcript is the opt-out.
+    """
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            return real_run(cmd, cwd, env, timeout)
+        # Stand in for the model loop: write the program the way solve_loop's contract says, and a
+        # transcript the way _agent_script writes one.
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        log = [{"model": "m", "message": {"content": "looking"},
+                "tool_calls": [{"id": "c1", "function": {"name": "run_shell",
+                                                         "arguments": {"command": "ls"}}}],
+                "tool_results": [{"name": "run_shell", "output": "a b c"}]}]
+        (Path(cwd) / "transcript.json").write_text(json.dumps(log))
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    runner.once(row, "Q?", work, Path(sys.prefix), "m", 2, inputs_of=lambda r: inputs)
+
+    turns = json.loads((work / "transcript.json").read_text())
+    assert len(turns) == 1
+    assert turns[0]["tool_results"][0]["output"] == "a b c"
+    # and the scratch copy is gone, so what survives is one file per trial, not two
+    assert not list((tmp_path / "scratch").rglob("transcript.json"))
+
+
+def test_no_transcript_leaves_no_file(tmp_path, monkeypatch):
+    """The opt-out must actually opt out, or --no-transcript is a slower no-op."""
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            return real_run(cmd, cwd, env, timeout)
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        (Path(cwd) / "transcript.json").write_text("[]")
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    runner.once(row, "Q?", work, Path(sys.prefix), "m", 2, inputs_of=lambda r: inputs,
+                save_transcript=False)
+    assert not (work / "transcript.json").exists()
+
+
+def test_a_half_written_transcript_is_not_kept(tmp_path, monkeypatch):
+    """A killed trial leaves a truncated transcript.json, and a truncated one is worse than none:
+    train/traces.py would read it as a complete one-turn trajectory and train on it."""
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            return real_run(cmd, cwd, env, timeout)
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        (Path(cwd) / "transcript.json").write_text('[{"model": "m", "mess')
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    result = runner.once(row, "Q?", work, Path(sys.prefix), "m", 2, inputs_of=lambda r: inputs)
+    assert not (work / "transcript.json").exists()
+    # the trial still scored: losing the transcript must not lose the result
+    assert result["reward"] == 1.0
 
 
 def test_jail_chdirs_into_scratch_not_the_trial_dir(tmp_path):
@@ -434,7 +536,8 @@ def test_the_control_runs_without_a_reference(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "read_source", lambda row, split: None)
 
     def fake_once(row, prompt, work, venv, model, max_turns, retry_failed, inputs_of,
-                  rung_label="run", provenance=None, was_run=None, agent="tools"):
+                  rung_label="run", provenance=None, was_run=None, agent="tools",
+                  save_transcript=True):
         ran.append(work.name)
         if was_run is not None:
             was_run.clear()

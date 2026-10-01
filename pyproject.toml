@@ -18,5 +18,20 @@ dependencies = [
   "kagglehub>=1.0.2",
 ]
 
+# Post-training. Optional and deliberately heavy: the eval harness needs none of it, and the
+# existing suite runs in seconds without it. `uv run --extra train python -m train.sft_lora`.
+# torch is pinned to a CUDA 12.x wheel set because that is what both the RTX 4050 and Kaggle's T4
+# driver stacks want; a CPU-only default would silently make the smoke run 50x slower.
+[project.optional-dependencies]
+train = [
+  "torch>=2.6",
+  "transformers>=5.17",
+  "trl>=1.13",
+  "peft>=0.21",
+  "accelerate>=1.0",
+  "datasets>=5.0",
+  "bitsandbytes>=0.45",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]

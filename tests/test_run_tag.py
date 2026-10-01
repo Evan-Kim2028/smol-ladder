@@ -366,7 +366,8 @@ def test_the_summary_pins_the_not_climbable_bucket_to_the_launch(monkeypatch):
 
 def _fake_once(ran: list):
     def once(row, prompt, work, venv, model, max_turns, retry_failed=False, inputs_of=None,
-             rung_label="run", provenance=None, was_run=None, agent="tools"):
+             rung_label="run", provenance=None, was_run=None, agent="tools",
+             save_transcript=True):
         work = Path(work)
         if was_run is not None:
             was_run.clear()

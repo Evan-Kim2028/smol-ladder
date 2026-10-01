@@ -250,11 +250,18 @@ def _kill_group(proc: subprocess.Popen) -> None:
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
          retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run",
          provenance: dict | None = None, was_run: list | None = None,
-         agent: str = "tools") -> dict:
+         agent: str = "tools", save_transcript: bool = True) -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
     asked, so a rerun does not quietly re-roll a genuinely failed task.
+
+    `save_transcript` (default on) copies the assistant/tool conversation out of the per-trial
+    scratch beside solution.py. It was the missing artifact: the scratch is deleted on the way out
+    and the loop's log went with it, so every trial this harness has ever run left a program, an
+    answer, and a turn *count* -- and a verified trial is the only training data this project
+    produces. The file is a few KB to a few hundred KB against a table that is usually larger, and
+    `--no-transcript` exists for the sweep that only wants the score.
 
     A cached result from before this carried no provenance, so it is returned untouched: stamping
     today's git commit onto a result some older code produced would be a lie, and summarize.py
@@ -370,6 +377,17 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     submitted = trial_scratch / "answer.txt"
     if submitted.exists():
         shutil.copy(submitted, work / "answer.txt")
+    # The conversation, if the protocol wrote one. Copied before the rmtree below, and only from a
+    # file that parsed: a half-written transcript from a killed trial would otherwise be read back
+    # as a complete (and very short) trajectory, which is worse than none at all.
+    transcript = trial_scratch / "transcript.json"
+    if save_transcript and transcript.exists():
+        try:
+            turns = json.loads(transcript.read_text())
+        except ValueError:
+            turns = None
+        if isinstance(turns, list):
+            (work / "transcript.json").write_text(json.dumps(turns))
     shutil.rmtree(trial_scratch, ignore_errors=True)
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
               "agent": agent, "base_url": env["SMOL_LADDER_BASE_URL"],
@@ -499,46 +517,55 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
     trained on; the system turn comes from the same module and is not the rung prompt, because a
     rung's extra information has to arrive in the user turn to be a rung at all.
 
-    All three write turns.json so once() can tell a clean finish from a crash. Built rather than
-    switched at the call site because the difference between the three is invisible in a one-line
-    %-format, and a test that guesses which body it is running silently stops exercising it.
+    All three write transcript.json -- the full assistant/tool conversation, one JSON object per
+    turn -- beside the turns.json that holds only the count. Before this, a trial left a program
+    and an answer and threw the conversation away, so the sweeps had no training data in them at
+    all: the 2,178 verified trials under data/runs/ could each become a program-plus-answer and
+    nothing else. Built rather than switched at the call site because the difference between the
+    three is invisible in a one-line %-format, and a test that guesses which body it is running
+    silently stops exercising it.
     """
     head = ("import json,os,sys;"
             "sys.path.insert(0, %r);"
             "import smol_ladder.or_agent as A;"
             "import smol_ladder.upstream as U;"
             % str(Path(__file__).resolve().parent.parent))
+    # No format placeholders of its own, so it is concatenated after the %-formatting rather than
+    # folded into it: `dump % args` with no specifier is a TypeError, and one of the three bodies
+    # formats separately from the other two purely because of where its arguments sit.
+    dump = ("open('transcript.json','w').write(json.dumps(log));"
+            "open('turns.json','w').write(json.dumps(len(log)))")
     if agent == "tools":
-        return head + (
-            "log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
-            "lambda c: open('solution.py','w').write(c), %r, %d);"
-            "open('turns.json','w').write(json.dumps(len(log)))" % (model, max_turns))
+        body = ("log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
+                "lambda c: open('solution.py','w').write(c), %r, %d);" % (model, max_turns))
+        return head + body + dump
     if agent == "program":
         # Upstream's generation step exactly: one turn, no tools, 1024 new tokens. The extracted
         # program is written to solution.py so the offline grading pass below runs it sealed, the
         # same way it runs our agent's -- the prediction is what the program printed when re-run,
-        # never the model's stdout.
-        return head + (
-            "M=[{'role':'system','content':U.PROGRAM_SYSTEM},"
-            "{'role':'user','content':sys.argv[1]}];"
-            "out=A.program_once(M, %r);"
-            "open('solution.py','w').write(out['code']);"
-            "open('turns.json','w').write('1')" % model)
+        # never the model's stdout. The one-turn log is still a transcript: it is the whole
+        # conversation under this protocol, and it is what makes the run trainable.
+        body = ("M=[{'role':'system','content':U.PROGRAM_SYSTEM},"
+                "{'role':'user','content':sys.argv[1]}];"
+                "out=A.program_once(M, %r);"
+                "log=[out];"
+                "open('solution.py','w').write(out['code']);" % model)
+        return head + body + dump
     if agent == "bash":
-        return head + (
-            "M=[{'role':'system','content':U.BASH_SYSTEM},"
-            "{'role':'user','content':sys.argv[1]}];"
-            "log=A.bash_loop(M, lambda c: A.run_command(c),"
-            "lambda: (open('answer.txt').read() if os.path.exists('answer.txt') else None),"
-            "%r, %d);"
-            "open('turns.json','w').write(json.dumps(len(log)))" % (model, max_turns))
+        body = ("M=[{'role':'system','content':U.BASH_SYSTEM},"
+                "{'role':'user','content':sys.argv[1]}];"
+                "log=A.bash_loop(M, lambda c: A.run_command(c),"
+                "lambda: (open('answer.txt').read() if os.path.exists('answer.txt') else None),"
+                "%r, %d);" % (model, max_turns))
+        return head + body + dump
     raise ValueError(f"unknown agent protocol {agent!r}")
 
 
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
                 runs_root: Path | None = None, samples: int = 1,
-                climb: bool = True, agent: str = "tools") -> list[dict]:
+                climb: bool = True, agent: str = "tools",
+                save_transcript: bool = True) -> list[dict]:
     """Run the ladder for one task: `samples` trials per rung, optionally climbing.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
@@ -585,7 +612,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
             r = once(row, prompt, work, venv, model, max_turns,
                      retry_failed, inputs_of, label,
                      {"rung": prompt_rung, "sample": k, "hint_source": src}, ran,
-                     agent)
+                     agent, save_transcript)
             # Write only what once() actually produced. A reused result is already on disk with
             # whatever provenance it was written with, and rewriting it here would stamp this
             # run's rung, sample index and git commit onto a trial some earlier code ran -- and
@@ -740,7 +767,11 @@ def main() -> None:
                     help="run every requested rung on every task, so each rung's pass rate has "
                          "the same denominator. Rungs that need a reference are still skipped "
                          "for tasks without one.")
-    ap.set_defaults(climb=True)
+    ap.add_argument("--no-transcript", dest="transcript", action="store_false",
+                    help="do not keep each trial's assistant/tool conversation. On by default: "
+                         "a verified trial with its transcript is an SFT trajectory, and without "
+                         "it a verified trial is only a program and an answer (train/traces.py).")
+    ap.set_defaults(climb=True, transcript=True)
     args = ap.parse_args()
     if args.samples < 1:
         ap.error("--samples must be at least 1")
@@ -779,7 +810,8 @@ def main() -> None:
         with ThreadPoolExecutor(args.workers) as pool:
             futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
                                    args.max_turns, args.retry_failed, inputs_of,
-                                   root, args.samples, args.climb, args.agent) for row in rows]
+                                   root, args.samples, args.climb, args.agent,
+                                   args.transcript) for row in rows]
             for f in as_completed(futures):
                 done += 1
                 for r in f.result():
