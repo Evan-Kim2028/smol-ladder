@@ -27,6 +27,21 @@ that wrote it to show the on-disk tree is one consistent ladder version, traces 
 `nrows=50_000` truncation in `synthetic.py` that makes the synthetic gold answers ungradeable
 for any table over 50k rows.
 
+## 2026-10-01 — reference retries ([`2026-10-01-reference-retries.md`](2026-10-01-reference-retries.md))
+
+Asks which held-out tasks have no reference and why, after retrying the ones `gen_refs` had
+blocked. The gate was `agent_status == "exit 0"`, which is only a statement about the agent
+process: 56 test and 32 eval solutions ran cleanly and printed the wrong answer, so those tasks
+could never be re-attempted and roughly half turned out to be solvable on a second or third try.
+Gating on the offline `reward` instead recovered 32 test and 23 eval references (181 → 213 of
+250, 95 → 118 of 144). The 63 tasks still without one are classified from the attempt directories
+rather than the log, and the two suspect golds are checked against the underlying data instead of
+the model's word — the hospital-ownership task asks about a column the shipped 2017 CMS file does
+not contain, and the water-quality task leaves "case" undefined, where the gold's 2010 needs a
+case id the file does not carry. What remains splits into unstated hyperparameters, answer-format
+losses on correct reasoning, and timeouts on questions needing several models trained to compare;
+only the last is a reason to drop without changing something first.
+
 ## Superseded findings
 
 Findings above that later work on this branch has overturned. The reports keep the original

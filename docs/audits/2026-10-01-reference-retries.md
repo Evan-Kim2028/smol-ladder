@@ -1,4 +1,4 @@
-# Reference retry report (test / eval)
+# Reference retries (test / eval) — 2026-10-01
 
 Sweep of 2026-10-01 on branch `feat/refretry`, run from the `smol-ladder-wt-refretry` worktree
 with `--attempts 3 --workers 8`, model `stealth/space-bunny-alpha`. Logs:
