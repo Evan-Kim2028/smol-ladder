@@ -268,6 +268,22 @@ def test_a_result_records_the_prompt_hash_rung_sample_model_commit_and_time(tmp_
     assert datetime.fromisoformat(result["timestamp"]).tzinfo is not None
 
 
+def test_a_result_records_whether_the_rung_came_from_the_model_or_the_ast(tmp_path, monkeypatch):
+    """L2-L4 can be model-written or AST-fallback per task, and the record has to say which.
+
+    gen_refs drives once() for a reference and passes no hint_source, so a reference result must
+    simply not carry the key rather than claim a rung it never ran.
+    """
+    work = tmp_path / "trial" / "L2" / "s1"
+    result = run_one_real_trial(tmp_path, monkeypatch, work,
+                                provenance={"rung": "L2", "sample": 0, "hint_source": "llm"})
+    assert result["hint_source"] == "llm"
+
+    ref = run_one_real_trial(tmp_path, monkeypatch, tmp_path / "ref",
+                             provenance={"rung": "reference", "sample": 0})
+    assert "hint_source" not in ref
+
+
 def test_the_prompt_is_saved_beside_the_result(tmp_path, monkeypatch):
     """prompt.txt is what makes a prompt hash checkable instead of a bare assertion."""
     work = tmp_path / "trial" / "L1" / "s1"

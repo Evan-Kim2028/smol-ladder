@@ -959,6 +959,20 @@ def _l2_block_from_ast(source: str) -> str:
     )
 
 
+def hint_source(row: dict, split: str, rung: str) -> str:
+    """Which hand built this rung's text: the model ("llm"), the AST extraction ("ast"), or neither.
+
+    The prompt hash already changes when a hint's wording changes, but it cannot say *why* two runs
+    that carry the same shape differ: an L2 that came from a validated model hint and one that fell
+    back to the AST both read as "Notes on the intended computation". Recording the source lets a
+    summary separate them, and the plain-language hints are validated per task, so a rung's text is
+    model-written on some tasks and AST on others within one split.
+    """
+    if rung in {"L1", "L1+schema"}:
+        return "none"
+    return "llm" if load_hint(row, split) is not None else "ast"
+
+
 def l2_block(row: dict, split: str) -> str:
     """The L2 block: files, columns, filters — from the cached hint if there is one, else the AST."""
     hint = load_hint(row, split)

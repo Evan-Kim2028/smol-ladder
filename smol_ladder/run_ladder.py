@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smol_ladder.grade import grade
-from smol_ladder.ladder import prompt_for, read_source
+from smol_ladder.ladder import hint_source, prompt_for, read_source
 from smol_ladder.tasks import DATA, input_dir, load_split
 from smol_ladder.upstream import looks_like_a_command
 
@@ -347,6 +347,11 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     # with a rung label and no sample axis, and a reference has rung "reference", sample 0.
     result["rung"] = (provenance or {}).get("rung", rung_label)
     result["sample"] = (provenance or {}).get("sample", 0)
+    # Which hand built this rung's text. L2-L4 can come from a validated model hint or from the
+    # AST fallback, per task, and a result that did not say which cannot be told apart from one
+    # that did; gen_refs calls once() without a split, so it simply goes unstamped.
+    if "hint_source" in (provenance or {}):
+        result["hint_source"] = provenance["hint_source"]
     if agent == "bash":
         if (work / "answer.txt").exists():
             raw = (work / "answer.txt").read_text().strip()
@@ -519,6 +524,9 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                         "sample": k, "skipped": "no verified reference"} for k in range(samples))
             continue
         prompt = prompt_for(row, split, prompt_rung)
+        # Resolved once beside the prompt it describes, so the rung's text and the record of where
+        # that text came from cannot disagree: both read the same cached hint.
+        src = hint_source(row, split, prompt_rung)
         rung_dir = root / row["task_id"] / rung.replace("+", "_")
         passed = False
         for k in range(samples):
@@ -529,7 +537,8 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
             label = rung if k == 0 else f"{rung}s{k}"
             ran: list = []
             r = once(row, prompt, work, venv, model, max_turns,
-                     retry_failed, inputs_of, label, {"rung": prompt_rung, "sample": k}, ran,
+                     retry_failed, inputs_of, label,
+                     {"rung": prompt_rung, "sample": k, "hint_source": src}, ran,
                      agent)
             # Write only what once() actually produced. A reused result is already on disk with
             # whatever provenance it was written with, and rewriting it here would stamp this

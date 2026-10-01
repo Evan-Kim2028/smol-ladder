@@ -246,6 +246,30 @@ def test_cached_hint_keeps_the_blackwell_prefix(row, monkeypatch):
     assert block in l3 and block in l4
 
 
+def test_a_result_records_which_hand_wrote_the_rung(row, monkeypatch):
+    """A rung's text comes from the model or the AST, per task, so the result has to say which.
+
+    The prompt hash cannot: an L2 built from a validated hint and one that fell back both read
+    as "Notes on the intended computation". A summary over a split that mixes the two would
+    otherwise be averaging two different treatments as if they were one.
+    """
+    hint = {"l2": {"files": ["t.csv"], "columns": ["col_a"], "filters": "none"},
+            "l3": "average col_a over all rows"}
+    monkeypatch.setattr(L, "load_hint", lambda r, s: hint)
+    assert L.hint_source(row, "test", "L2") == "llm"
+    assert L.hint_source(row, "test", "L3") == "llm"
+    assert L.hint_source(row, "test", "L4") == "llm"
+
+    monkeypatch.setattr(L, "load_hint", lambda r, s: None)
+    assert L.hint_source(row, "test", "L2") == "ast"
+    assert L.hint_source(row, "test", "L4") == "ast"
+
+    # The rungs that carry no hint at all are neither: "none" rather than a misleading "ast",
+    # which would read as a fallback that never happened.
+    assert L.hint_source(row, "test", "L1") == "none"
+    assert L.hint_source(row, "test", "L1+schema") == "none"
+
+
 def test_hint_cache_file_is_a_plain_dict_on_disk(tmp_path, monkeypatch):
     def fake_call(row, source, files, headers, model):
         return {
