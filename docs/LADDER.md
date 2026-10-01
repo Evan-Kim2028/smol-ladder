@@ -101,6 +101,36 @@ The ladder is strictly ordered: L1 < L2 < L3 < L4.
 | L3 | L2 + the method, e.g. "count rows per value of X, take the mode" | verified reference solution |
 | L4 | L3 + the full reference `solution.py` with its final print removed | verified reference solution |
 
+### L2 and L3 are written in plain language, and validated because of it
+
+L2 and L3 were extracted statically from the reference's AST. That is deterministic but it is
+mostly empty: 98/181 test references are hand-written csv or sqlite code rather than pandas, so
+the filters came back empty on 71% of them and L3 read "get, items, values" — a bag of method
+names, not a method. So the hints are now written by a model, from the verified reference, in
+plain language, and cached to `data/hints/<split>/<task_id>.json` with the model, the prompt
+version and a hash of the reference, which makes a rerun resumable and deterministic once
+generated.
+
+That trades a guarantee away, so it is bought back with validation. Every hint is checked before
+it is used, and a hint that fails is regenerated up to three times before the task falls back to
+the AST extraction:
+
+1. **No hallucination.** A named file must exist in `./input` and a named column in that table's
+   header, including the `table_info` of a sqlite file (13 test references are hand-written SQL).
+   A fabricated name is dropped and counted; the ladder would otherwise be asserting something
+   false about the solver's own environment, which is the failure mode requirement 2 above.
+2. **No leak**, by the same three checks as everything else in section "Construction rules": no
+   gold answer by text match, no numeric literal the dataset's grader accepts, and the hit must
+   be one L1 does not already have.
+3. **L3 must add something.** A method that only restates L2's columns and filters is not a rung.
+
+On the 181 verified test references: 167 (92.3%) got a usable hint and 14 fell back to the AST.
+The share of tasks with non-empty content went from 62.4% to 88.4% for columns, from 28.2% to
+56.9% for filters, and from 66.9% to 92.3% for the method. Every failed hint failed on a leak
+rejection. The cost is context: 506 characters added at L3 against 114 for the AST, which is
+exactly the budget the monotonicity discussion below is about, and it applies to these rungs
+more than it did to the old ones.
+
 Each rung carries information about which computation the question intends, and none of it is
 recoverable from the tables alone. How to read the first passing rung:
 - **L1**: the model solves the task as posed.
