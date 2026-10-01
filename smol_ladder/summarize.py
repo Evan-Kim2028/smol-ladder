@@ -37,7 +37,7 @@ from pathlib import Path
 
 import numpy as np
 
-from smol_ladder.ladder import read_source
+from smol_ladder.ladder import ladder_fingerprint, read_source
 from smol_ladder.run_ladder import source_for
 from smol_ladder.tasks import DATA
 
@@ -62,7 +62,7 @@ BOOTSTRAP_SEED = 20260101
 
 
 class MixedPrompts(ValueError):
-    """Results in one rung that were produced by different prompts."""
+    """Results in one rung that were produced by different ladders."""
 
 
 def rung_name(directory: str) -> str:
@@ -171,32 +171,104 @@ def pass_fraction(trials: list[dict]) -> float | None:
     return sum(_passed(t) for t in scored) / len(scored)
 
 
-def check_prompts(runs: dict[str, dict[str, list[dict]]], allow_mixed: bool = False) -> dict:
+def check_prompts(runs: dict[str, dict[str, list[dict]]], allow_mixed: bool = False,
+                  record: dict | None = None) -> dict:
     """Refuse to average two ladder versions into one number. Returns what was mixed, if allowed.
 
-    A result with no recorded hash is not treated as matching a hashed one. Its prompt is
-    unknown, not known-equal, and pooling it with a hashed result would silently average two
-    different ladders -- the exact failure the hash exists to prevent.
+    A rung's results are pooled only when every trial of the SAME (task, rung) cell agrees on
+    everything that defines the ladder it measured.
+
+    Why the comparison is per task and not per rung. A rung prompt embeds the task's own question,
+    the file list and -- above L1 -- that task's hint, so every task's `prompt_sha256` differs from
+    every other task's by construction. Collecting a rung's hashes and calling a set of size > 1
+    "mixed" therefore reports 250 hashes for 250 clean tasks: it read the design as the defect, made
+    a clean sweep un-summarisable, and taught the reader to reach for --allow-mixed, which is the
+    override that would hide a real one. The comparison belongs where "the same thing twice" means
+    something -- inside one (task, rung) cell, across its samples and across a resume.
+
+    Three axes are checked, because each catches a mixing the others cannot:
+
+    1. `prompt_sha256` -- the prompt text itself. Two hashes in one cell mean a reword, a widened
+       schema dump or a resume under new text.
+    2. `ladder_sha256` -- a fingerprint of the code that builds and grades the ladder. The prompt
+       can be byte-identical while the grader, the jail or the agent loop changed underneath it,
+       and a per-result prompt hash cannot see that. It is a fingerprint rather than the commit
+       because a resume across a commit that touched none of these files is still one ladder.
+    3. `hint_prompt_version` -- the gen_hints version behind L2-L4. A rung text rebuilt from a hint
+       of another version is a different ladder while its own hash merely looks per-task unique.
+
+    A launch's fingerprint is also checked against the fingerprints the results carry, which
+    catches a tree whose RUN.json claims a version that produced none of the trials in it.
+
+    A result with no recorded value on an axis is not treated as matching a recorded one. Its
+    provenance is unknown, not known-equal, and pooling it would silently average two ladders --
+    the exact failure this check exists to prevent.
     """
     mixed: dict[str, list[str]] = {}
-    by_rung: dict[str, set[str]] = {}
-    for rungs in runs.values():
+    detail: dict[str, list[str]] = {}
+
+    def note(rung: str, values: list[str], line: str) -> None:
+        bucket = mixed.setdefault(rung, [])
+        lines = detail.setdefault(rung, [])
+        lines.append(line)
+        for value in values:
+            if value not in bucket:
+                bucket.append(value)
+
+    for task, rungs in runs.items():
         for rung, trials in rungs.items():
-            # Collected across every task in the rung, not per task: one task's samples agreeing
-            # says nothing about whether the other 249 were run on the same prompt.
-            by_rung.setdefault(rung, set()).update(
-                t.get("prompt_sha256") or "<unrecorded>" for t in trials)
-    for rung, hashes in by_rung.items():
-        if len(hashes) <= 1:
-            continue
-        if not allow_mixed:
-            raise MixedPrompts(
-                f"rung {rung} holds results from {len(hashes)} different prompts "
-                f"({', '.join(sorted(h[:12] for h in hashes))}); these are different ladders "
-                f"and cannot be pooled. Re-run the rung, or pass --allow-mixed to pool them "
-                f"anyway and record it in the report.")
-        mixed[rung] = sorted(hashes)
+            for field, label in (("prompt_sha256", "prompt"), ("ladder_sha256", "ladder version"),
+                                 ("hint_prompt_version", "hint prompt version")):
+                values = sorted({str(t[field]) if t.get(field) else "<unrecorded>"
+                                 for t in trials})
+                if len(values) > 1:
+                    note(rung, values, f"task {task}: {len(values)} different {label}s "
+                                       f"({', '.join(v[:12] for v in values)})")
+        # The hint version is task-wide, not cell-wide: L2, L3 and L4 of one task all read the
+        # same cached hint, so a task whose L2 came from one hint version and whose L3 came from
+        # another is a ladder whose rungs are not cumulative -- and the ordering claim the
+        # "lowest rung that passes" rests on is void for exactly that task.
+        versions = sorted({str(t["hint_prompt_version"])
+                           for rung in CLIMBABLE
+                           for t in rungs.get(rung, []) if t.get("hint_prompt_version")})
+        if len(versions) > 1:
+            note("/".join(rung for rung in CLIMBABLE if rung in rungs), versions,
+                 f"task {task}: its rungs were built from {len(versions)} different hint prompt "
+                 f"versions ({', '.join(v[:12] for v in versions)}), so they are not cumulative")
+
+    for rung, fingerprint in _stray_ladder_versions(runs, record):
+        note(rung, [fingerprint], f"RUN.json launch ladder version {fingerprint[:12]} produced "
+                                  f"none of the results on disk")
+
+    if mixed and not allow_mixed:
+        raise MixedPrompts(
+            "these results are measurements of more than one ladder and cannot be pooled: "
+            + "; ".join(f"rung {rung}: " + " | ".join(lines) for rung, lines in detail.items())
+            + ". Re-run the affected cells on one version, or pass --allow-mixed to pool them "
+              "anyway and record it in the report.")
     return mixed
+
+
+def _stray_ladder_versions(runs: dict[str, dict[str, list[dict]]],
+                           record: dict | None) -> list[tuple[str, str]]:
+    """Launch fingerprints in RUN.json that no result in the tree carries, as (rung, fingerprint).
+
+    A resumed run legitimately spans code, so a fingerprint the results share is not a finding:
+    the per-cell check above is what says whether those two versions measured the same thing.
+    What cannot be legitimate is a recorded launch whose version produced no trial at all -- a
+    tree assembled from somewhere else, or one whose record describes a sweep that never ran.
+    """
+    if not record:
+        return []
+    results = {str(t["ladder_sha256"]) for rungs in runs.values()
+               for trials in rungs.values() for t in trials if t.get("ladder_sha256")}
+    launches = record.get("launches") or []
+    if isinstance(launches, dict):
+        launches = [launches]
+    return [("run", str(launch["ladder_sha256"]))
+            for launch in launches
+            if isinstance(launch, dict) and launch.get("ladder_sha256")
+            and str(launch["ladder_sha256"]) not in results]
 
 
 def _bootstrap_ci(values: list[float], draws: int = BOOTSTRAP_DRAWS,
@@ -403,9 +475,10 @@ def control_block(runs: dict[str, dict[str, list[dict]]],
 
 
 def summarise(split: str, runs: dict[str, dict[str, list[dict]]],
-              has_reference: Callable[[str], bool], allow_mixed: bool = False) -> dict:
+              has_reference: Callable[[str], bool], allow_mixed: bool = False,
+              record: dict | None = None) -> dict:
     """The whole report, as a dict. `summarise` asserts nothing; this asserts the partition."""
-    mixed = check_prompts(runs, allow_mixed)
+    mixed = check_prompts(runs, allow_mixed, record)
     hist = partition(runs, has_reference)
     assert sum(hist.values()) == len(runs), (hist, len(runs))
     return {
@@ -512,7 +585,7 @@ def main() -> None:
           f"{f'  run tag={args.run_tag}' if args.run_tag else ''}")
 
     try:
-        report = summarise(args.split, runs, reference_at_launch, args.allow_mixed)
+        report = summarise(args.split, runs, reference_at_launch, args.allow_mixed, record)
     except MixedPrompts as e:
         raise SystemExit(f"refusing to pool results from different prompts: {e}")
     report["source_tasks"] = total

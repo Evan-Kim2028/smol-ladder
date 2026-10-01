@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
+import hashlib
 import json
 import re
 import shutil
@@ -28,6 +30,39 @@ from smol_ladder.sandbox import run_script
 from smol_ladder.tasks import DATA, input_dir, load_split, read_tables
 
 RUNGS = ("L1", "L2", "L3", "L4")
+
+#: The files that decide what a rung says and whether a trial passed, hashed together into the
+#: ladder fingerprint. A change to any of them is a new ladder; a change to anything else (the
+#: runner's bookkeeping, the summary, a test) is not. This module writes the prompts, the hint
+#: generators supply the L2-L4 text they interpolate, `or_agent.py` and `upstream.py` decide what
+#: the model is asked and in which protocol, and `grade.py` decides pass or fail.
+LADDER_SOURCES = ("ladder.py", "gen_hints.py", "gen_refs.py", "or_agent.py", "upstream.py",
+                  "grade.py")
+
+
+@functools.lru_cache(maxsize=1)
+def ladder_fingerprint() -> str:
+    """One hash over every file that defines the ladder, so a version check can ignore the rest.
+
+    A result's `prompt_sha256` says what that one trial was asked. It cannot say what built the
+    prompt or what graded the answer, so two ladder versions whose prompts happen to coincide look
+    poolable. This is the other half of the provenance: equal here means the same ladder, whatever
+    the commit.
+
+    Deliberately not the commit. The v2 run resumed on a commit whose only change was recording
+    `verify_status` in run_ladder.py, and every file listed above is byte-identical across the two
+    commits -- so it measured one ladder. Refusing on the commit would have sent that clean run to
+    --allow-mixed again, which is how a real mixing gets waved through next time.
+    """
+    here = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in LADDER_SOURCES:
+        digest.update(name.encode())
+        # A missing file contributes its name and nothing else, so a tree that lost one hashes
+        # differently instead of silently reading as the same ladder.
+        digest.update((here / name).read_bytes() if (here / name).exists() else b"<missing>")
+    return digest.hexdigest()
+
 
 SCHEMA_DUMP_CHARS = 4000  # prompt cap, set before measuring; see schema_dump
 SCHEMA_DUMP_ROWS = 200

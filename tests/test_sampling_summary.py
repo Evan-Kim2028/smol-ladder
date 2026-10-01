@@ -9,7 +9,9 @@ only a non-climbing design can measure, and the refusal to pool two ladder versi
     uv run --with pytest pytest -q tests/test_sampling_summary.py
 """
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -231,22 +233,36 @@ def test_the_control_is_still_not_a_bucket():
 
 # --- refusing to pool two ladder versions -----------------------------------------------------
 
-def test_results_from_two_prompts_are_refused_within_one_rung():
-    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A)]}, b={"L1": [trial(0.0, hash_=HASH_B)]})
+def test_different_tasks_with_different_hashes_are_not_a_mixed_rung():
+    """Every task's prompt embeds its own question, so every task's hash differs BY CONSTRUCTION.
+
+    Collecting the hashes of a whole rung and calling a set of size >1 "mixed" made a clean
+    250-task sweep un-summarisable: 250 tasks at L1 is 250 hashes, which is the opposite of
+    evidence that two ladders were pooled. It is what made the v2 run need --allow-mixed.
+    """
+    runs = tree(**{f"t{i}": {"L1": [trial(i % 2, hash_=f"{i:064d}")]} for i in range(250)})
+    assert S.summarise("test", runs, lambda _t: True)["mixed_prompts"] == {}
+
+
+def test_one_task_measured_on_two_prompts_is_refused():
+    """This is the real defect the hash exists to catch: a resumed sweep or a mid-run prompt
+    reword changed the text for the SAME (task, rung), so its samples are not replicates."""
+    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A), trial(0.0, hash_=HASH_B)]})
     with pytest.raises(S.MixedPrompts):
         S.summarise("test", runs, lambda _t: True)
 
 
-def test_the_error_names_the_rung_and_both_hashes():
-    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A)]}, b={"L1": [trial(0.0, hash_=HASH_B)]})
+def test_the_error_names_the_task_the_rung_and_both_hashes():
+    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A), trial(0.0, hash_=HASH_B)]})
     with pytest.raises(S.MixedPrompts) as excinfo:
         S.summarise("test", runs, lambda _t: True)
     message = str(excinfo.value)
-    assert "L1" in message and HASH_A[:12] in message and HASH_B[:12] in message
+    assert "a" in message and "L1" in message
+    assert HASH_A[:12] in message and HASH_B[:12] in message
 
 
 def test_allow_mixed_pools_them_and_records_that_it_did():
-    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A)]}, b={"L1": [trial(0.0, hash_=HASH_B)]})
+    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A), trial(0.0, hash_=HASH_B)]})
     report = S.summarise("test", runs, lambda _t: True, allow_mixed=True)
     assert report["mixed_prompts"] == {"L1": [HASH_A, HASH_B]}
     assert report["rungs"]["L1"]["mean_pass_probability"] == pytest.approx(0.5)
@@ -255,7 +271,7 @@ def test_allow_mixed_pools_them_and_records_that_it_did():
 def test_results_with_no_prompt_hash_are_never_pooled_with_hashed_ones():
     """A legacy result predates provenance. Its prompt is unknown, not known-equal, so pairing it
     with a hashed one would average two ladder versions while claiming they matched."""
-    runs = tree(a={"L1": [trial(1.0)]}, b={"L1": [{"reward": 0.0, "agent_status": "exit 0"}]})
+    runs = tree(a={"L1": [trial(1.0), trial(0.0, hash_=HASH_B)]})
     with pytest.raises(S.MixedPrompts):
         S.summarise("test", runs, lambda _t: True)
 
@@ -269,6 +285,111 @@ def test_a_different_hash_at_a_different_rung_is_not_a_conflict():
     """L1 and L2 have different prompts by construction. The check is within a rung."""
     runs = tree(a={"L1": [trial(1.0, hash_=HASH_A)], "L2": [trial(0.0, hash_=HASH_B)]})
     assert S.summarise("test", runs, lambda _t: True)["mixed_prompts"] == {}
+
+
+# --- a ladder-version mismatch is mixing too ----------------------------------------------------
+
+def test_a_task_at_the_same_rung_on_two_ladder_fingerprints_is_refused():
+    """Two different ladder definitions measured the same cell. The per-task prompt hash cannot
+    always see it, because the prompt text can be identical while what built or graded it
+    changed underneath."""
+    runs = tree(a={"L1": [dict(trial(1.0), ladder_sha256="c" * 64),
+                          dict(trial(0.0), ladder_sha256="d" * 64)]})
+    with pytest.raises(S.MixedPrompts):
+        S.summarise("test", runs, lambda _t: True)
+
+
+def test_two_commits_with_one_ladder_definition_are_not_a_conflict():
+    """This is v2's own situation, and the reason the fingerprint exists rather than the commit.
+
+    v2 was resumed on a commit whose only change to the ladder was bookkeeping: run_ladder.py
+    started recording `verify_status` and summarize stopped trusting a bare "exit 0". Every file
+    that defines a rung's text or grades it -- ladder.py, gen_hints.py, gen_refs.py, or_agent.py,
+    upstream.py, grade.py -- is byte-identical between the two commits, so both launches measured
+    the same ladder. Refusing on the commit alone would have sent a clean run to --allow-mixed
+    again, which is how a real mixing gets waved through next time.
+    """
+    runs = tree(a={"L1": [dict(trial(1.0), ladder_sha256="c" * 64, git_commit="a" * 40),
+                          dict(trial(0.0), ladder_sha256="c" * 64, git_commit="b" * 40)]},
+                b={"L1": [dict(trial(1.0), ladder_sha256="c" * 64, git_commit="b" * 40)]})
+    assert S.summarise("test", runs, lambda _t: True)["mixed_prompts"] == {}
+
+
+def test_a_run_record_fingerprint_that_no_result_carries_is_refused():
+    """The mismatch the per-result check cannot make: RUN.json says the run was launched by a
+    ladder version that produced none of the results on disk -- a tree assembled by hand, or a
+    sweep that resumed under new code without re-running anything."""
+    runs = tree(a={"L1": [dict(trial(1.0), ladder_sha256="c" * 64)]})
+    record = {"launches": [{"ladder_sha256": "e" * 64}]}
+    with pytest.raises(S.MixedPrompts):
+        S.summarise("test", runs, lambda _t: True, record=record)
+
+
+def test_a_run_record_fingerprint_the_results_agree_with_is_fine():
+    runs = tree(a={"L1": [dict(trial(1.0), ladder_sha256="c" * 64)]})
+    record = {"launches": [{"ladder_sha256": "c" * 64}]}
+    assert S.summarise("test", runs, lambda _t: True, record=record)["mixed_prompts"] == {}
+
+
+def test_a_run_record_with_no_fingerprint_is_not_invented():
+    """A run tagged before fingerprints were recorded has nothing to compare. Refusing on an
+    absent key would retire every existing tree at once."""
+    runs = tree(a={"L1": [dict(trial(1.0), ladder_sha256="c" * 64)]})
+    record = {"launches": [{"git_commit": "c" * 40}]}
+    assert S.summarise("test", runs, lambda _t: True, record=record)["mixed_prompts"] == {}
+
+
+def test_the_ladder_fingerprint_covers_every_file_that_defines_a_rung():
+    """The fingerprint is the whole point, so it has to actually cover the ladder. A rung's text
+    comes from ladder.py and the hint it interpolates from gen_hints.py, gen_refs.py and
+    or_agent.py, under the protocols in upstream.py, and grade.py decides pass or fail. Change any
+    of them and the hash must move, or a new ladder would be silently pooled with the old one."""
+    sources = Path(S.__file__).parent
+    baseline = S.ladder_fingerprint()
+    for name in ("ladder.py", "gen_hints.py", "gen_refs.py", "or_agent.py", "upstream.py",
+                 "grade.py"):
+        assert (sources / name).exists(), name
+        changed = hashlib.sha256(
+            (sources / name).read_bytes() + b"smol-ladder-probe").hexdigest()
+        assert changed != baseline, f"{name} is not covered by the fingerprint"
+
+
+def test_a_hint_prompt_version_mismatch_is_refused():
+    """L2-L4 text is built by gen_hints and its own PROMPT_VERSION stamps each hint. A rung built
+    from a hint of another version is a different ladder, and prompt_sha256 cannot see it because
+    the hint text itself changed."""
+    runs = tree(a={"L2": [dict(trial(1.0), hint_prompt_version="nl-hints-v1"),
+                          dict(trial(0.0), hint_prompt_version="nl-hints-v2")]})
+    with pytest.raises(S.MixedPrompts):
+        S.summarise("test", runs, lambda _t: True)
+
+
+def test_one_hint_version_behind_l2_l3_l4_of_a_task_is_fine():
+    """L2, L3 and L4 read the same cached hint, so a task measured on all three at one hint
+    version is the normal case and must not be refused."""
+    runs = tree(a={"L2": [dict(trial(1.0), hint_prompt_version="nl-hints-v1")],
+                   "L3": [dict(trial(1.0), hint_prompt_version="nl-hints-v1")],
+                   "L4": [dict(trial(0.0), hint_prompt_version="nl-hints-v1")]})
+    assert S.summarise("test", runs, lambda _t: True)["mixed_prompts"] == {}
+
+
+def test_l3_built_from_another_hint_version_than_l2_is_refused():
+    """L4 must extend L3 verbatim or the rungs are not cumulative. If a task's L2 and L3 were
+    built from different hint versions they are not the same ladder, and the ordering claim the
+    "lowest rung that passes" rests on is void for that task."""
+    runs = tree(a={"L2": [dict(trial(1.0), hint_prompt_version="nl-hints-v1")],
+                   "L3": [dict(trial(0.0), hint_prompt_version="nl-hints-v2")]})
+    with pytest.raises(S.MixedPrompts):
+        S.summarise("test", runs, lambda _t: True)
+
+
+def test_the_check_reports_a_tree_mixed_on_several_axes_at_once():
+    runs = tree(a={"L1": [trial(1.0, hash_=HASH_A), trial(0.0, hash_=HASH_B)]},
+                b={"L2": [dict(trial(1.0), hint_prompt_version="nl-hints-v1"),
+                          dict(trial(0.0), hint_prompt_version="nl-hints-v2")]})
+    with pytest.raises(S.MixedPrompts) as excinfo:
+        S.summarise("test", runs, lambda _t: True)
+    assert "L1" in str(excinfo.value) and "L2" in str(excinfo.value)
 
 
 # --- the reference-gathering consumer must see the samples too -------------------------------

@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smol_ladder.grade import grade
-from smol_ladder.ladder import hint_source, prompt_for, read_source
+from smol_ladder.ladder import hint_source, ladder_fingerprint, prompt_for, read_source
 from smol_ladder.tasks import DATA, input_dir, load_split
 from smol_ladder.upstream import looks_like_a_command
 
@@ -400,6 +400,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
               "prediction": "", "reward": 0.0}
     result.update(git_provenance())
     result["prompt_sha256"] = prompt_sha256(prompt)
+    result["ladder_sha256"] = ladder_fingerprint()
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
     # rung and sample default to what the caller passed anyway: gen_refs drives once() directly
     # with a rung label and no sample axis, and a reference has rung "reference", sample 0.
@@ -877,6 +878,9 @@ def main() -> None:
         "skipped_for_inputs_file": (str(skipped_path) if skipped_path else None),
         "command_line": [sys.executable, "-m", "smol_ladder.run_ladder", *sys.argv[1:]],
         "start_time": _stamp(), **git_provenance(),
+        # What the summariser checks this launch's results against. The commit alone is too blunt
+        # for a resumed sweep: a launch that only moved harness bookkeeping is the same ladder.
+        "ladder_sha256": ladder_fingerprint(),
         **reference_state(rows, args.split, rungs),
     }
     if run_record is not None:
