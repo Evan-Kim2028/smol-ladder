@@ -320,6 +320,108 @@ def test_the_agent_shell_survives_a_backgrounded_command():
     assert isinstance(out, str)
 
 
+def test_a_verification_pass_that_times_out_is_a_harness_failure_not_a_zero(tmp_path, monkeypatch):
+    """The bug the smoke run turned up: a solution that takes longer than the offline deadline.
+
+    The sealed grading pass has a 180s cap, and a TimeoutExpired was caught and turned into out=""
+    -- which is then graded exactly like a program that printed nothing. The result kept the
+    solver's own "exit 0", so the trial looked clean everywhere: reward 0.0, scored, and counted
+    in the pass rate. Two of the six smoke tasks were this, both of which print the right answer
+    when given time. A harness deadline is not evidence the model cannot solve the task.
+    """
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        # The solver finishes and writes a solution; only the offline grading pass overruns.
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    result = runner.once(row, "Q?", tmp_path / "trial" / "L1", Path(sys.prefix), "m", 2,
+                         inputs_of=lambda r: inputs)
+
+    assert result["agent_status"] == "exit 0", "the solver did finish; only the grading pass did not"
+    assert result["verify_status"] == "verify timeout"
+    assert result["reward"] == 0.0
+    # and the summary must keep it out of the pass rate entirely
+    from smol_ladder.summarize import _finished, pass_fraction
+    assert not _finished(result), "a timed-out grading pass is a harness failure"
+    assert pass_fraction([result]) is None, "and it contributes no pass fraction"
+
+
+def test_a_solution_that_crashes_offline_is_also_a_harness_failure(tmp_path, monkeypatch):
+    """Same failure, other shape: the program raises on re-run, so again there is no prediction.
+
+    Without the marker this is indistinguishable from a solution that printed the wrong value, and
+    the two are very different facts -- one is the model's arithmetic, the other is a program that
+    does not run.
+    """
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            (Path(cwd) / "solution.py").write_text("raise SystemExit(1)\n")
+            return real_run(["bash", "-c", "exit 1"], cwd, env, timeout)
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    result = runner.once(row, "Q?", tmp_path / "trial" / "L1", Path(sys.prefix), "m", 2,
+                         inputs_of=lambda r: inputs)
+
+    assert result["verify_status"] == "verify exit 1", result
+    from smol_ladder.summarize import _finished
+    assert not _finished(result)
+
+
+def test_a_clean_offline_run_records_no_verify_status(tmp_path, monkeypatch):
+    """The marker is only written when something went wrong, so a good trial's record is unchanged
+    and old results -- which have no such key -- keep reading as clean."""
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            return real_run(cmd, cwd, env, timeout)
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    result = runner.once(row, "Q?", tmp_path / "trial" / "L1", Path(sys.prefix), "m", 2,
+                         inputs_of=lambda r: inputs)
+
+    assert result["reward"] == 1.0
+    assert "verify_status" not in result, result
+
+
 def test_the_control_runs_without_a_reference(monkeypatch, tmp_path):
     """The L1+schema control is built from the tables alone.
 

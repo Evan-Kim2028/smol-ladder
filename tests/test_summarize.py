@@ -18,10 +18,10 @@ from smol_ladder import summarize as S
 Control = "L1+schema"          # the control's name in a prompt, the spelling the old code used
 
 
-def trial(reward=0.0, status="exit 0", hash_=None):
+def trial(reward=0.0, status="exit 0", hash_=None, **extra):
     """One sample. The hash defaults to None so these trees exercise the no-provenance path."""
     return {"reward": reward, "agent_status": status, "prediction": str(reward),
-            **({"prompt_sha256": hash_} if hash_ else {})}
+            **({"prompt_sha256": hash_} if hash_ else {}), **extra}
 
 
 def old_hist(runs, has_reference):
@@ -174,6 +174,46 @@ def test_every_bucket_is_present_even_when_zero():
     hist = S.partition({"a": {"L1": [trial(1.0)]}}, lambda _t: True)
     assert list(hist) == S.BUCKETS
     assert hist["L4"] == 0
+
+
+# --- the offline grading pass is part of the harness, not the model ----------------
+
+def test_a_trial_whose_grading_pass_never_ran_is_a_harness_failure():
+    """The agent's own "exit 0" says the model loop finished. It says nothing about whether the
+    answer exists: if the sealed re-run timed out, there was no prediction to grade, and the
+    resulting empty string is not evidence the model got the answer wrong."""
+    runs = {"a": {"L1": [trial(0.0, verify_status="verify timeout")]}}
+    block = S.rung_stats(runs)["L1"]
+    assert block["harness_failures"] == 1
+    assert block["trials_scored"] == 0
+    assert block["scored_tasks"] == 0, "a task with nothing scored must not carry a 0.0"
+    assert block["mean_pass_probability"] != block["mean_pass_probability"]  # nan
+
+
+def test_a_trial_whose_grading_pass_crashed_is_also_not_a_failure():
+    runs = {"a": {"L1": [trial(0.0, verify_status="verify exit 1")]}}
+    assert S.rung_stats(runs)["L1"]["harness_failures"] == 1
+    assert S.first_passing_rung(runs["a"], has_reference=True) == \
+        "not scored (every trial was a harness failure)"
+
+
+def test_one_unrunnable_sample_out_of_two_leaves_the_other_in():
+    """The sample axis is the point of K>1: a harness failure on one sample must not throw away a
+    real observation from the other. If it did, a flaky trial would silently shrink the
+    denominator and the pass fraction would be read off fewer samples than were paid for."""
+    runs = {"a": {"L1": [trial(0.0, verify_status="verify timeout"), trial(1.0)]}}
+    assert S.pass_fraction(runs["a"]["L1"]) == 1.0
+    assert S.rung_stats(runs)["L1"] == {
+        "tasks": 1, "scored_tasks": 1, "trials": 2, "trials_scored": 1,
+        "harness_failures": 1, "mean_pass_probability": 1.0, "ci95": [1.0, 1.0]}
+
+
+def test_results_written_before_this_marker_still_read_as_clean():
+    """Every result already on disk has no verify_status key, and they were all graded by a real
+    run of the program. Defaulting a missing key to clean keeps old trees readable; defaulting it
+    to broken would silently invalidate the entire back catalogue."""
+    assert S._finished(trial(1.0)) is True
+    assert S._finished(trial(0.0)) is True
 
 
 def test_a_pass_needs_reward_one():

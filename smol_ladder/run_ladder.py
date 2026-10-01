@@ -49,6 +49,11 @@ JAIL_RO = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"]
 # is generous for that; the old 45-minute cap let one stuck trial hold a worker for three
 # quarters of an hour, and with sixteen workers the sweep crawled.
 AGENT_TIMEOUT = 1200
+# The offline grading pass re-runs the agent's own solution.py under a sealed jail. It is a
+# deadline, not a budget: a program that outruns it has told us nothing, so the trial is recorded as
+# a harness failure rather than scored on the empty output. 180s is generous for reading a task's
+# tables with one BLAS thread.
+VERIFY_TIMEOUT = 180
 
 
 @functools.lru_cache(maxsize=1)
@@ -440,8 +445,15 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
                     link.symlink_to(Path("input") / item.name)
                 except OSError:
                     pass
-        # A verification run that hangs is a failed trial, not a crashed harness: the agent
-        # wrote a program that never terminates offline. Catch it or the whole run dies.
+        # A verification run that hangs is a harness failure, not a model failure. It used to be
+        # caught, and out = "" was then graded exactly like a solution that printed nothing --
+        # scoring 0.0 and leaving agent_status at the solver's own "exit 0". So a program that
+        # simply takes longer than VERIFY_TIMEOUT to re-run was booked as a task the model got
+        # wrong, and summarize, which trusts "exit 0", counted it in the pass rate. Two of the
+        # smoke run's clean-exit trials were exactly this. A timeout now keeps the agent's own
+        # status for the trial but marks the verification separately, so the trial leaves the
+        # denominator instead of reading as a 0.
+        verify_status = "exit 0"
         try:
             run = _run_jailed(
                 ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
@@ -452,11 +464,15 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
                  sys.executable, "solution.py"],
                 verify, {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
                          "HOME": str(verify), "LANG": "C.UTF-8",
-                         "OMP_NUM_THREADS": "1", "MPLBACKEND": "Agg"}, 180)
+                         "OMP_NUM_THREADS": "1", "MPLBACKEND": "Agg"}, VERIFY_TIMEOUT)
             out = run.stdout.decode("utf-8", "replace") if isinstance(run.stdout, bytes) \
                 else (run.stdout or "")
+            if run.returncode != 0:
+                verify_status = f"verify exit {run.returncode}"
         except subprocess.TimeoutExpired:
-            out = ""
+            out, verify_status = "", "verify timeout"
+        if verify_status != "exit 0":
+            result["verify_status"] = verify_status
         lines = [l.strip() for l in out.splitlines() if l.strip()]
         result["prediction"] = lines[-1] if lines else ""
         result["reward"] = grade(row, result["prediction"])

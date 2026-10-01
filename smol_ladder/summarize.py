@@ -144,8 +144,18 @@ def _passed(result: dict | None) -> bool:
 
 
 def _finished(result: dict | None) -> bool:
-    """Did the harness get a clean run out of the trial? Anything else is not a model failure."""
-    return bool(result) and result.get("agent_status") == "exit 0"
+    """Did the harness get a clean run out of the trial? Anything else is not a model failure.
+
+    A trial counts as finished only if the agent exited cleanly AND the offline grading pass
+    produced a usable result. A `verify_status` other than "exit 0" means the solution could not be
+    re-run under the sealed jail -- it timed out, or it crashed -- so there was no prediction to
+    grade. The agent's own exit code says the model loop finished; it says nothing about whether the
+    answer exists, and scoring the empty output of an unrunnable program as 0.0 books the harness's
+    deadline in the model's pass rate.
+    """
+    if not result or result.get("agent_status") != "exit 0":
+        return False
+    return result.get("verify_status", "exit 0") == "exit 0"
 
 
 def _scored(trials: list[dict]) -> list[dict]:
