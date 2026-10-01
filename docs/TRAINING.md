@@ -61,6 +61,13 @@ verbatim, and that the bash protocol's submission is in the transcript with its 
 **This cannot be applied retroactively.** Arm B's data has to come from a new sweep, not from the
 tree already on disk — that is what the `ja3` transcript sweep on the v3 ladder-grade pool is for.
 
+**That sweep has now been run and exported: §5.** The `ja3` sweep (run tag `ja3`, split
+`jupyter-agent-v3`, rung L1, 3,880 tasks, model `stealth/space-bunny-alpha`) produced 2,109
+verified trials and `train/export_ja3.py` turns them into **2,029 real SFT trajectories** in
+upstream's format. The numbers above describe the tree as it stood *before* it; they are kept
+because they are the reason the exporter exists, and because `--source traces` still reads that old
+tree and still finds nothing in it.
+
 ---
 
 ## 2. The format decision
@@ -131,7 +138,9 @@ which check refused them: `dropped {"question": 4}` is a fact about the run, not
 | source | available | format | notes |
 |---|---|---|---|
 | `smoldataenvs-sft` | **4,673** | bash | 4,439 train / 234 val after a 5% deterministic split |
-| `traces` | **1,258** (0 real / 1,258 fallback) | bash | 223 refused: 217 held-out tasks + 6 held-out questions. **The "0 real" is the pre-2026-10-01 tree**; the `ja3` sweep is what changes it |
+| **`ja3_sft`** (§5) | **2,029** | bash | **real traces.** Arm B's data. 80 refused, 0 by the firewall |
+| **`ja3_fallback`** (§5) | **682** | bash | single-turn contract rows from `solutions/jupyter-agent`. **Not traces** |
+| `traces` | **1,258** (0 real / 1,258 fallback) | bash | 223 refused: 217 held-out tasks + 6 held-out questions. **Superseded for arm B by `ja3_sft`** |
 | `rungs L1` | **590** | program | jupyter-agent only |
 | `rungs L2` | **591** | program | |
 | `rungs L3` | **591** | program | |
@@ -139,7 +148,7 @@ which check refused them: `dropped {"question": 4}` is a fact about the run, not
 | `rungs`, synthetic | **0** | program | **all 1,830 synthetic tasks sit on held-out tables** |
 | `rungs`, train | **0** | program | `solutions/train` is empty; L2+ needs a reference |
 
-Two zeros worth explaining:
+Three zeros worth explaining:
 
 - **synthetic: 0, by the firewall working.** Every one of the 1,830 synthetic tasks is built on a
   table that also appears in a held-out split (verified, not suspected). The coarse check removes
@@ -147,10 +156,141 @@ Two zeros worth explaining:
   than returning an empty set quietly.
 - **train: 0, because no references exist.** `L2`–`L4` are gated on a verified reference solution
   and `data/solutions/train/` is empty. `gen_solutions --split train` fills it.
+- **`traces`: 0 real, and that is now history.** `--source traces` reads the pre-2026-10-01 tree
+  and still finds no conversation in it. `ja3_sft` is what the `ja3` sweep produced, and §5 is
+  the dataset to use for arm B.
 
 ---
 
-## 5. Running it
+## 5. Arm B's dataset: `ja3_sft`
+
+**Exported 2026-10-01 from the `ja3` transcript sweep** (run tag `ja3`, split
+`jupyter-agent-v3`, rung L1, model `stealth/space-bunny-alpha`). This is the first training data in
+the project that is *our own solver's* real conversations rather than another model's or a
+contract stub, which is the whole difference between arm B and arm A.
+
+```sh
+uv run python -m train.export_ja3 --out data/train     # writes the two files and two manifests
+uv run python -m train.export_ja3 --dry-run            # counts only, writes nothing
+```
+
+| | |
+|---|---|
+| **path** | `data/train/ja3_sft.jsonl` (20.9 MB, 2,029 rows) |
+| manifest | `data/train/ja3_sft.manifest.json` |
+| fallback | `data/train/ja3_fallback.jsonl` (682 rows) + `ja3_fallback.manifest.json` |
+| format | upstream's `SmolDataEnvs-sft`: `messages` + `tools`, one tool named `bash`, and nothing else |
+| source | 2,109 verified trials (reward 1.0, clean sealed verify) → 2,029 rows exported, **80 refused** |
+| row shape | identical to upstream's: `{"messages": [...], "tools": [...]}` |
+
+### The 80 refusals, by reason
+
+| reason | rows | what it means |
+|---|---|---|
+| `transcript does not end with the graded answer` | 35 | truncated, or the model's last words are not the value the sealed pass graded |
+| `gold answer in the prompt (answer-substring)` | 28 | `ladder.leaks` found the gold answer in the task's own question |
+| `gold answer in the prompt (answer-numeric:…)` | 16 | the same, via the grader: a number in the question grades as the answer |
+| `heldout:question` | 1 | a SmolDataEnvs test/eval **question** text |
+| `heldout:kaggle_table` | **0** | no v3 task sits on a held-out table — which is the expected answer |
+
+**The firewall dropped 0 by table and 1 by question.** One jupyter-agent question happens to match
+a SmolDataEnvs held-out question verbatim, which the bare-name table rule cannot see; the question
+key catches it. Everything else survived because v3 was built with `jtasks_v2.sde_overlap` on
+`dataset_key` — the *bare* Kaggle name, so a mirror under another owner cannot slip through — and
+the export re-derives the keys from the live split load rather than trusting the pool's own
+`sde_overlap` tag. A tag is a claim; the split is the fact.
+
+**983 rows (48%) have a gold answer under four characters**, below the floor `ladder.leaks` uses
+for a *hint*, where a short answer matches by chance. That floor is not widened here, because the
+text being checked is the task's own question — which every row of a dataset must contain — and
+holding questions to a stricter rule than hints would make arm B's population depend on the
+answer's length. They are counted in the manifest instead of silently dropped.
+
+### The scrub, and what it caught
+
+Every message, command and tool result is scrubbed before it is written, and the export **refuses
+a row** rather than writing one that still contains `/home/`, `/var/tmp/`, the local username, a
+hostname, or anything matching a key/token pattern. Rules: local absolute paths
+(`/home/<user>`, `/Users/<user>`, `/var/tmp/...`, worktrees) and the Kaggle cache layout become
+`./input/<file>` or `./input`; the username and hostname are removed.
+
+Two things it found on the live tree, both of which a path-only rule would have shipped:
+
+- **`ls -la ./input`** is the first command of essentially every transcript, and its output opens
+  with three columns of permissions, **the local account name**, and a date. Replacing paths
+  cannot fix that column; a bare-name rule is what removes it.
+- **`/var/tmp/synprobe2/...`** — another session's scratch directory, present in 7 of the first
+  320 verified trials. Not this project's path, and not something the pool knows about. The rule
+  is now *any* `/var/tmp` path.
+
+Verified on the written files: 0 occurrences of `/home/`, `/Users/`, `/var/tmp/` or
+`kaggle/datasets`. The remaining hits for the username are inside words (`relevant`, `relevance`)
+and inside a table's data (`Evans, Fred` in a baseball CSV), both of which are correct to keep.
+
+### It is a translation, and the cost is stated
+
+The sweep ran `run_shell` + `write_solution` against `./input` with a persistent `solution.py`;
+upstream's protocol is one `bash` tool against `/home/user/input` submitting to
+`/workdir/answer.txt`. Same contract, different spelling, so the trajectory is re-expressed:
+
+- both tools become `bash`; the model's own command text is kept verbatim; call ids are rewritten
+  so results stay attached to the calls that produced them; `cd . &&` is dropped (it is the
+  sweep's scratch, not something the model said);
+- `./input` is **kept**, not rewritten to `/home/user/input`: it is the spelling the model's own
+  commands already use, so rewriting it would misattribute a convention to the translator;
+- the **submission turn is appended**: the trajectory is cut at the model's final answer — which is
+  checked to actually state the graded prediction, compared through the dataset's own grader so
+  "141" and "141.0" are one answer — and `echo -n "<prediction>" > /workdir/answer.txt` is added
+  after it. What the model learns is "compute it, state it, submit it"; what it does *not* learn
+  is our re-formatting of the value. That is the whole of the invention, and it is one turn.
+
+### Token statistics
+
+Measured with the base model's own chat template — `Qwen/Qwen3.5-0.8B`, cached locally,
+`enable_thinking=False` — because that is the text a `--max-length` has to be set against. The
+manifest names the method; a chars/4 fallback names itself in the same field.
+
+| | trace rows (`ja3_sft`) | contract rows (`ja3_fallback`) |
+|---|---|---|
+| turns, median | **7** | 4 (always 4) |
+| turns, p90 | **11** | 4 |
+| turns, min / max | 4 / 41 | 4 / 4 |
+| tokens, median | **2,364** | 1,079 |
+| tokens, p90 | **6,956** | 1,370 |
+| tokens, min / max | 1,249 / 54,648 | 894 / 20,709 |
+| **share over 8,192 tokens** | **7.93%** | 0.15% |
+
+**op_family breakdown** (2,029 rows): count 823 · agg 400 · string 239 · filter 195 · stat_test
+144 · other 67 · ml_fit 66 · argmax 48 · groupby 35 · lookup 12.
+
+### How it compares to arm A
+
+| | arm A (`smoldataenvs-sft`) | arm B (`ja3_sft`) |
+|---|---|---|
+| rows | 4,673 | **2,029 (43%)** |
+| protocol | bash | bash |
+| trajectories | another model's, on SmolDataEnvs' tasks | **our own solver's**, on jupyter-agent tasks |
+| median turns / tokens | — | 7 / 2,364 |
+| held-out leakage caught | 4 (question) | 1 (question), 0 (table) |
+
+Arm B is **43% the size of arm A and different in kind**, which is the point of the experiment: the
+same format, the same grader, the same held-out splits, and trajectories from a different solver on
+a non-overlapping corpus. Two caveats that belong next to the number: 2,029 rows is one epoch of
+about 250 optimizer steps at batch 1 × accum 8, which is small enough that seed variance matters
+(PLAN asks for ≥2 seeds), and the 7.9% over 8,192 tokens means a `--max-length 8192` run silently
+truncates ~160 rows — `--max-length 4096` would truncate ~25% and is the wrong default here.
+
+### The fallback file, and why it is separate
+
+`data/solutions/jupyter-agent` has 855 verified references and **zero** conversations, so all that
+can come out of it is the contract trajectory: write the verified program, submit the graded
+answer, stop. 173 more are not in the v3 pool at all. Those 682 rows are written to their own
+file with a `note` in their manifest saying exactly what they are, because a dataset that mixed
+them in with real traces without saying so would report something it is not.
+
+---
+
+## 6. Running it
 
 ### Export
 
@@ -169,16 +309,29 @@ uv run --extra train python -m train.export_sft \
 uv run --extra train python -m train.export_sft --source traces --out data/train/sft_traces
 uv run --extra train python -m train.export_sft --source rungs --rung L2 --out data/train/rungs_L2
 uv run python -m train.rungs --counts      # availability, per rung, per source
+
+# Arm B: the ja3 transcript sweep, real traces + the contract rows (see §5)
+uv run python -m train.export_ja3 --out data/train
+# -> ja3_sft.jsonl 2029 rows, ja3_fallback.jsonl 682, firewall drops 0 table / 1 question
 ```
 
 ### SFT — laptop (this box)
 
 ```sh
+# Arm A
 uv run --extra train python -m train.sft_lora \
     --data data/train/sft_upstream \
     --model Qwen/Qwen3.5-2B \
     --out runs/sft_a \
     --max-length 4096 --load-in-4bit        # QLoRA: 4-bit weights, ~1.2 GB
+
+# Arm B. --max-length 8192, not 4096: 7.9% of the trace rows are longer than 8,192 tokens and the
+# median is 2,364, so 4096 would truncate about a quarter of the set (§5).
+uv run --extra train python -m train.sft_lora \
+    --data data/train/ja3_sft.jsonl \
+    --model Qwen/Qwen3.5-2B \
+    --out runs/sft_b \
+    --max-length 8192 --load-in-4bit
 ```
 
 `--load-in-4bit` is **required** on 6 GB: the base model is 4.55 GB bf16 and leaves nothing for
@@ -202,7 +355,7 @@ uv run --extra train python -m train.grpo \
 
 ---
 
-## 6. Measured, on this laptop
+## 7. Measured, on this laptop
 
 **Stack** (the `train` extra): torch 2.14.1+cu130, transformers 5.18.0, trl 1.14.1, peft 0.21.2,
 accelerate 1.15.0, datasets 5.0.1, bitsandbytes 0.50.2. GPU: RTX 4050 Laptop, 6,141 MiB total,
@@ -269,7 +422,7 @@ be set on the first run or an interrupted run loses everything.
 
 ---
 
-## 7. Decisions the owner must make
+## 8. Decisions the owner must make
 
 1. **Firewall strictness** (§3) — **decided 2026-10-01: keep the default**, `task_id,question`, which
    keeps **4,673** rows and replicates arm A. The table-level `bucket_prefix` check stays an **opt-in
@@ -278,15 +431,24 @@ be set on the first run or an interrupted run loses everything.
    L2 hands over. Whichever is used, the export reports the drops by column, so the contamination is
    stated in the run record rather than left in a report nobody reads. Changing this changes the
    dataset and must never be done silently.
+
+   **For arm B this decision is already made by construction and it is not the owner's to make
+   twice.** `ja3_sft` is exported from the v3 pool, which excludes every SmolDataEnvs test/eval
+   *table* on the bare dataset name; the export re-asserts that and reports 0 drops (§5). There is
+   no arm-B variant of the `bucket_prefix` flag, because there is no arm-B row to apply it to.
 2. **Base model.** Everything defaults to `Qwen/Qwen3.5-2B`, the exact `base_model_name_or_path` in
    both released models' configs. The smoke run used `Qwen/Qwen3.5-0.8B` (same architecture, same
    `enable_thinking` template) because 2B does not fit a LoRA smoke run on 6 GB. Real runs use the
    2B.
-3. **Which SFT arm is "ours".** Arm A is upstream's 4.7K. Arm B is jupyter-agent, and there is **no
-   trainable trace for it on the pre-2026-10-01 tree** (§1) — `--source traces` yields only the
-   contract fallback. `run_ladder` and `gen_refs` now save transcripts by default, so arm B becomes
-   trainable the moment a sweep is run with them; the `ja3` sweep on the v3 ladder-grade pool is
-   that sweep. Until then `--source traces` must not be quoted as a trace dataset.
+3. **Which SFT arm is "ours".** — **resolved 2026-10-01.** Arm A is upstream's 4.7K. Arm B is
+   **`data/train/ja3_sft.jsonl`, 2,029 rows of our own solver's real trajectories** (§5), exported
+   by `train/export_ja3.py` from the `ja3` transcript sweep. `--source traces` is superseded for
+   arm B and must not be quoted as a trace dataset: it still reads the pre-2026-10-01 tree and finds
+   no conversation in it. What is still the owner's call: whether to train arm B on `ja3_sft`
+   alone (2,029 traces), on `ja3_fallback` alone (682 contract rows), or on the two concatenated
+   (2,711, with the contract rows teaching only the submission contract and the traces teaching the
+   exploration). §5 argues for the traces alone, and the fallback file exists so the alternative can
+   be run without re-deriving anything.
 4. **Where the arms run** — **leaning, not settled: the AMD Developer Cloud credit** (MI300X 192 GB,
    $1.99/h, $100 ≈ 50 h, expiring 30 days after applying) carries arms A–D, with **Kaggle as the
    fallback** and the place the first SFT runs. The credit is to be **applied only once SFT and GRPO
