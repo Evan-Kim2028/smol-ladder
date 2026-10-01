@@ -177,10 +177,12 @@ in at least one sample:
 
 **This is the result, and it is much stronger than the full-set curve.** Where a hint can act, it
 acts: 22.3% → 97.2%, and the control — which adds no information — moves it only to 37.5%. On the
-full referenced set the same rungs read 87.6% → 98.6% because 154 tasks are already at 1.0 and can
-only contribute a constant. Quoting the full-set curve alone would understate the ladder's effect
-by an order of magnitude, and quoting the headroom curve alone would overstate the population. Both
-belong in every caption.
+full referenced set the same rungs read 87.6% → 98.6%, because 154 tasks are already at 1.0 and
+can only contribute a constant. The L1 → L4 gain is **74.9 points** on the 56 tasks with headroom
+against **11.0 points** on all 213 — roughly five times smaller, and with the control at 15.2
+points on the headroom set. Quoting the full-set curve alone understates the effect several-fold,
+and quoting the headroom curve alone overstates the population it covers. Both belong in every
+caption.
 
 #### Monotonicity
 

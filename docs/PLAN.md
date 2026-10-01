@@ -16,8 +16,8 @@ hint generation and validation, the tagged jupyter-agent pools v1/v2/**v3** (`jt
 tasks, with the corrected `test`/`eval` bare-name overlap firewall), per-rung summarisation with a
 bootstrap CI, offline regrading, and `--run-tag`/`RUN.json` so a sweep records the code, command
 line, model, protocol, rungs, samples, climb setting and reference denominator at launch.
-367 tests pass (as of 2026-10-01), 4 of them marked `slow` because they read a whole split from
-disk; `pytest -m "not slow"` is the ~2-minute quick loop and the full suite ~15.
+453 tests pass (as of 2026-10-01), 4 of them marked `slow` because they read a whole split from
+disk; `pytest -m "not slow"` is the ~2-minute quick loop (449 tests) and the full suite ~15.
 
 **Measured, on `test`, run `v2` (250 tasks x 5 conditions x 2 samples, `--no-climb`,
 `stealth/space-bunny-alpha`) — as of 2026-10-01, re-measured from `data/runs/v2` by me:** every
