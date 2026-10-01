@@ -332,7 +332,7 @@ def test_the_control_runs_without_a_reference(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "read_source", lambda row, split: None)
 
     def fake_once(row, prompt, work, venv, model, max_turns, retry_failed, inputs_of,
-                  rung_label="run", provenance=None, was_run=None):
+                  rung_label="run", provenance=None, was_run=None, agent="tools"):
         ran.append(work.name)
         if was_run is not None:
             was_run.clear()

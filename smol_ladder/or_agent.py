@@ -22,9 +22,69 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from smol_ladder.upstream import BASH_TOOL, extract_code, is_program, localise_paths
+
 MODEL = "stealth/space-bunny-alpha"
-API = "https://openrouter.ai/api/v1/chat/completions"
-ENV_KEY = "OPENROUTER_API_KEY"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+API_KEY_ENV = "OPENROUTER_API_KEY"
+
+
+class Endpoint:
+    """Where the completions come from, resolved from the environment.
+
+    Any OpenAI-compatible server speaks this shape: vLLM, llama.cpp's server, ollama, LM Studio,
+    OpenRouter, a stub in a test. So the base URL, the name of the API-key variable and the
+    model id are all configuration rather than constants, and a loopback URL is allowed to carry
+    no key at all -- vLLM and llama.cpp both reject a bearer header they did not ask for, and
+    making every local run invent a token to satisfy the remote path is how a local eval ends up
+    not runnable at all.
+    """
+
+    def __init__(self, base_url: str, api_key: str = "", chat_template_kwargs: dict | None = None,
+                 name: str = "smol-ladder"):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.chat_template_kwargs = chat_template_kwargs
+        self.name = name
+
+    @property
+    def url(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            if "openrouter.ai" in self.base_url:
+                headers["HTTP-Referer"] = "https://github.com/evan-kim2028/smol-ladder"
+                headers["X-Title"] = self.name
+        return headers
+
+
+def _is_local(base_url: str) -> bool:
+    return any(h in base_url for h in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]"))
+
+
+def endpoint(env: dict | None = None, model: str = MODEL) -> Endpoint:
+    """Resolve the endpoint.
+
+    SMOL_LADDER_BASE_URL    the server; a loopback one needs no key
+    SMOL_LADDER_API_KEY_ENV which env var holds the key (default OPENROUTER_API_KEY)
+    SMOL_LADDER_CHAT_TEMPLATE_KWARGS
+                           JSON passed through as chat_template_kwargs. Defaults to
+                           {"enable_thinking": False} because that is how every model in this
+                           study was trained and how upstream scores it; set it to "" to send
+                           none (a server whose template has no such flag rejects the kwarg).
+    """
+    env = os.environ if env is None else env
+    base = (env.get("SMOL_LADDER_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+    key_env = env.get("SMOL_LADDER_API_KEY_ENV") or API_KEY_ENV
+    key = env.get(key_env, "")
+    if not key and not _is_local(base):
+        raise RuntimeError(f"{key_env} is not set, and {base} is not a local server")
+    raw = env.get("SMOL_LADDER_CHAT_TEMPLATE_KWARGS")
+    kwargs = {"enable_thinking": False} if raw is None else (json.loads(raw) if raw else None)
+    return Endpoint(base, key, kwargs)
 
 SYSTEM = """You are solving a data-analysis question.
 
@@ -72,36 +132,43 @@ SHELL_TIMEOUT = 120
 
 
 def api_key() -> str:
-    key = os.environ.get(ENV_KEY)
+    key = os.environ.get(API_KEY_ENV)
     if not key:
-        raise RuntimeError(f"{ENV_KEY} is not set")
+        raise RuntimeError(f"{API_KEY_ENV} is not set")
     return key
 
 
-def call_model(messages: list[dict], model: str, tools: list[dict]) -> dict:
+def call_model(messages: list[dict], model: str, tools: list[dict] | None,
+               ep: Endpoint | None = None, max_tokens: int | None = None) -> dict:
     """One chat completion, with retries.
 
     OpenRouter intermittently answers 200 with a body that has no "choices" (a routed-provider
     error, or a rate limit surfaced as JSON). Retrying is the same call the cmd path already
-    made, and losing a whole trial to a transient is worse than a few seconds of backoff.
+    made, and losing a whole trial to a transient is worse than a few seconds of backoff. A local
+    server does the same thing on an out-of-memory batch, so the retry is not OpenRouter-specific.
+
+    `tools=None` means no tools at all: upstream's one-turn program protocol passes no `tools`
+    key, and sending an empty list instead is not the same request (some servers reject it).
     """
-    body = json.dumps({
+    ep = ep or endpoint()
+    body: dict = {
         "model": model,
         "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
         "temperature": 0.0,
-    }).encode()
-    headers = {
-        "Authorization": f"Bearer {api_key()}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/evan-kim2028/smol-ladder",
-        "X-Title": "smol-ladder",
     }
+    if tools is not None:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    if ep.chat_template_kwargs:
+        body["chat_template_kwargs"] = ep.chat_template_kwargs
+    payload_bytes = json.dumps(body).encode()
+    headers = ep.headers()
     last = ""
     for attempt in range(5):
         try:
-            req = urllib.request.Request(API, data=body, headers=headers)
+            req = urllib.request.Request(ep.url, data=payload_bytes, headers=headers)
             with urllib.request.urlopen(req, timeout=180) as resp:
                 payload = json.load(resp)
             if payload.get("choices"):
@@ -112,7 +179,7 @@ def call_model(messages: list[dict], model: str, tools: list[dict]) -> dict:
         except Exception as e:  # noqa: BLE001 - any transport error is worth one more try
             last = f"{type(e).__name__}: {e}"
         time.sleep(min(60, 5 * 2**attempt))
-    raise RuntimeError(f"OpenRouter gave no completion after 5 attempts: {last}")
+    raise RuntimeError(f"{ep.base_url} gave no completion after 5 attempts: {last}")
 
 
 def run_command(command: str, timeout: int = 150, cwd: str | None = None) -> str:
@@ -168,20 +235,21 @@ def _as_file(text: str) -> Path:
 
 
 def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
-               max_turns: int = 40) -> list[dict]:
+               max_turns: int = 40, ep: Endpoint | None = None) -> list[dict]:
     """The model loop, independent of Harbor.
 
     run_shell(command) -> str executes in the task container; write_solution(code) stages
     solution.py. Returns the per-turn log. Kept free of Harbor types so it can be tested
     against a stub and reused outside a trial.
     """
+    ep = ep or endpoint()
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": instruction},
     ]
     log: list[dict] = []
     for _ in range(max_turns):
-        completion = call_model(messages, model, TOOLS)
+        completion = call_model(messages, model, TOOLS, ep)
         message = completion["choices"][0]["message"]
         calls = message.get("tool_calls") or []
         entry: dict = {"model": model, "message": message}
@@ -217,6 +285,74 @@ def _harbor_base():
     """Import Harbor lazily so this module imports (and is testable) without it."""
     from harbor.agents.installed.base import BaseInstalledAgent
     return BaseInstalledAgent
+
+
+# ── the upstream protocols, as loops ──────────────────────────────────────────
+# MAX_NEW_TOKENS is upstream's eval_pass1.py default. Upstream caps the *program* at 1024
+# generated tokens; anything longer is a 2B model repeating itself, and a truncated program has
+# no closing fence so it cannot compile and scores zero anyway.
+UPSTREAM_MAX_TOKENS = 1024
+
+
+def program_once(messages: list[dict], model: str, ep: Endpoint | None = None,
+                 max_tokens: int = UPSTREAM_MAX_TOKENS) -> dict:
+    """One turn, no tools: the model writes a program, we hand back the extracted code.
+
+    This is `eval_pass1.py`'s whole generation step. Nothing loops, because upstream's rollout
+    is one turn; the loop in our `tools` agent is the part these models were not trained on.
+    """
+    ep = ep or endpoint()
+    completion = call_model(messages, model, None, ep, max_tokens=max_tokens)
+    message = completion["choices"][0]["message"]
+    return {"model": model, "message": message,
+            "code": extract_code(message.get("content") or ""),
+            "ran": is_program(extract_code(message.get("content") or ""))}
+
+
+def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
+              max_turns: int = 16, ep: Endpoint | None = None) -> list[dict]:
+    """The SFT protocol: one `bash` tool, and the loop ends when the answer is submitted.
+
+    Stopping on submission is upstream's "then stop" made executable. Without it a 2B model that
+    has answered correctly keeps calling bash, sometimes overwriting its own answer, and the
+    trial measures its ability to stop talking rather than its ability to answer. The published
+    trajectories show the pattern plainly: submit, then one short closing message, nothing more.
+
+    Upstream's trajectories run 3-12 turns; 16 is a ceiling that no published row reaches.
+    """
+    ep = ep or endpoint()
+    log: list[dict] = []
+    for _ in range(max_turns):
+        completion = call_model(messages, model, BASH_TOOL, ep)
+        message = completion["choices"][0]["message"]
+        calls = message.get("tool_calls") or []
+        entry: dict = {"model": model, "message": message}
+        messages.append({
+            "role": "assistant",
+            "content": message.get("content") or "",
+            **({"tool_calls": calls} if calls else {}),
+        })
+        if not calls:
+            log.append(entry)
+            break
+        results = []
+        for call in calls:
+            fn = call["function"]
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            command = localise_paths(args.get("command", ""))
+            output = run_shell(command)
+            entry.setdefault("tool_results", []).append({"name": fn["name"], "output": output})
+            results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+        messages.extend(results)
+        log.append(entry)
+        submitted = read_answer()
+        if submitted is not None:
+            entry["submitted"] = submitted
+            break
+    return log
 
 
 class OpenRouter:  # replaced below once Harbor is importable

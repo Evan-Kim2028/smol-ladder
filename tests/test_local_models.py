@@ -1,0 +1,436 @@
+"""The ladder against a local OpenAI-compatible server, in both of its agent modes.
+
+Nothing here loads a model. A stub HTTP server stands in for vLLM / llama.cpp / ollama and
+replies with scripted completions, so the whole request/response contract is exercised: which
+URL is called, what the body says, which tool schema is offered, and what gets graded.
+
+The stub is a ThreadingHTTPServer on a loopback port rather than a mock of `urlopen`, because
+the endpoint being configurable is the whole point of the change: a base URL, an API-key env
+name and a model id that a local server understands are different things from OpenRouter's, and
+only a real socket can prove the request got there.
+"""
+
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from smol_ladder.or_agent import Endpoint, endpoint
+from smol_ladder.upstream import (BASH_TOOL, PROGRAM_SYSTEM, extract_code, localise_paths,
+                                  looks_like_a_command, program_prompt, bash_prompt)
+
+
+class Stub:
+    """An OpenAI-compatible chat/completions endpoint that replies from a script."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.requests: list[dict] = []
+        self.headers: list[dict] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                outer.requests.append(json.loads(self.rfile.read(length)))
+                outer.headers.append({k.lower(): v for k, v in self.headers.items()})
+                reply = outer.replies.pop(0) if outer.replies else {
+                    "choices": [{"message": {"content": ""}}]}
+                body = json.dumps(reply).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+    def __enter__(self):
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def assistant(content="", calls=None):
+    message = {"role": "assistant", "content": content}
+    if calls:
+        # arguments is a JSON *string* on the wire. Handing the loop a dict would let it pass
+        # while the server it actually talks to sends a string, so the stub has to match.
+        message["tool_calls"] = [
+            {"id": f"call_{i}", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}
+            for i, (name, args) in enumerate(calls)]
+    return {"choices": [{"message": message}]}
+
+
+# ── the upstream protocol, byte for byte ──────────────────────────────────────
+
+def test_the_program_prompt_is_the_one_the_grpo_model_was_trained_on():
+    """The prompt is the protocol. A paraphrase is a different evaluation."""
+    prompt = program_prompt("How many rows?", ["a.csv"])
+    assert prompt[0] == {"role": "system", "content": PROGRAM_SYSTEM}
+    user = prompt[1]["content"]
+    assert user.startswith("How many rows?\n\nThe files are in /home/user/input")
+    assert "- a.csv" in user
+    assert "```python block" in user
+    assert "/workdir/answer.txt" not in user, "the program protocol has no answer file"
+
+
+def test_a_task_with_no_file_names_still_gets_a_prompt():
+    """Upstream's build_prompt has a fallback here, and 1/4 of tasks hit it."""
+    user = program_prompt("Q?", [])[1]["content"]
+    assert "No file names were provided by the dataset" in user
+    assert "os.listdir" in user
+
+
+def test_the_bash_prompt_is_the_one_the_sft_model_was_trained_on():
+    prompt = bash_prompt("How many rows?", ["a.csv"])
+    system, user = prompt[0]["content"], prompt[1]["content"]
+    assert system.startswith("You are an autonomous data-analysis agent")
+    assert "/workdir/answer.txt" in system
+    assert "Do NOT end your turn without submitting." in system
+    assert "Question:\nHow many rows?" in user
+    assert user.count("/workdir/answer.txt") >= 2
+    assert BASH_TOOL[0]["function"]["name"] == "bash"
+    assert "non-stateful" in BASH_TOOL[0]["function"]["description"]
+
+
+def test_the_last_fenced_block_wins():
+    """Models draft in one block and answer in the next; upstream takes the last."""
+    out = extract_code("thinking\n```python\nprint(1)\n```\nactually\n```python\nprint(42)\n```")
+    assert out == "print(42)"
+
+
+def test_unfenced_output_is_treated_as_code_rather_than_scored_zero():
+    assert extract_code("  print(42)  ") == "print(42)"
+
+
+def test_the_command_guard_matches_upstreams_rule():
+    # a bare value that begins with '>' is an answer, not a redirect
+    assert not looks_like_a_command(">50K")
+    # a value that redirects one is a command that never ran
+    assert looks_like_a_command("2.14 > answer.txt")
+    assert looks_like_a_command("echo -n 2.14 > answer.txt")
+    assert looks_like_a_command("42 | tee out.txt")
+    assert not looks_like_a_command("42")
+
+
+def test_paths_are_localised_because_our_jail_is_not_their_sandbox():
+    code = "df = pd.read_csv('/home/user/input/Iris.csv')\nprint(len(df))"
+    out = localise_paths(code)
+    assert "input/Iris.csv" in out
+    assert "/home/user" not in out
+    assert "answer.txt" in localise_paths("echo -n 7 > /workdir/answer.txt")
+
+
+# ── endpoint resolution ───────────────────────────────────────────────────────
+
+def test_a_local_server_needs_no_api_key(monkeypatch):
+    monkeypatch.delenv("SMOL_LADDER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+    ep = endpoint({"SMOL_LADDER_BASE_URL": "http://127.0.0.1:8000/v1"})
+    assert ep.url == "http://127.0.0.1:8000/v1/chat/completions"
+    assert ep.api_key == ""
+
+
+def test_a_remote_endpoint_without_a_key_is_an_error_not_a_401(monkeypatch):
+    monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        endpoint({"SMOL_LADDER_BASE_URL": "https://openrouter.ai/api/v1"})
+
+
+def test_the_key_env_var_is_itself_configurable():
+    ep = endpoint({"SMOL_LADDER_BASE_URL": "http://127.0.0.1:1/v1",
+                   "SMOL_LADDER_API_KEY_ENV": "LOCAL_TOKEN", "LOCAL_TOKEN": "secret"})
+    assert ep.headers()["Authorization"] == "Bearer secret"
+
+
+def test_a_trailing_slash_does_not_double_up():
+    ep = Endpoint(base_url="http://127.0.0.1:8000/v1/", api_key="")
+    assert ep.url == "http://127.0.0.1:8000/v1/chat/completions"
+
+
+def test_non_thinking_is_requested_by_default_but_can_be_turned_off():
+    assert endpoint({"SMOL_LADDER_BASE_URL": "http://127.0.0.1:1/v1"}).chat_template_kwargs \
+        == {"enable_thinking": False}
+    assert endpoint({"SMOL_LADDER_BASE_URL": "http://127.0.0.1:1/v1",
+                     "SMOL_LADDER_CHAT_TEMPLATE_KWARGS": ""}).chat_template_kwargs is None
+
+
+# ── the tools loop, against a stub server ─────────────────────────────────────
+
+def test_the_tools_loop_calls_the_configured_server_with_the_configured_model(monkeypatch,
+                                                                              tmp_path):
+    """The endpoint is the change: base URL, key env and model id all come from config."""
+    with Stub([assistant(calls=[("run_shell", {"command": "ls input"})]),
+               assistant(calls=[("write_solution", {"code": "print(42)"})]),
+               assistant("done")]) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.setenv("SMOL_LADDER_API_KEY_ENV", "LOCAL_TOKEN")
+        monkeypatch.setenv("LOCAL_TOKEN", "tok")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        seen: list[str] = []
+        from smol_ladder.or_agent import solve_loop
+        log = solve_loop("Q?", lambda c: (seen.append(c), "ok")[1],
+                         lambda c: None, "AdithyaSK/smoldataenvs-grpo-2b-v0", 4)
+    assert len(log) == 3
+    assert seen == ["ls input"]
+    body = stub.requests[0]
+    assert body["model"] == "AdithyaSK/smoldataenvs-grpo-2b-v0"
+    assert body["temperature"] == 0.0
+    assert {t["function"]["name"] for t in body["tools"]} == {"run_shell", "write_solution"}
+    assert stub.headers[0]["authorization"] == "Bearer tok"
+
+
+# ── the upstream program mode, end to end through once() ──────────────────────
+
+def test_once_in_program_mode_grades_the_extracted_program(tmp_path, monkeypatch):
+    """The faithful path: one program in a fence, run offline, graded by our grader."""
+    import smol_ladder.run_ladder as runner
+
+    program = "```python\nimport pandas as pd\ndf = pd.read_csv('input/t.csv')\nprint(6*7)\n```"
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+
+    with Stub([assistant(program)]) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.setenv("SMOL_LADDER_API_KEY_ENV", "LOCAL_TOKEN")
+        monkeypatch.setenv("LOCAL_TOKEN", "tok")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once(row, runner_program_prompt(), work, Path(sys.prefix), "local-2b",
+                             1, inputs_of=lambda r: inputs, rung_label="L1", agent="program")
+
+    assert result["agent_status"] == "exit 0", result.get("stderr", "")[:400]
+    assert (work / "solution.py").read_text().endswith("print(6*7)")
+    assert result["prediction"] == "42", result["prediction"]
+    assert result["reward"] == 1.0
+    # one turn, no tools offered: this mode is not a tool loop at all
+    assert "tools" not in stub.requests[0]
+
+
+def test_a_result_records_which_protocol_and_which_endpoint_produced_it(tmp_path, monkeypatch):
+    """Provenance has to name the protocol, not just the model.
+
+    The same model under `program` and under `tools` is a different measurement, and the same
+    model served locally versus through OpenRouter is a third. A summary that cannot tell those
+    apart pools them, so both the mode and the base URL that actually served the request are
+    written next to the prompt hash and the rung.
+    """
+    import smol_ladder.run_ladder as runner
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+
+    with Stub([assistant("```python\nprint(42)\n```")]) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.setenv("SMOL_LADDER_API_KEY_ENV", "LOCAL_TOKEN")
+        monkeypatch.setenv("LOCAL_TOKEN", "tok")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once(row, runner_program_prompt(), tmp_path / "p", Path(sys.prefix),
+                             "local-2b", 1, inputs_of=lambda r: inputs, rung_label="L1",
+                             provenance={"rung": "L1", "sample": 2}, agent="program")
+
+    assert result["agent"] == "program"
+    assert result["base_url"] == stub.base_url
+    assert result["model"] == "local-2b"
+    # ... beside the ladder provenance, so one record identifies the whole measurement
+    assert result["rung"] == "L1" and result["sample"] == 2
+    assert result["prompt_sha256"]
+
+    with Stub([assistant("```python\nprint(42)\n```")]) as stub2:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub2.base_url)
+        monkeypatch.setenv("SMOL_LADDER_API_KEY_ENV", "LOCAL_TOKEN")
+        monkeypatch.setenv("LOCAL_TOKEN", "tok")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        same_model = runner.once(row, runner_program_prompt(), tmp_path / "b", Path(sys.prefix),
+                                 "local-2b", 1, inputs_of=lambda r: inputs, rung_label="L1",
+                                 agent="bash")
+
+    # same model, different protocol and different port: the record must tell them apart
+    assert same_model["agent"] == "bash"
+    assert same_model["base_url"] == stub2.base_url != result["base_url"]
+
+
+def test_once_in_program_mode_does_not_offer_tools_even_though_the_model_can_call_them(
+        tmp_path, monkeypatch):
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    with Stub([assistant("```python\nprint(1)\n```")]) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        import smol_ladder.run_ladder as runner
+        runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "1",
+                     "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                    runner_program_prompt(), tmp_path / "w", Path(sys.prefix), "m", 1,
+                    inputs_of=lambda r: inputs, agent="program")
+    assert "tool_calls" not in json.dumps(stub.requests[0])
+
+
+def runner_program_prompt() -> str:
+    from smol_ladder.upstream import program_prompt
+    return program_prompt("Q?", ["t.csv"])[1]["content"]
+
+
+# ── the upstream bash mode, end to end through once() ─────────────────────────
+
+def test_once_in_bash_mode_grades_the_answer_file(tmp_path, monkeypatch):
+    """The SFT protocol: the model shells around and submits by writing a file."""
+    import smol_ladder.run_ladder as runner
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    replies = [
+        assistant(calls=[("bash", {"command": "ls input"})]),
+        assistant(calls=[("bash", {"command": "python3 -c \"print(6*7)\""})]),
+        assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})]),
+        assistant("The answer is 42."),
+    ]
+    with Stub(replies) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once(row, runner_bash_prompt(), work, Path(sys.prefix), "sft-2b", 8,
+                             inputs_of=lambda r: inputs, rung_label="L1", agent="bash")
+
+    assert result["agent_status"] == "exit 0", result.get("stderr", "")[:400]
+    assert result["prediction"] == "42", result["prediction"]
+    assert result["reward"] == 1.0
+    # the answer file is the run's evidence, so it is kept next to the result
+    assert (work / "answer.txt").read_text() == "42"
+    # the bash tool schema is the one from SmolDataEnvs-sft, verbatim
+    assert [t["function"]["name"] for t in stub.requests[0]["tools"]] == ["bash"]
+    # and the sandbox saw a localised command, not an absolute /workdir path
+    assert "answer.txt" in json.dumps(stub.requests[1:])
+    assert not (work / "solution.py").exists()
+
+
+def test_a_submitted_answer_ends_the_bash_loop(tmp_path, monkeypatch):
+    """"then stop" is part of the protocol: three more turns after submitting are not a
+    measurement of anything, and on a 2B model they are 3 turns of rambling."""
+    import smol_ladder.run_ladder as runner
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    replies = [
+        assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})]),
+        assistant(calls=[("bash", {"command": "ls"})]),
+    ]
+    with Stub(replies) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
+                              "answer": "42", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                             runner_bash_prompt(), tmp_path / "w", Path(sys.prefix), "m", 8,
+                             inputs_of=lambda r: inputs, agent="bash")
+    assert result["reward"] == 1.0
+    assert len(stub.requests) == 1, "the loop kept going after the answer was submitted"
+
+
+def test_the_bash_mode_refuses_to_credit_an_answer_that_is_just_a_command(tmp_path, monkeypatch):
+    """Upstream's reward hack, guard and all.
+
+    A 2B model that has not understood the protocol often "submits" by running
+    `python3 -c "print(2.14)" > answer.txt` *as the echo payload*, i.e. the answer file ends up
+    holding the text of the command rather than the value it would print. Upstream guards exactly
+    this: `echo -n "2.14" > answer.txt` used to grade as 2.14 because the string contains it.
+    """
+    import smol_ladder.run_ladder as runner
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    # The model echoes the whole shell line into the file instead of running it.
+    replies = [assistant(calls=[("bash", {"command":
+                           "echo -n 'echo 2.14 > answer.txt' > answer.txt"})])]
+    with Stub(replies) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
+                              "answer": "2.14", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                             runner_bash_prompt(), tmp_path / "w", Path(sys.prefix), "m", 8,
+                             inputs_of=lambda r: inputs, agent="bash")
+    assert result["reward"] == 0.0, result["prediction"]
+    assert "command" in result.get("stderr", "")
+
+
+def test_the_bash_mode_accepts_a_value_that_merely_contains_a_redirect(tmp_path, monkeypatch):
+    """The guard is not so blunt that it rejects a real gold answer. Upstream's regex requires
+    something *before* the redirect, because gold answers legitimately start with `>`:
+    `>50K`, `> 2 Years`, `>40hrs` are all real answers in SmolDataEnvs."""
+    from smol_ladder.upstream import looks_like_a_command
+    assert not looks_like_a_command(">50K")
+    assert not looks_like_a_command(">40hrs")
+
+
+def test_a_local_model_that_produces_nothing_scores_zero_not_a_crash(tmp_path, monkeypatch):
+    import smol_ladder.run_ladder as runner
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    with Stub([assistant("I am not sure how to answer that.")]) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
+                              "answer": "42", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                             runner_program_prompt(), tmp_path / "w", Path(sys.prefix), "m", 1,
+                             inputs_of=lambda r: inputs, agent="program")
+    assert result["agent_status"] == "exit 0"
+    assert result["reward"] == 0.0
+
+
+def test_a_program_that_reads_a_bare_filename_still_finds_its_table(tmp_path, monkeypatch):
+    """Upstream programs run with the tables as the working directory, so `pd.read_csv('a.csv')`
+    is idiomatic for them. Ours run one level up, next to ./input. Both spellings must work or
+    we are not measuring their skill, ours."""
+    import smol_ladder.run_ladder as runner
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n7\n")
+    work = tmp_path / "trial" / "L1"
+    program = "```python\nimport pandas as pd\nprint(int(pd.read_csv('t.csv')['a'].sum()))\n```"
+    with Stub([assistant(program)]) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
+                              "answer": "7", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                             runner_program_prompt(), work, Path(sys.prefix), "m", 1,
+                             inputs_of=lambda r: inputs, agent="program")
+    assert result["reward"] == 1.0, (result["prediction"], result.get("stderr", "")[:300])
+
+
+def runner_bash_prompt() -> str:
+    from smol_ladder.upstream import bash_prompt
+    return bash_prompt("Q?", ["t.csv"])[1]["content"]

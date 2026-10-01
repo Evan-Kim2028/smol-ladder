@@ -35,6 +35,7 @@ from pathlib import Path
 from smol_ladder.grade import grade
 from smol_ladder.ladder import prompt_for, read_source
 from smol_ladder.tasks import DATA, input_dir, load_split
+from smol_ladder.upstream import looks_like_a_command
 
 JAIL_RO = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"]
 # A trial is one model loop of at most 40 turns, each shell command capped at 150s. 20 minutes
@@ -213,7 +214,8 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
          retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run",
-         provenance: dict | None = None, was_run: list | None = None) -> dict:
+         provenance: dict | None = None, was_run: list | None = None,
+         agent: str = "tools") -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
@@ -227,6 +229,19 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     or was reused. It is a list rather than a return flag because the returned dict is the result
     record, and a key like `_fresh` in it would be read by the summariser and written into the
     summary JSON as if it were part of the measurement.
+
+    `agent` picks the protocol, and it is not cosmetic:
+
+    - "tools"  ours. run_shell + write_solution, a persistent ./solution.py, re-run offline.
+    - "program" upstream's GRPO/eval protocol. One turn, no tools, one fenced program.
+    - "bash"   upstream's SFT protocol. One `bash` tool, submit by writing answer.txt.
+
+    Both upstream protocols run in the same jail and are graded by the same offline pass and the
+    same grader, so a local 2B model's number and our solver's number are comparable on the
+    grading side and differ only where the protocol differs. That difference is the measurement.
+
+    A fresh result records the protocol in its "agent" key, beside the provenance below, so a
+    summary over samples can tell a rung's pass rate apart by which contract was actually run.
     """
     if was_run is not None:
         was_run.clear()
@@ -277,17 +292,24 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         # other fifteen workers. Cap the process pool and default n_jobs to that same ceiling.
         "LOKY_MAX_CPU_COUNT": "2", "JOBLIB_START_METHOD": "loky",
         "MKL_DYNAMIC": "FALSE", "NUMEXPR_MAX_THREADS": "1",
+        # The endpoint, handed in whole so the solver inside the jail resolves the same server
+        # this process would. Every one of these is allowlisted rather than inherited: passing
+        # os.environ through gave the agent ten API keys it could read and exfiltrate over the
+        # jail's open network. The base URL is not a credential, so it goes in either way, and
+        # it is the one value a local server cannot do without.
+        "SMOL_LADDER_BASE_URL": os.environ.get("SMOL_LADDER_BASE_URL", ""),
+        "SMOL_LADDER_API_KEY_ENV": os.environ.get("SMOL_LADDER_API_KEY_ENV",
+                                                  "OPENROUTER_API_KEY"),
+        "SMOL_LADDER_CHAT_TEMPLATE_KWARGS": os.environ.get("SMOL_LADDER_CHAT_TEMPLATE_KWARGS",
+                                                           ""),
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
     }
-    script = (
-        "import json,sys;"
-        "sys.path.insert(0, %r);"
-        "import smol_ladder.or_agent as A;"
-        "log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
-        "lambda c: open('solution.py','w').write(c), %r, %d);"
-        "open('turns.json','w').write(json.dumps(len(log)))"
-        % (str(Path(__file__).resolve().parent.parent), model, max_turns)
-    )
+    # A key held under a non-default name has to travel under its own name too, since that is
+    # what SMOL_LADDER_API_KEY_ENV now points at.
+    key_env = env["SMOL_LADDER_API_KEY_ENV"]
+    if key_env != "OPENROUTER_API_KEY":
+        env[key_env] = os.environ.get(key_env, "")
+    script = _agent_script(agent, model, max_turns)
     t0 = time.time()
     try:
         proc = _run_jailed(
@@ -307,9 +329,17 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     produced = trial_scratch / "solution.py"
     if produced.exists():
         shutil.copy(produced, work / "solution.py")
+    # The bash protocol's artifact is a submitted answer rather than a program, so there is
+    # nothing to re-run offline: the value the model chose IS the prediction. Kept on disk
+    # because it is the only evidence of what the run produced.
+    submitted = trial_scratch / "answer.txt"
+    if submitted.exists():
+        shutil.copy(submitted, work / "answer.txt")
     shutil.rmtree(trial_scratch, ignore_errors=True)
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
-              "agent_seconds": round(time.time() - t0, 1), "prediction": "", "reward": 0.0}
+              "agent": agent, "base_url": env["SMOL_LADDER_BASE_URL"],
+              "agent_seconds": round(time.time() - t0, 1),
+              "prediction": "", "reward": 0.0}
     result.update(git_provenance())
     result["prompt_sha256"] = prompt_sha256(prompt)
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -317,6 +347,22 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     # with a rung label and no sample axis, and a reference has rung "reference", sample 0.
     result["rung"] = (provenance or {}).get("rung", rung_label)
     result["sample"] = (provenance or {}).get("sample", 0)
+    if agent == "bash":
+        if (work / "answer.txt").exists():
+            raw = (work / "answer.txt").read_text().strip()
+            if looks_like_a_command(raw):
+                # Upstream's own guard: `echo -n 2.14 > answer.txt` prints as the answer is a
+                # redirect that never ran, and grading it as the value is how 42% of the old
+                # reward's partial credit once went to strings that merely contained it.
+                result["prediction"] = raw
+                result["reward"] = 0.0
+                result["stderr"] = "answer is a command, not a value"
+            else:
+                result["prediction"] = raw
+                result["reward"] = grade(row, raw)
+        if stderr:
+            result["stderr"] = stderr
+        return result
     solution = work / "solution.py"
     if solution.exists():
         # Grade the agent's own last printed line from a clean run, like the Harbor verifier.
@@ -336,6 +382,29 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
                 if tables.is_symlink() or tables.exists():
                     tables.unlink()
                 tables.symlink_to(inputs.resolve())
+        # Upstream runs a program from inside the table directory (`cd /home/user/input &&
+        # python3 /tmp/solve.py`), so a bare `pd.read_csv('a.csv')` is the idiomatic spelling in
+        # every program these models produced -- but our ladder prompts, and our own agent, are
+        # written for `input/a.csv`. Rather than pick one and mis-measure the other, lay the
+        # tables out under BOTH roots: keep the cwd one level up (so `input/...` resolves) and
+        # link each table beside solution.py (so a bare `a.csv` resolves). Both idioms then run,
+        # and the program is measured on its arithmetic rather than on our directory layout.
+        #
+        # The links are RELATIVE. The offline pass bind-mounts this directory at /tmp/work, and
+        # bwrap does not follow a symlink whose target lies outside the mount -- an absolute
+        # link back into the trial directory resolves to a path that does not exist inside the
+        # jail, so every bare-filename program raised FileNotFoundError and scored 0.0.
+        if tables.is_dir():
+            for item in sorted(tables.iterdir()):
+                if item.name.startswith("."):
+                    continue
+                link = verify / item.name
+                if link.exists() or link.is_symlink():
+                    continue
+                try:
+                    link.symlink_to(Path("input") / item.name)
+                except OSError:
+                    pass
         # A verification run that hangs is a failed trial, not a crashed harness: the agent
         # wrote a program that never terminates offline. Catch it or the whole run dies.
         try:
@@ -371,10 +440,54 @@ def sample_dir(rung_dir: Path, k: int) -> Path:
     return rung_dir if k == 0 else rung_dir / f"s{k}"
 
 
+def _agent_script(agent: str, model: str, max_turns: int) -> str:
+    """The program that runs *inside* the jail, one per protocol.
+
+    argv[1] is the user turn of the conversation, which for the upstream protocols is built by
+    `upstream.program_prompt` / `upstream.bash_prompt` so the text matches what the model was
+    trained on; the system turn comes from the same module and is not the rung prompt, because a
+    rung's extra information has to arrive in the user turn to be a rung at all.
+
+    All three write turns.json so once() can tell a clean finish from a crash. Built rather than
+    switched at the call site because the difference between the three is invisible in a one-line
+    %-format, and a test that guesses which body it is running silently stops exercising it.
+    """
+    head = ("import json,os,sys;"
+            "sys.path.insert(0, %r);"
+            "import smol_ladder.or_agent as A;"
+            "import smol_ladder.upstream as U;"
+            % str(Path(__file__).resolve().parent.parent))
+    if agent == "tools":
+        return head + (
+            "log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
+            "lambda c: open('solution.py','w').write(c), %r, %d);"
+            "open('turns.json','w').write(json.dumps(len(log)))" % (model, max_turns))
+    if agent == "program":
+        # Upstream's generation step exactly: one turn, no tools, 1024 new tokens. The extracted
+        # program is written to solution.py so the offline grading pass below runs it sealed, the
+        # same way it runs our agent's -- the prediction is what the program printed when re-run,
+        # never the model's stdout.
+        return head + (
+            "M=[{'role':'system','content':U.PROGRAM_SYSTEM},"
+            "{'role':'user','content':sys.argv[1]}];"
+            "out=A.program_once(M, %r);"
+            "open('solution.py','w').write(out['code']);"
+            "open('turns.json','w').write('1')" % model)
+    if agent == "bash":
+        return head + (
+            "M=[{'role':'system','content':U.BASH_SYSTEM},"
+            "{'role':'user','content':sys.argv[1]}];"
+            "log=A.bash_loop(M, lambda c: A.run_command(c),"
+            "lambda: (open('answer.txt').read() if os.path.exists('answer.txt') else None),"
+            "%r, %d);"
+            "open('turns.json','w').write(json.dumps(len(log)))" % (model, max_turns))
+    raise ValueError(f"unknown agent protocol {agent!r}")
+
+
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
                 runs_root: Path | None = None, samples: int = 1,
-                climb: bool = True) -> list[dict]:
+                climb: bool = True, agent: str = "tools") -> list[dict]:
     """Run the ladder for one task: `samples` trials per rung, optionally climbing.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
@@ -416,7 +529,8 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
             label = rung if k == 0 else f"{rung}s{k}"
             ran: list = []
             r = once(row, prompt, work, venv, model, max_turns,
-                     retry_failed, inputs_of, label, {"rung": prompt_rung, "sample": k}, ran)
+                     retry_failed, inputs_of, label, {"rung": prompt_rung, "sample": k}, ran,
+                     agent)
             # Write only what once() actually produced. A reused result is already on disk with
             # whatever provenance it was written with, and rewriting it here would stamp this
             # run's rung, sample index and git commit onto a trial some earlier code ran -- and
@@ -440,6 +554,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int)
     ap.add_argument("--workers", type=int, default=20)
     ap.add_argument("--model", default="stealth/space-bunny-alpha")
+    ap.add_argument("--agent", default="tools", choices=["tools", "program", "bash"],
+                    help="which protocol to run. 'program' is upstream's GRPO/eval_pass1 "
+                         "protocol (one turn, no tools); 'bash' is the SmolDataEnvs-sft bash "
+                         "agent; 'tools' is ours. A released 2B model must be run under its own "
+                         "protocol or the number is about the protocol, not the model.")
     ap.add_argument("--max-turns", type=int, default=40)
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run trials whose agent crashed; a clean pass is never re-rolled")
@@ -466,7 +585,7 @@ def main() -> None:
     with ThreadPoolExecutor(args.workers) as pool:
         futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
                                args.max_turns, args.retry_failed, inputs_of,
-                               None, args.samples, args.climb) for row in rows]
+                               None, args.samples, args.climb, args.agent) for row in rows]
         for f in as_completed(futures):
             done += 1
             for r in f.result():

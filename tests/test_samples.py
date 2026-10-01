@@ -45,7 +45,7 @@ def fake_once(ran: list, rewards: list[float] | None = None):
     rewards = list(rewards or [])
 
     def once(row, prompt, work, venv, model, max_turns, retry_failed=False, inputs_of=None,
-             rung_label="run", provenance=None, was_run=None):
+             rung_label="run", provenance=None, was_run=None, agent="tools"):
         if was_run is not None:
             was_run.clear()
         work = Path(work)
