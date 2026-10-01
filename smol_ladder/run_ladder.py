@@ -3,16 +3,25 @@
 The solver runs in our process and executes the agent's shell commands in a bubblewrap jail
 holding only the task's tables, so a trial costs no container and no per-trial install.
 
-Pass-rate curve by rung is the headline; "lowest rung that passes" is derived from it. Climbing
-stops at the first pass, so a task that passes at L1 costs one trial, not four.
+Pass-rate curve by rung is the headline; "lowest rung that passes" is derived from it.
+
+One sample per (task, rung) cannot support that derivation. Four independent L1 runs on the same
+244 test tasks disagreed on 18.9% of them, so a task recorded as an L1 pass at k=1 may have been
+about to be an L1 failure, and climbing stops the very first time one happens. `--samples K` runs
+K independent trials per (task, rung) under `<task>/<rung>/s<k>/`; the existing unsuffixed layout
+is sample 0 and is read in place, never moved. `--no-climb` runs every requested rung on every
+task, which is what gives each rung the same denominator.
 
     uv run python -m smol_ladder.run_ladder --split test --rungs L1 --workers 20
     uv run python -m smol_ladder.run_ladder --split test --workers 20
+    uv run python -m smol_ladder.run_ladder --split test --samples 3 --no-climb --workers 20
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import json
 import os
 import shutil
@@ -20,6 +29,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 from smol_ladder.grade import grade
@@ -31,6 +41,38 @@ JAIL_RO = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"]
 # is generous for that; the old 45-minute cap let one stuck trial hold a worker for three
 # quarters of an hour, and with sixteen workers the sweep crawled.
 AGENT_TIMEOUT = 1200
+
+
+@functools.lru_cache(maxsize=1)
+def git_provenance() -> dict:
+    """The commit of the code doing the running, and whether it can even be asked.
+
+    Recorded on every result so a number can be traced to the code that produced it. A dirty tree
+    is flagged rather than hidden: `git rev-parse HEAD` reports the commit, not the edits on top
+    of it, so a results tree written from a modified checkout is otherwise indistinguishable from
+    a clean one. Memoised because a `git` subprocess per trial over a few hundred tasks is a
+    storm, and a sweep's code cannot change under itself.
+    """
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+                              capture_output=True, text=True, timeout=30)
+        commit = proc.stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=Path(__file__).parent,
+                                    capture_output=True, text=True,
+                                    timeout=30).stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        commit, dirty = "", False
+    return {"git_commit": commit or "unknown", "git_dirty": dirty}
+
+
+def prompt_sha256(prompt: str) -> str:
+    """A hash of the exact prompt text, so two ladder versions' results cannot be pooled blind.
+
+    The text is saved next to the result as prompt.txt, which is what makes the hash checkable
+    instead of a claim. Anything that changes the prompt -- a reworded header, a schema dump that
+    got wider -- changes this, and the summariser then refuses to average across the two.
+    """
+    return hashlib.sha256(prompt.encode()).hexdigest()
 
 
 def source_for(split: str):
@@ -170,18 +212,35 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
-         retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run") -> dict:
+         retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run",
+         provenance: dict | None = None, was_run: list | None = None) -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
     asked, so a rerun does not quietly re-roll a genuinely failed task.
+
+    A cached result from before this carried no provenance, so it is returned untouched: stamping
+    today's git commit onto a result some older code produced would be a lie, and summarize.py
+    treats a missing prompt hash as "unknown ladder version" rather than as agreement.
+
+    `was_run` is a one-element list the caller may pass to learn whether this trial actually ran
+    or was reused. It is a list rather than a return flag because the returned dict is the result
+    record, and a key like `_fresh` in it would be read by the summariser and written into the
+    summary JSON as if it were part of the measurement.
     """
+    if was_run is not None:
+        was_run.clear()
     cached = work / "result.json"
     if cached.exists():
         prior = json.loads(cached.read_text())
         if prior.get("agent_status") == "exit 0" or not retry_failed:
             return prior
+    if was_run is not None:
+        was_run.append(True)
     work.mkdir(parents=True, exist_ok=True)
+    # The prompt, verbatim, next to the result. The hash alone cannot be checked against anything;
+    # this can, and it is the only thing that distinguishes two ladder versions on disk.
+    (work / "prompt.txt").write_text(prompt)
     inputs = inputs_of(row)  # fetched here, not inside the jail: kagglehub needs $HOME
     # The trial directory keeps a pointer to the tables, and only that: it is provenance on
     # disk (a later re-run of a rung, a human reading a failure) and costs one symlink.
@@ -251,6 +310,13 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     shutil.rmtree(trial_scratch, ignore_errors=True)
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
               "agent_seconds": round(time.time() - t0, 1), "prediction": "", "reward": 0.0}
+    result.update(git_provenance())
+    result["prompt_sha256"] = prompt_sha256(prompt)
+    result["timestamp"] = datetime.now(timezone.utc).isoformat()
+    # rung and sample default to what the caller passed anyway: gen_refs drives once() directly
+    # with a rung label and no sample axis, and a reference has rung "reference", sample 0.
+    result["rung"] = (provenance or {}).get("rung", rung_label)
+    result["sample"] = (provenance or {}).get("sample", 0)
     solution = work / "solution.py"
     if solution.exists():
         # Grade the agent's own last printed line from a clean run, like the Harbor verifier.
@@ -295,13 +361,30 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     return result
 
 
+def sample_dir(rung_dir: Path, k: int) -> Path:
+    """Where sample k of a rung lives. Sample 0 is the rung directory itself.
+
+    Keeping the first sample where every existing result already is means no result has to be
+    moved: a tree of <task>/<rung>/result.json is read as-is as k=1, and --samples K adds
+    <task>/<rung>/s1 .. s(K-1) beside it.
+    """
+    return rung_dir if k == 0 else rung_dir / f"s{k}"
+
+
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
-                runs_root: Path | None = None) -> list[dict]:
-    """Climb the ladder for one task: stop at the first rung that passes.
+                runs_root: Path | None = None, samples: int = 1,
+                climb: bool = True) -> list[dict]:
+    """Run the ladder for one task: `samples` trials per rung, optionally climbing.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
     the "L1+schema" control, since "+" would need quoting in a comma-separated list.
+
+    Climbing stops after a rung that passed on any of its samples. That is the old behaviour and
+    it stays the default so a resumed sweep does not silently start running rungs it never
+    intended to; `--no-climb` is what makes the per-rung denominators equal. A rung's samples are
+    always all run before the climb decision is taken, so `--samples 4` is 4 real observations of
+    the rung rather than 1 and 3 for whatever split the coin-flip landed on.
     """
     out = []
     root = runs_root or (DATA / "runs" / split)
@@ -317,17 +400,34 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
         # trial to learn it again. The article's own table calls this case "Nothing new".
         needs_reference = prompt_rung in {"L2", "L3", "L4"} and not have_source
         if needs_reference:
-            out.append({"task_id": row["task_id"], "rung": prompt_rung, "reward": 0.0,
-                        "skipped": "no verified reference"})
+            # One skipped record per sample, so the sample count of the summary still lines up
+            # with the rung's budget: a rung with no reference was not attempted K times.
+            out.extend({"task_id": row["task_id"], "rung": prompt_rung, "reward": 0.0,
+                        "sample": k, "skipped": "no verified reference"} for k in range(samples))
             continue
-        work = root / row["task_id"] / rung.replace("+", "_")
-        work.mkdir(parents=True, exist_ok=True)
-        r = once(row, prompt_for(row, split, prompt_rung), work, venv, model, max_turns,
-                 retry_failed, inputs_of, rung)
-        r["rung"] = prompt_rung
-        (work / "result.json").write_text(json.dumps(r, indent=1))
-        out.append(r)
-        if r["reward"] >= 1.0:
+        prompt = prompt_for(row, split, prompt_rung)
+        rung_dir = root / row["task_id"] / rung.replace("+", "_")
+        passed = False
+        for k in range(samples):
+            work = sample_dir(rung_dir, k)
+            work.mkdir(parents=True, exist_ok=True)
+            # The scratch label carries the sample so two samples of one rung, which run
+            # concurrently, never share a $HOME -- once() rmtree's it on entry.
+            label = rung if k == 0 else f"{rung}s{k}"
+            ran: list = []
+            r = once(row, prompt, work, venv, model, max_turns,
+                     retry_failed, inputs_of, label, {"rung": prompt_rung, "sample": k}, ran)
+            # Write only what once() actually produced. A reused result is already on disk with
+            # whatever provenance it was written with, and rewriting it here would stamp this
+            # run's rung, sample index and git commit onto a trial some earlier code ran -- and
+            # would modify results in the shared data tree just by resuming a sweep over them.
+            if ran:
+                r["rung"] = prompt_rung
+                r["sample"] = k
+                (work / "result.json").write_text(json.dumps(r, indent=1))
+            out.append(r)
+            passed |= r["reward"] >= 1.0
+        if climb and passed:
             break
     return out
 
@@ -343,24 +443,40 @@ def main() -> None:
     ap.add_argument("--max-turns", type=int, default=40)
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run trials whose agent crashed; a clean pass is never re-rolled")
+    ap.add_argument("--samples", type=int, default=1,
+                    help="independent trials per (task, rung); sample 0 is the existing "
+                         "<task>/<rung>/result.json, sample k lands in <task>/<rung>/s<k>/")
+    ap.add_argument("--no-climb", dest="climb", action="store_false",
+                    help="run every requested rung on every task, so each rung's pass rate has "
+                         "the same denominator. Rungs that need a reference are still skipped "
+                         "for tasks without one.")
+    ap.set_defaults(climb=True)
     args = ap.parse_args()
+    if args.samples < 1:
+        ap.error("--samples must be at least 1")
 
     rows, inputs_of = source_for(args.split)
     rows = rows[: args.limit]
     rungs = args.rungs.split(",")
     venv = Path(sys.prefix)
     (DATA / "runs" / args.split).mkdir(parents=True, exist_ok=True)
+    print(f"{len(rows)} tasks x {len(rungs)} rungs x {args.samples} samples"
+          f"{'' if args.climb else ', no climb'}; code {git_provenance()['git_commit'][:8]}")
     done = 0
     with ThreadPoolExecutor(args.workers) as pool:
         futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
-                               args.max_turns, args.retry_failed, inputs_of) for row in rows]
+                               args.max_turns, args.retry_failed, inputs_of,
+                               None, args.samples, args.climb) for row in rows]
         for f in as_completed(futures):
             done += 1
             for r in f.result():
+                if r.get("skipped"):
+                    continue
                 print(f"[{done}/{len(rows)}] {r['task_id']} {r['rung']} "
+                      f"s{r.get('sample', 0)} "
                       f"reward={r['reward']} pred={r.get('prediction','')[:40]!r} "
                       f"{r.get('agent_status','')}", flush=True)
-    print(f"done: {done} tasks x {len(rungs)} rungs")
+    print(f"done: {done} tasks x {len(rungs)} rungs x {args.samples} samples")
 
 
 if __name__ == "__main__":

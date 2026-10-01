@@ -22,14 +22,27 @@ from smol_ladder.tasks import DATA
 
 
 def failed_task_ids(split: str) -> list[str]:
-    """Task ids whose L1 trial did not pass. The id is the grandparent: <task>/<rung>/result."""
-    out = []
-    for path in (DATA / "runs" / split).glob("*/*/result.json"):
-        if path.parent.name != "L1":
+    """Task ids that no L1 sample passed. A task needs a reference only if it is unsolved.
+
+    The glob has to reach s<k>/ as well as the bare rung directory: with --samples K the extra
+    trials live one level deeper, and a pattern that stopped at */L1/result.json would see only
+    sample 0. Worse, the old "reward < 1" test would then file a task that failed sample 0 and
+    passed on a rerun as a failure, which is the same coin-flip bucket A7 is about. A task that
+    passed any sample has been solved at least once and does not need a reference built for it.
+    """
+    passed_anywhere: set[str] = set()
+    failed_somewhere: set[str] = set()
+    for path in (DATA / "runs" / split).glob("*/*/**/result.json"):
+        parts = path.parent.relative_to(DATA / "runs" / split).parts
+        task, directory = parts[0], parts[1]
+        if directory != "L1":
             continue
-        if json.loads(path.read_text())["reward"] < 1.0:
-            out.append(path.parent.parent.name)
-    return out
+        result = json.loads(path.read_text())
+        if result.get("agent_status") != "exit 0":
+            continue      # a crash is not evidence the task needs a reference
+        (passed_anywhere if result.get("reward", 0.0) >= 1.0
+         else failed_somewhere).add(task)
+    return sorted(failed_somewhere - passed_anywhere)
 
 
 def main() -> None:

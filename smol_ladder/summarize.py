@@ -1,20 +1,28 @@
-"""Summarise ladder runs: a partition of tasks by first passing rung, plus per-rung counts.
+"""Summarise ladder runs: mean pass probability per rung, the buckets it implies, and monotonicity.
 
-Three tables, and they are kept apart on purpose.
+Four independent L1 runs on the same 244 test tasks disagreed on 18.9% of them, so a single
+result per (task, rung) cannot say which rung a task first passes at, and stopping at the first
+pass makes the per-rung numbers a partition with a composition-dependent denominator. With K
+samples per (task, rung) the report is built on the per-task pass fraction instead, which is
+monotone in the underlying pass probability and well defined at any K.
 
-1. `first_passing_rung` — one bucket per task, over the ladder rungs only. It is a partition:
-   every task lands in exactly one bucket and the buckets sum to the task count. The L1+schema
-   control is excluded from it. The control is not a rung; it adds no information, only
-   cheaper reading, so booking a rescue there would double-count a task that the ladder also
-   books. It is reported on its own, in (2).
-2. `control` — the L1+schema trials: attempted and rescued, split by whether the task has a
-   reference, because the control runs on L1 failures whether or not they can be climbed.
-3. `rungs` — attempted, passed, and harness failures (`agent_status != "exit 0"`) per rung,
-   over the tasks actually run at that rung.
+Five tables, and they are kept apart on purpose.
 
-The partition also separates three states that used to collapse into one: a task that passed at
-no rung, a task with no reference and therefore nothing above L1 to try, and a task no rung was
-ever run on at all. "Tried and failed" and "never tried" are different findings.
+1. `rungs` — per rung: the mean of the per-task pass fractions over the tasks scored at that
+   rung, with a bootstrap 95% CI, plus the raw counts. The mean is over tasks, never over trials,
+   or a task that happened to get 4 samples would outweigh one that got 1.
+2. `monotonicity` — for each adjacent pair, the tasks that pass at k and fail at k+1. A drop is
+   the finding the ladder exists to detect, so it gets an exact paired sign test rather than
+   being averaged into the curve.
+3. `first_passing_rung` — the old bucket table, still a partition, now computed from the MAJORITY
+   pass of a task's samples. `marginality` says how close each task was to the line, because a
+   bucket whose membership is decided by a coin flip is exactly the bucket A7 warns about.
+4. `control` — the L1+schema trials, on their own: it adds no information, so it is not a rung.
+5. `harness_failures` — trials where the harness did not get a clean run, counted and kept out
+   of every pass rate. A crash is not a model failure.
+
+Results whose prompt hashes differ inside one rung are refused rather than pooled, because they
+are measurements of different ladders. `--allow-mixed` overrides, and records what it pooled.
 
     uv run python -m smol_ladder.summarize --split test
 """
@@ -23,8 +31,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
+
+import numpy as np
 
 from smol_ladder.ladder import read_source
 from smol_ladder.run_ladder import source_for
@@ -39,16 +50,51 @@ DIRS = {rung: rung.replace("+", "_") for rung in ALL}
 
 # Every bucket `first_passing_rung` can hold, so the key set is fixed and a reader never has to
 # guess whether a zero bucket is missing or empty.
-BUCKETS = RUNGS + ["never", "not climbable (no reference)", "not attempted"]
+BUCKETS = RUNGS + ["never", "not climbable (no reference)", "not scored (every trial was a "
+                   "harness failure)", "not attempted"]
+
+# Adjacent pairs the monotonicity test runs on. The control is excluded: it is not on the
+# information axis, so "monotonic in rung" says nothing about it.
+PAIRS = [(RUNGS[i], RUNGS[i + 1]) for i in range(len(RUNGS) - 1)]
+
+BOOTSTRAP_DRAWS = 10_000
+BOOTSTRAP_SEED = 20260101
 
 
-def collect(split: str) -> dict[str, dict[str, dict]]:
-    """task_id -> rung -> result, read off disk."""
-    out: dict[str, dict[str, dict]] = {}
-    by_dir = {v: k for k, v in DIRS.items()}
-    for path in (DATA / "runs" / split).glob("*/*/result.json"):
-        rung = by_dir.get(path.parent.name, path.parent.name)
-        out.setdefault(path.parent.parent.name, {})[rung] = json.loads(path.read_text())
+class MixedPrompts(ValueError):
+    """Results in one rung that were produced by different prompts."""
+
+
+def rung_name(directory: str) -> str:
+    """`L1_schema` -> `L1+schema`; anything else is the rung name verbatim."""
+    for rung, name in DIRS.items():
+        if name == directory:
+            return rung
+    return directory
+
+
+def collect(split: str) -> dict[str, dict[str, list[dict]]]:
+    """task_id -> rung -> [result, ...], one entry per sample, sample 0 first.
+
+    The unsuffixed <task>/<rung>/result.json is sample 0 and <task>/<rung>/s<k>/result.json is
+    sample k, so a tree written before --samples existed reads as k=1 with no migration.
+    """
+    out: dict[str, dict[str, list[dict]]] = {}
+    for path in (DATA / "runs" / split).glob("*/*/**/result.json"):
+        parts = path.parent.relative_to(DATA / "runs" / split).parts
+        task, directory = parts[0], parts[1]
+        result = json.loads(path.read_text())
+        # The recorded index wins over the directory name; the name is only the fallback for
+        # results written before there was an index to record.
+        match = re.fullmatch(r"s(\d+)", parts[2]) if len(parts) > 2 else None
+        index = result.get("sample")
+        if not isinstance(index, int):
+            index = int(match.group(1)) if match else 0
+        result["_index"] = index
+        out.setdefault(task, {}).setdefault(rung_name(directory), []).append(result)
+    for rungs in out.values():
+        for trials in rungs.values():
+            trials.sort(key=lambda r: r["_index"])
     return out
 
 
@@ -61,29 +107,192 @@ def _finished(result: dict | None) -> bool:
     return bool(result) and result.get("agent_status") == "exit 0"
 
 
-def first_passing_rung(rungs: dict[str, dict], has_reference: bool) -> str:
-    """The one bucket this task belongs to, out of BUCKETS.
+def _scored(trials: list[dict]) -> list[dict]:
+    """Only trials the harness ran cleanly. A timeout is not evidence the model cannot solve it."""
+    return [t for t in trials if _finished(t)]
+
+
+def pass_fraction(trials: list[dict]) -> float | None:
+    """This task's pass rate at this rung, over its scored samples. None if none were scored."""
+    scored = _scored(trials)
+    if not scored:
+        return None
+    return sum(_passed(t) for t in scored) / len(scored)
+
+
+def check_prompts(runs: dict[str, dict[str, list[dict]]], allow_mixed: bool = False) -> dict:
+    """Refuse to average two ladder versions into one number. Returns what was mixed, if allowed.
+
+    A result with no recorded hash is not treated as matching a hashed one. Its prompt is
+    unknown, not known-equal, and pooling it with a hashed result would silently average two
+    different ladders -- the exact failure the hash exists to prevent.
+    """
+    mixed: dict[str, list[str]] = {}
+    by_rung: dict[str, set[str]] = {}
+    for rungs in runs.values():
+        for rung, trials in rungs.items():
+            # Collected across every task in the rung, not per task: one task's samples agreeing
+            # says nothing about whether the other 249 were run on the same prompt.
+            by_rung.setdefault(rung, set()).update(
+                t.get("prompt_sha256") or "<unrecorded>" for t in trials)
+    for rung, hashes in by_rung.items():
+        if len(hashes) <= 1:
+            continue
+        if not allow_mixed:
+            raise MixedPrompts(
+                f"rung {rung} holds results from {len(hashes)} different prompts "
+                f"({', '.join(sorted(h[:12] for h in hashes))}); these are different ladders "
+                f"and cannot be pooled. Re-run the rung, or pass --allow-mixed to pool them "
+                f"anyway and record it in the report.")
+        mixed[rung] = sorted(hashes)
+    return mixed
+
+
+def _bootstrap_ci(values: list[float], draws: int = BOOTSTRAP_DRAWS,
+                  seed: int = BOOTSTRAP_SEED) -> list[float]:
+    """Percentile bootstrap over tasks. Seeded, so two runs of the summary agree exactly.
+
+    Resampling tasks, not trials: the between-task spread is the dominant term (the audit put
+    the task-to-task sd at 0.394 against a rerun sd of similar size), and resampling trials
+    would ignore it and report an interval far too narrow.
+    """
+    if not values:
+        return [float("nan"), float("nan")]
+    if len(values) == 1:
+        # Every resample is the same task, so the bootstrap distribution is a point mass. The
+        # honest interval is the sampling error of one task, which bootstrap cannot estimate.
+        return [values[0], values[0]]
+    rng = np.random.default_rng(seed)
+    samples = rng.integers(0, len(values), size=(draws, len(values)))
+    means = np.asarray(values, dtype=float)[samples].mean(axis=1)
+    return [float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))]
+
+
+def rung_stats(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
+    """Per rung: mean pass probability over tasks, its bootstrap CI, and the raw counts."""
+    out: dict[str, dict] = {}
+    for rung in ALL:
+        fractions: list[float] = []
+        trials = scored = harness = 0
+        attempted = 0
+        for rungs in runs.values():
+            block = rungs.get(rung)
+            if block is None:
+                continue
+            attempted += 1
+            trials += len(block)
+            harness += sum(not _finished(t) for t in block)
+            scored += len(_scored(block))
+            fraction = pass_fraction(block)
+            if fraction is not None:
+                fractions.append(fraction)
+        mean = float(np.mean(fractions)) if fractions else float("nan")
+        out[rung] = {
+            # `tasks` is how many tasks were attempted here, and `scored_tasks` how many
+            # contributed a pass fraction. They differ when a task's every trial crashed: it was
+            # attempted, it contributes nothing, and dropping it from the denominator is what
+            # keeps a harness outage from reading as a pass-rate drop.
+            "tasks": attempted,
+            "scored_tasks": len(fractions),
+            "trials": trials,
+            "trials_scored": scored,
+            "harness_failures": harness,
+            "mean_pass_probability": mean,
+            "ci95": _bootstrap_ci(fractions),
+        }
+    return out
+
+
+def pass_fractions(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict[str, float]]:
+    """rung -> task -> that task's pass fraction. The raw material behind the mean."""
+    out: dict[str, dict[str, float]] = {}
+    for rung in ALL:
+        per_task = {}
+        for task, rungs in runs.items():
+            fraction = pass_fraction(rungs[rung]) if rung in rungs else None
+            if fraction is not None:
+                per_task[task] = fraction
+        out[rung] = per_task
+    return out
+
+
+def _sign_test(down: int, up: int) -> float | None:
+    """Two-sided exact sign test on the discordant pairs. None when there are none.
+
+    Zero discordant pairs is perfect agreement, which is not evidence about ordering, and the
+    test is undefined there: reporting p=1.0 would read as a measurement.
+    """
+    n = down + up
+    if n == 0:
+        return None
+    from scipy import stats
+    return float(stats.binomtest(min(down, up), n, 0.5, alternative="two-sided").pvalue)
+
+
+def monotonicity(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
+    """Per adjacent rung pair, the tasks whose pass probability went DOWN, and an exact test.
+
+    Paired on tasks, so a task that was measured at one rung and not the other is excluded and
+    counted in `excluded_unpaired` rather than quietly inflating the denominator. That case is
+    the normal one under climbing, which is why the exclusion is reported.
+    """
+    out: dict[str, dict] = {}
+    for lower, upper in PAIRS:
+        violations = discordant = up = paired = 0
+        for rungs in runs.values():
+            low = pass_fraction(rungs[lower]) if lower in rungs else None
+            high = pass_fraction(rungs[upper]) if upper in rungs else None
+            if low is None or high is None:
+                continue
+            paired += 1
+            if high < low:
+                violations += 1
+                discordant += 1
+            elif high > low:
+                up += 1
+        out[f"{lower}->{upper}"] = {
+            "paired": paired,
+            "violations": violations,
+            "improved": up,
+            "discordant": discordant,
+            "excluded_unpaired": len(runs) - paired,
+            "p_value": _sign_test(violations, up),
+        }
+    return out
+
+
+def first_passing_rung(rungs: dict[str, list[dict]], has_reference: bool) -> str:
+    """The one bucket this task belongs to, out of BUCKETS, decided by the MAJORITY of its
+    samples. A tie is not a pass: at k=1 every task ties, and letting ties fall upward is the
+    coin-flip bucket that four reruns disagreed on 18.9% of the time.
 
     The control cannot appear here. A task that the control rescued is booked by the rung that
-    passed it, if any, and by `never` if no rung did — which is the honest reading, because the
-    control result says nothing about the ladder rungs.
+    passed it, if any, and by `never` if no rung did -- the honest reading, because the control
+    result says nothing about the ladder rungs.
     """
     if "L1" not in rungs:
         return "not attempted"
-    if _passed(rungs["L1"]):
+    fraction = pass_fraction(rungs["L1"])
+    if fraction is None:
+        # Every L1 trial crashed. The task was attempted and nothing was learned, which is not
+        # the same as never having been run: booking it as "not attempted" would understate the
+        # sweep's coverage, and booking it "never" would blame the model for a harness failure.
+        return "not scored (every trial was a harness failure)"
+    if fraction > 0.5:
         return "L1"
     if not has_reference:
         # Nothing above L1 was ever built for this task, so it cannot have passed one. It is
         # not a ladder failure; it is outside the ladder.
         return "not climbable (no reference)"
     for rung in CLIMBABLE:
-        if _passed(rungs.get(rung)):
+        fraction = pass_fraction(rungs[rung]) if rung in rungs else None
+        if fraction is not None and fraction > 0.5:
             return rung
     return "never"
 
 
-def partition(runs: dict[str, dict[str, dict]],
-             has_reference: Callable[[str], bool]) -> dict[str, int]:
+def partition(runs: dict[str, dict[str, list[dict]]],
+              has_reference: Callable[[str], bool]) -> dict[str, int]:
     """task -> exactly one bucket. Sums to len(runs) by construction, one task per iteration."""
     hist = dict.fromkeys(BUCKETS, 0)
     for task, rungs in runs.items():
@@ -91,57 +300,72 @@ def partition(runs: dict[str, dict[str, dict]],
     return hist
 
 
-def control_block(runs: dict[str, dict[str, dict]],
+def marginality(runs: dict[str, dict[str, list[dict]]]) -> dict[str, float]:
+    """How far each task's L1 pass fraction is from the majority line at 0.5.
+
+    A bucket decided at 0.25 is a different kind of claim from one decided at 1.0, and the
+    bucket counts alone cannot tell a reader which tasks those are. This is the number A7's
+    18.9% was about, measured on the current run rather than reconstructed from logs.
+
+    Reported as the distance from 0.5, so 0.5 is the *least* decisive task: exactly the coin
+    flip that four reruns disagreed on. A task at 1.0 scores 0.5, the most decisive.
+    """
+    out = {}
+    for task, rungs in runs.items():
+        fraction = pass_fraction(rungs["L1"]) if "L1" in rungs else None
+        if fraction is not None:
+            out[task] = abs(fraction - 0.5)
+    return out
+
+
+def control_block(runs: dict[str, dict[str, list[dict]]],
                   has_reference: Callable[[str], bool]) -> dict:
     """The L1+schema trials, on the tasks they were actually run on, split by reference status.
 
     Split by reference because the control is gated on nothing: it runs on every L1 failure, so
     most of its rescues are on tasks the ladder never climbs, and a single blended rate hides
-    that.
+    that. Reported on the tasks' own sample counts, so a control sampled 4 times is not counted
+    as 4 separate tasks.
     """
     block: dict = {"attempted": 0, "rescued": 0,
                    "with reference": {"attempted": 0, "rescued": 0},
                    "without reference": {"attempted": 0, "rescued": 0}}
-    harness = 0
+    harness = trials = 0
     for task, rungs in runs.items():
-        result = rungs.get(CONTROL)
-        if result is None:
+        results = rungs.get(CONTROL)
+        if not results:
             continue
         group = "with reference" if has_reference(task) else "without reference"
         block["attempted"] += 1
         block[group]["attempted"] += 1
-        harness += not _finished(result)
-        if _passed(result):
+        trials += len(results)
+        harness += sum(not _finished(r) for r in results)
+        # A task whose every control trial crashed still counts as attempted: it was run, and
+        # dropping it would make a harness outage look like the control was never tried.
+        fraction = pass_fraction(results)
+        if fraction is not None and fraction > 0.5:
             block["rescued"] += 1
             block[group]["rescued"] += 1
+    block["trials"] = trials
     block["harness_failures"] = harness
     return block
 
 
-def rung_counts(runs: dict[str, dict[str, dict]]) -> dict[str, dict]:
-    """Attempted, passed and harness failures per rung, over the tasks run at that rung."""
-    out: dict[str, dict] = {}
-    for rung in ALL:
-        seen = [r[rung] for r in runs.values() if rung in r]
-        out[rung] = {
-            "attempted": len(seen),
-            "passed": sum(_passed(r) for r in seen),
-            "harness_failures": sum(not _finished(r) for r in seen),
-        }
-    return out
-
-
-def summarise(split: str, runs: dict[str, dict[str, dict]],
-              has_reference: Callable[[str], bool]) -> dict:
-    """The whole report, as a dict. `summarize` asserts nothing; this asserts the partition."""
+def summarise(split: str, runs: dict[str, dict[str, list[dict]]],
+              has_reference: Callable[[str], bool], allow_mixed: bool = False) -> dict:
+    """The whole report, as a dict. `summarise` asserts nothing; this asserts the partition."""
+    mixed = check_prompts(runs, allow_mixed)
     hist = partition(runs, has_reference)
     assert sum(hist.values()) == len(runs), (hist, len(runs))
     return {
         "split": split,
         "tasks": len(runs),
+        "mixed_prompts": mixed,
+        "rungs": rung_stats(runs),
+        "monotonicity": monotonicity(runs),
         "first_passing_rung": hist,
         "control": control_block(runs, has_reference),
-        "rungs": rung_counts(runs),
+        "marginality": marginality(runs),
     }
 
 
@@ -151,15 +375,50 @@ def _rows_for(split: str) -> tuple[list[dict], Callable[[str], bool]]:
     return rows, lambda task: task in by_id and read_source(by_id[task], split) is not None
 
 
+def _pct(value: float) -> str:
+    return "   n/a" if value != value else f"{value:>6.1%}"
+
+
 def _print(report: dict) -> None:
     print(f"split={report['split']}  tasks={report['tasks']}")
+    if report["mixed_prompts"]:
+        print(f"  WARNING pooled mixed prompts: "
+              f"{ {k: [h[:12] for h in v] for k, v in report['mixed_prompts'].items()} }")
+
     print()
-    print("first passing rung (mutually exclusive, control excluded, sums to tasks)")
+    print("mean pass probability per rung, over tasks scored there (bootstrap 95% CI)")
+    for rung in ALL:
+        block = report["rungs"][rung]
+        if not block["tasks"]:
+            print(f"  {rung:<10} not run")
+            continue
+        low, high = block["ci95"]
+        print(f"  {rung:<10} {_pct(block['mean_pass_probability'])}"
+              f"  [{_pct(low)}, {_pct(high)}]  "
+              f"{block['trials_scored']}/{block['trials']} trials scored, "
+              f"{block['tasks']} tasks, {block['harness_failures']} harness failures")
+
+    print()
+    print("monotonicity: tasks whose pass probability fell as information was added")
+    for pair in report["monotonicity"].values():
+        p = "   n/a" if pair["p_value"] is None else f" p={pair['p_value']:.2g}"
+        print(f"  {pair['paired']:>4} paired, {pair['violations']:>3} fell, "
+              f"{pair['improved']:>3} rose, {pair['excluded_unpaired']:>3} unpaired{p}")
+
+    print()
+    print("first passing rung by majority pass (mutually exclusive, control excluded)")
     for key in BUCKETS:
         value = report["first_passing_rung"][key]
         if value:
             print(f"  {key:<30} {value:>4}")
     print(f"  {'sum':<30} {sum(report['first_passing_rung'].values()):>4}")
+
+    marginal = report["marginality"]
+    if marginal:
+        # marginality is |pass fraction - 0.5|, so small means undecided, not close.
+        undecided = sum(1 for v in marginal.values() if v < 0.25)
+        print(f"  {undecided} of {len(marginal)} tasks pass on a fraction within 0.25 of the "
+              f"majority line at L1, so their bucket is a coin flip")
 
     control = report["control"]
     print()
@@ -167,21 +426,10 @@ def _print(report: dict) -> None:
     for group in ("with reference", "without reference"):
         block = control[group]
         rate = block["rescued"] / block["attempted"] if block["attempted"] else float("nan")
-        print(f"  {group:<20} {block['rescued']:>3}/{block['attempted']:<3} = {rate:>5.1%}")
+        print(f"  {group:<20} {block['rescued']:>3}/{block['attempted']:<3} = {_pct(rate)}")
     rate = control["rescued"] / control["attempted"] if control["attempted"] else float("nan")
-    print(f"  {'all':<20} {control['rescued']:>3}/{control['attempted']:<3} = {rate:>5.1%}"
+    print(f"  {'all':<20} {control['rescued']:>3}/{control['attempted']:<3} = {_pct(rate)}"
           f"   (harness failures {control['harness_failures']})")
-
-    print()
-    print("per rung, over the tasks actually run at that rung")
-    for rung in ALL:
-        block = report["rungs"][rung]
-        if not block["attempted"]:
-            print(f"  {rung:<10} not run")
-            continue
-        print(f"  {rung:<10} {block['passed']:>3}/{block['attempted']:<3} = "
-              f"{block['passed']/block['attempted']:>5.1%}"
-              f"   (harness failures {block['harness_failures']})")
 
 
 def main() -> None:
@@ -189,6 +437,9 @@ def main() -> None:
     ap.add_argument("--split", default="test",
                     choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
     ap.add_argument("--out", type=Path, help="where to write the JSON report")
+    ap.add_argument("--allow-mixed", action="store_true",
+                    help="pool results in one rung that have different prompt hashes, and record "
+                         "in the report that they were pooled")
     args = ap.parse_args()
 
     rows, has_reference = _rows_for(args.split)
@@ -198,7 +449,10 @@ def main() -> None:
     print(f"split={args.split}  tasks in the source={total}  "
           f"with verified reference={n_ref} ({n_ref/total:.0%})")
 
-    report = summarise(args.split, runs, has_reference)
+    try:
+        report = summarise(args.split, runs, has_reference, args.allow_mixed)
+    except MixedPrompts as e:
+        raise SystemExit(f"refusing to pool results from different prompts: {e}")
     report["source_tasks"] = total
     report["with_reference"] = n_ref
     _print(report)
