@@ -16,12 +16,13 @@ hint generation and validation, the tagged jupyter-agent pools v1/v2/**v3** (`jt
 tasks, with the corrected `test`/`eval` bare-name overlap firewall), per-rung summarisation with a
 bootstrap CI, offline regrading, and `--run-tag`/`RUN.json` so a sweep records the code, command
 line, model, protocol, rungs, samples, climb setting and reference denominator at launch.
-289 tests pass (as of 2026-10-01).
+305 tests pass (as of 2026-10-01).
 
 **Measured, on `test` (250 tasks, `stealth/space-bunny-alpha`):** L1 187/250 = 74.8%; schema control
 23/63 = 36.5% on L1 failures; L2 167/181 = 92.3%; L3 8/14 = 57.1%; L4 6/6 = 100%. Reference funnel:
-181/250 (72%) have a verified reference. First-passing rung: L1 187, L2 17, L3 3, L4 3, and 40 tasks
-with no reference. **16 of the 23 information-rung rescues are also control rescues** (re-measured
+**213 of the 250 tasks have a verified reference, and 181 have a rung above L1 actually run** (the
+climb predates the last 32 references). First-passing rung: L1 187, L2 17, L3 3, L4 3, and 40 tasks
+with no rung above L1 run. **16 of the 23 information-rung rescues are also control rescues** (re-measured
 2026-10-01 off `data/runs/test`: 23 control rescues, 23 information-rung rescues, 16 in both, 7
 only each way), so on this split a hint rung and a no-information prompt overlap heavily but are
 far from interchangeable — a third of the hint's value survives the control, and a third of the
@@ -50,10 +51,20 @@ On disk as of 2026-10-01: 209 `test` hints (193 validated, 16 failed) and 60 `ev
 `test` figure above is the 181 that also have a ladder reference, which is the set L2/L3 are
 measured on.
 
-**Still broken or open.** The `synthetic` split's gold answers are wrong: `iter_tables` reads 50,000
-rows to compute the answer but the agent reads the untruncated file, so 58 of 275 tables over 50k
-rows are ungradeable by construction — the 87 "never" there is a grading artefact, not a result.
-jupyter-agent references are accumulating but still far short of the pool: 1,478 attempts recorded
+**Repaired on this branch.** The `synthetic` split's gold answers were wrong and are now fixed.
+`iter_tables` read 50,000 rows to compute the answer while the agent read the untruncated file, so
+any table over that size was ungradeable by construction (58 of the 275 old tables); separately,
+`.6g` printing against a 1e-6 tolerance rejected the task's own correct answer on tasks small
+enough that truncation could not explain them. Both are fixed at the root and enforced by a
+shipped-file gate that
+re-executes each task's reference against the file the agent is shipped. The corpus is **6,956
+tasks over 42 tables**, all gate-passing, of which **only 275 have any trial at all** — so the
+split has no measured curve, and regrading the stored 757 trials moves 287 of them (L3 1/65 → 61/65,
+L4 0/64 → 62/64). The old synthetic numbers were a measurement of a broken gold and are
+superseded; see `docs/LADDER.md` for the before/after table and the 87 owed rung-trials.
+
+**Still open.** jupyter-agent references are accumulating but still far short of the pool: 1,478
+attempts recorded
 on disk, 624 verified, as of 2026-10-01, against 7,518 ladder tasks in v3. 8/181 tasks pass at L1 and
 fail at L2, a real monotonicity violation. 18.9% of tasks flip across four identical L1 runs, so
 "first passing rung" is not identifiable at k=1. No inference stack is installed on this machine.
@@ -82,7 +93,7 @@ Every outcome is reportable. "Hints do not help RL" is a result, not a failure.
 | SmolDataEnvs `test` / `eval` | 250 / 144 | held out, never trained on | in-distribution eval | nothing; 69/250 `test` tasks have no usable reference, so L2–L4 are measurable on 181 only |
 | jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** | built and tagged; references being generated | RL tasks + reward; eval (L1 41.9%, twice the headroom) | verified references (624 as of 2026-10-01); 500 tasks across 144 uncached datasets need downloads |
 | Plain-language hints (L2/L3) | 167/181 `test` refs validate | written, validated, cached | RL curriculum; measurement | 14 fall back to the AST, and 9 of those are label-answers that *are* column names — unfixable; needs generating on jupyter-agent refs |
-| Synthetic tasks | 275 | **gold broken, repair outstanding** | RL tasks (unlimited supply) | the `nrows=50,000` truncation is still in `synthetic.py`: regenerate all gold and re-verify every spec against the shipped table before any trial |
+| Synthetic tasks | **6,956** | **gold repaired and gated; unmeasured** | RL tasks (unlimited supply) | the shipped-file gate now refuses any task whose reference does not grade 1.0 against the file the agent is shipped, and the id cache is committed so a regeneration cannot renumber the corpus. But only **275** of the 6,956 have ever been run, so there is no curve: run a full `--no-climb` grid over the corpus before quoting any synthetic number |
 
 The `jtasks_v3` ladder-grade subset (4,217 tasks) deliberately keeps the method-ambiguous families
 (`ml_fit`, `stat_test`, `groupby`, `lookup`, `join`) and does not tune towards `count`/`agg`, because
@@ -126,7 +137,10 @@ early anyway: it is the long pole for the ladder and it is what validates a task
 - [ ] 2. Converter: upstream `bash` traces and our traces → one tool format + chat template
 - [ ] 3. Reference solutions for the training split (`gen_refs` / `gen_solutions`), verified offline
 - [ ] 4. Plain-language L2/L3 hints for the training split (`gen_hints`), validated and cached
-- [ ] 5. Synthetic gold repair: drop the 50k truncation, regenerate, re-verify every spec
+- [x] 5. Synthetic gold repair: the 50k truncation and the print/tolerance bug are fixed, the
+      corpus is regenerated under the committed id cache, and every spec passes the shipped-file gate
+- [ ] 5b. Run the synthetic split: only 275 of 6,956 tasks have ever been run, so `--no-climb`
+      across the corpus before any synthetic number is quoted
 - [ ] 6. Our own verified SFT traces in the converted format
 - [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the step-1 model
 - [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises
@@ -175,7 +189,8 @@ Controls that still decide whether the numbers mean anything:
   written at launch. Cached results are never silently inherited across ladder versions.
 - **In-distribution first**: SmolDataEnvs `test` (250) and `eval` (144), with the reference funnel
   reported alongside every rung table — L2–L4 exist only where a verified reference was built
-  (181/250), so every rung number is conditional on that.
+  (213 have one, and 181 have a rung above L1 actually run), so every rung number is conditional
+  on that.
 - **The schema control** (L1+schema) is not a rung: it adds no information, so it isolates
   processing/skill gain. Run it on L1 failures.
 - **OOD later**: DABstep, after the in-distribution protocol is stable. No public gold code there,
@@ -218,7 +233,8 @@ notebook **Secrets**, never inline.
 3. Is the AMD credit still valid, and do we spend it on arm C or hold it?
 4. Do we hold the 74%-table-overlap contamination and report it, or partition the 471 Kaggle datasets
    for a clean held-out set (which shrinks `test`)?
-5. Synthetic: repair the gold and keep it as unlimited RL task supply, or drop the split?
+5. Synthetic: the gold is repaired and gated, so the split is kept as unlimited RL task supply —
+   but it has never been run beyond 275 of 6,956 tasks. Run it, or drop it?
 6. Do we do our own trace collection at all, or is arm B's question ("is our data better than
    SmolDataEnvs-sft?") answered by a smaller, higher-precision set built only from verified traces?
 
@@ -235,7 +251,7 @@ notebook **Secrets**, never inline.
 | Ladder hints leak the answer | already enforced (text, differential, run-and-grade oracle) and a hint that fails is regenerated or falls back |
 | Ladder hints are useless for RL | that is the measurement; arm D is designed to be able to return "no" |
 | Hint cost degrades the rung (L3 below L2) | already observed; report monotonicity violations as results, with k samples and no climb |
-| Training on broken gold | synthetic's 50k truncation is the known case; the rule is that a task's gold must be re-derivable from the table the agent sees |
+| Training on broken gold | both known cases (synthetic's 50k truncation and its `.6g`/1e-6 tolerance) are fixed and gated; the rule stands that a task's gold must be re-derivable from the table the agent sees |
 | fp16 instability on T4 | LoRA, lower LR, watch the first few hundred steps |
 | Ladder eval cost | no-climb grid only where needed; run L1 across all arms first, spend rungs second |
 

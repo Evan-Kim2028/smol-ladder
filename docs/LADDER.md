@@ -42,7 +42,8 @@ task, summing to 250:
 
 Reference funnel for this run, as the tool reports it: 250 tasks in the split, 213 with a reference
 in the source, and 181 that are actually measurable at L2–L4 — so every L2–L4 figure below is
-conditional on that 181. The 28 "not climbable" tasks had no reference, so they were never tested
+conditional on that 181. The 28 "not climbable" tasks never had a rung above L1 run on them (the
+climb stopped before the last 32 references existed), so they were never tested
 against an information rung; they are not a case of the model needing more information, and they
 are never booked as "never".
 
@@ -209,10 +210,11 @@ binomial test. A drop that survives at 2x the turn cap is about the *content* of
 (its style, its length, its leaks). A drop that disappears at 2x the cap is about the budget.
 Either way it is a finding, and the current numbers do not separate the two.
 
-## Two task sources
+## Task sources
 
-The ladder needs more tasks than SmolDataEnvs can supply: 250 in `test`, 181 with a reference,
-and — as above — a third of the L1 failures left after the control. So the second source is
+The ladder needs more tasks than SmolDataEnvs can supply: 250 in `test`, 213 with a reference
+and only 181 with a rung above L1 actually run, and — as above — a third of the L1 failures left
+after the control. The second source is
 **jupyter-agent** (51,389 rows). It does *not* share no dataset with SmolDataEnvs: that was the
 old claim and it was wrong in both directions, see "The overlap firewall was wrong" below. The pool
 is much noisier, and the work is in the filter:
@@ -326,6 +328,90 @@ download was attempted; sizes come from Kaggle's dataset-view metadata endpoint 
 dataset) and are cached in `data/jl_dataset_sizes.json`, because that endpoint rate-limits and a
 rebuild without the cache reports a *smaller* download cost each time more lookups 429.
 
+### Synthetic: gold by construction, and the gate it needed
+
+A third source removes the yield gate that limits the other two. We pick a table, instantiate a
+*specification* over it, and execute the specification to get the answer, so the gold is correct
+by construction and the population is not conditioned on the model. Each task records the ops it
+applied, and those ops are also the L2–L4 reference: the rung and the gold come from one
+implementation, so they cannot describe different computations.
+
+Two rules borrowed from the openswe pipeline, the only prior art here that took solvability
+seriously. **ARBITRARY vs DERIVABLE**: a task is only fair if a competent analyst holding the
+question would produce the graded answer; a question whose answer depends on a tie-break we chose
+is dropped rather than published. **Prove it three ways**: the answer must be computable, the
+question must not name the answer, and an independent execution of the spec must agree.
+
+The third proof is the shipped-file gate, and it is what this source had been missing. It
+re-executes each task's own reference against the shipped file, through the real grader, and
+refuses to emit a task that does not grade 1.0. Applying it found **two independent defects, and
+both of them made a task unpassable rather than merely hard**. The split between them — 38 of the
+64 failing L4 tasks to the truncation and 26 to the print/tolerance bug — is from the pre-fix
+sweep and cannot be recomputed from what is on disk now, since the 275-task old corpus has been
+replaced; what *is* on disk is the 757-trial regrade below, which is the number that matters:
+
+1. **The gold was computed over a different table than the one shipped.**
+   `iter_tables()` read each candidate table with `nrows=50_000` and wrote the *untruncated* file
+   into `data/inputs`, so on any table over that size the answer was computed over the first
+   50,000 rows while the agent summed all of them. That sweep found 58 of the 275 tables over the
+   cap. Concretely, `syn_runs_2_sum` asks for `sum(horse_no)` on `runs.csv` (79,447 rows):
+   the gold was 345296, the sum over the shipped file is 548631, and the model's 548631 was
+   marked wrong.
+2. **The gold was printed lossily against a tolerance too tight to survive it.** `_fmt` rendered
+   every float as `.6g`, and `_tolerance` read off the *shape* of that string and handed a float
+   a 1e-6 relative tolerance. For an answer of more than about seven digits the two are
+   inconsistent: the printed gold differs from the true value by more than 1e-6 relative, so the
+   grader rejects **the task's own correct answer**. `syn_Crime1_2_sum` asks for `sum(Y)` over
+   835 rows; the gold was `31535.6`, the sum is `31535.63530029`, and 3.5e-5 relative error
+   against a 1e-6 tolerance is 0.0. None of these tasks is on a table large enough for the
+   truncation to apply — `syn_ca_offenses_by_campus_0_mean` has 54 rows and its gold `10.9388`
+   likewise excludes the true `10.938775510204081`.
+
+The fix is at the root in both cases: read the shipped file with no row cap, print the answer
+exactly with `repr`, and derive the tolerance from the printed string rather than from the op, so
+the grader accepts the gold as its own prediction. `verify_shipped()` then enforces it end to
+end, and `tests/test_synthetic.py` covers each cause individually.
+
+Regrading the stored trials against the corrected gold (`python -m smol_lader.regrade_gold
+--split synthetic`, which reads `result.json` and never writes it) is what exposed the scale.
+Re-measured 2026-10-01, quoting the tool:
+
+| rung | trials | pass, old gold | pass, corrected gold | flipped |
+|---|---|---|---|---|
+| L1 | 275 | 179 | 213 | 44 |
+| L1+schema | 275 | 197 | 242 | 57 |
+| L2 | 78 | 13 | 73 | 62 |
+| L3 | 65 | 1 | 61 | 62 |
+| L4 | 64 | 0 | 62 | 62 |
+
+287 of the 757 stored trials moved. The old L3 and L4 curve — 1/65 and 0/64, read at the time as
+a strong model result on the hardest rung — is 61/65 and 62/64, so **that result was an artifact
+of the gold, not a measurement of the model.** The old rewards are kept on disk unchanged; the
+regrade writes a separate `data/runs/regrade_gold_post-goldfix.jsonl` carrying `reward` beside
+`reward_old` and the gold each row was graded against, so the before/after table above compares two
+golds and not two differently-populated samples.
+
+A correction to what was said here before that regrade was run on the shipped corpus. It was
+written that the tool grades "the 136 trials whose id the corrected corpus dropped" against the
+superseded gold, which was the case it was built for. On this corpus it does not: the committed id
+cache carried **all 275** published ids forward, so every stored trial has a corrected gold and all
+757 rows are graded against it (`gold_source` is `corrected` on every row). The superseded-gold
+branch is still there and still correct, because a corpus regenerated without
+`smol_ladder/synthetic_ids.jsonl` would drop those ids — but that has not happened yet.
+
+That regrade also says what the run can no longer answer. The climb stops at the first pass, so a
+task whose pass the corrected gold reverses was sent up rungs it should never have reached, and a
+task that now passes earlier never saw the ones in between. **87 rung-trials across 78 tasks were
+never run and are owed** (28 at L2, 29 at L3, 30 at L4); no regrade can recover a prediction that
+was never produced. The `synthetic` split's own numbers are therefore a measurement of a broken
+gold and are superseded by the table above, which is a measurement of a corrected one.
+
+The only `synthetic` figure quoted as a result of the source itself is the corpus it produces:
+**6,956 tasks over 42 tables**, every one of which passed the shipped-file gate. That corpus is
+almost entirely unmeasured — the stored `data/runs/synthetic` tree holds 275 tasks, so **6,681 of
+the 6,956 have no trial at all** — and the rung table above is a regrade of one 275-task run, not
+a curve over the corpus.
+
 ## Construction rules
 
 1. **Cumulative.** Lk = L(k-1) + a new block. Nothing is reworded or dropped. This is what makes
@@ -366,26 +452,30 @@ rebuild without the cache reports a *smaller* download cost each time more looku
 
 ## The funnel is a result, not a footnote
 
-L2–L4 exist only where a strong agent produced a solution that reproduced the gold answer. On
-`test` that is 181/250 = 72%. **Every rung number we report is conditional on that**, so the
-funnel is reported first and repeated in every caption:
+L2–L4 exist only where a strong agent produced a solution that reproduced the gold answer. The
+reference count moved and that is a fact about disk today, not a correction: the summarise tool
+reports **213/250 = 85%** with a verified reference, because the reference sweep was re-run after
+the numbers audit was written, and 181 of those are the tasks whose trials exist. **Every rung
+number we report is conditional on that**, so the funnel is reported first and repeated in every
+caption:
 
 | Stage | test | What it means |
 |---|---|---|
 | tasks in split | 250 | |
 | reference present in the source | 213 | as of 2026-10-01, per the summarise tool |
-| verified reference exists | 181 (72%) | a strong agent could find *an* answer that the grader accepts |
-| L4 excluded by the run-and-grade oracle | 0 | the rung does not evaluate to gold on its own |
+| L2 trials actually on disk | 181 | the climb ran before the last 32 references existed, so 8 of the 63 L1 failures with a reference have no rung above L1 |
+| L4 excluded by the run-and-grade oracle | unverifiable | `data/ladder/` holds only `_leakcheck`; no per-rung prompts or `meta.json` survive for any split, so this row cannot be recomputed from disk |
 | usable ladder tasks | 181 | L2–L4 measurable; L1 and the control measured on all 250 |
 
 Two consequences, stated up front rather than buried:
 
 - The **69 tasks with no usable reference** (250 − 181; of which the legacy run books 28 as
   `not climbable` and 6 as `not scored`) are **not** "tasks where the model needs more information".
-  They are tasks where no reference could be built, and they get their own row in every table.
-  They are never counted as "never passes" on the ladder. An earlier version of this file said 47
-  here and 69 in the line below; the two were never reconciled, 69 is the one that matches
-  `read_source`, and the withdrawn figure is recorded in the audit.
+  They are tasks where no rung above L1 was ever run, and they get their own row in every table.
+  They are never counted as "never passes" on the ladder. Two earlier versions of this file gave
+  47 and 69 here and 47 for tasks with no reference at all; that earlier denominator is 37 today
+  (250 − 213) and the ladder-measurable one is 69, so the number the confusion was reaching for
+  never depended on which was quoted. Both are withdrawn in the audit.
 - "Verified" means *the grader accepted this answer*, not *this is the unique correct
   computation*. On tasks with a loose `rtol` a materially different method also grades 1.0. So
   L4 does not certify correctness; it certifies one accepted path. Construction rule 5 already

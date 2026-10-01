@@ -16,11 +16,16 @@ therefore answers two questions with two different answers:
   that would need a rung rerun are named explicitly instead.
 
 The gold a stored trial is graded against is whichever version that task's id carries, and both
-are recorded per row as `gold_source`. This is not bookkeeping: the corrected corpus drops ids
-the shipped-file gate refused, and every stored trial under a dropped id still has a prediction
-and a recorded reward. Grading those against nothing would silently remove half the results tree
-from the report — 136 of 275 synthetic trials — and the before/after table would then compare
-two differently-populated samples rather than two golds.
+are recorded per row as `gold_source`. This is not bookkeeping: a corpus whose ids the gate or the
+id cache did not carry forward still has stored trials under those ids, each with a prediction and
+a recorded reward, and grading them against nothing would silently remove them from the report — on
+the corpus this was written against that was 136 of 275 synthetic trials — so the before/after
+table would compare two differently-populated samples rather than two golds.
+
+On the corpus actually shipped it comes out the other way: `smol_ladder/synthetic_ids.jsonl`
+carried every one of the 275 published ids forward, so all 757 stored trials have a corrected gold
+and every row reports `gold_source: corrected`. The superseded branch is unexercised here and is
+kept because a regeneration that loses the id cache would hit it.
 
     uv run python -m smol_ladder.regrade_gold --split synthetic
 """

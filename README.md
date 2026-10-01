@@ -15,13 +15,14 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 
 | module | what it does |
 |---|---|
-| `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the tagged jupyter-agent pools and writes `data/jtasks_v2.jsonl`; `--out data/jtasks_v3.jsonl` writes the corrected pool, with the overlap firewall firing on SmolDataEnvs `test`/`eval` and matching the bare dataset name instead of the full `owner/name` slug. `--v1-compatible` restores the shipped rule. The rest are the v1 and SmolDataEnvs sources. `tasks.read_tables` is the one table reader the schema dump and the synthetic tables share, so the two cannot drift apart |
+| `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the tagged jupyter-agent pools and writes `data/jtasks_v2.jsonl`; `--out data/jtasks_v3.jsonl` writes the corrected pool, with the overlap firewall firing on SmolDataEnvs `test`/`eval` and matching the bare dataset name instead of the full `owner/name` slug. `--v1-compatible` restores the shipped rule. The rest are the v1 and SmolDataEnvs sources. `tasks.read_tables` is the one table reader the schema dump and the synthetic tables share, so the two cannot drift apart; `tasks.read_shipped` is the uncapped reader the synthetic gold is computed from, so no row cap can sit between a gold and the file the agent is shipped |
 | `ladder.py` | the rungs: prompts, the schema-dump control, and the hint blocks — a validated model hint when one is cached, the AST extraction otherwise |
 | `run_ladder.py` | the runner: one trial per (task, rung, sample), in a jail, graded offline |
 | `sandbox.py`, `or_agent.py`, `upstream.py` | the offline grading pass; the solver agent; the two upstream 2B protocols |
 | `grade.py` | the SmolDataEnvs grader |
 | `summarize.py` | per-rung pass rates with a bootstrap CI, and a first-passing-rung partition |
 | `regrade.py` | re-scores stored predictions strict and prefix-normalised, offline. Writes nothing |
+| `regrade_gold.py` | re-scores stored predictions against a *corrected* gold, writing a separate `data/runs/regrade_gold_<tag>.jsonl` with `reward` beside `reward_old`. Never writes into the results tree, and grades trials whose id the corrected corpus dropped against the superseded gold rather than dropping them |
 | `gen_refs.py`, `gen_solutions.py` | generate and verify reference solutions |
 | `gen_hints.py` | writes the plain-language L2/L3 hints from each verified reference, validates them, and caches them per task |
 | `hint_report.py`, `hint_audit.py` | coverage, leak and cost numbers for the hints; a seeded side-by-side audit against the references |
@@ -53,6 +54,7 @@ uv run python -m smol_ladder.run_ladder --split test --rungs L1 --samples 2 \
 uv run python -m smol_ladder.summarize --split test                 # legacy data/runs/test tree
 uv run python -m smol_ladder.summarize --split test --run-tag v2    # that run's own tree
 uv run python -m smol_ladder.regrade --split test                   # what the ANSWER: prefix costs
+uv run python -m smol_ladder.regrade_gold --split synthetic          # what the old synthetic gold cost
 ```
 
 Sample 0 is the existing `<task>/<rung>/result.json`, so a tree written before `--samples` was
