@@ -1,275 +1,272 @@
-# Smol Data Transfer: does verified data-agent training generalise?
+# Plan: post-train a 2B data-analysis agent, and use the ladder to measure it
 
-> Umbrella plan. Paste it into a GitHub issue as-is, or keep it as `PLAN.md` in the repo.
-> The checkboxes work as a task list in both.
+> The priority is **data first, then a training run**. Evaluation of the *released* models
+> (the old "post #1") is no longer the gate; the ladder is now an instrument for training and
+> measurement rather than a deliverable of its own. Checkboxes work as a task list.
 
-## TL;DR
+## Where we are
 
-Small (2B) models can be trained with RL to answer data-analysis questions by writing and running code.
-[SmolDataEnvs](https://huggingface.co/datasets/FineEnvs/SmolDataEnvs) (released 2026-09-24) reports a
-2B model going from ~0.28 to ~0.40 pass@1 after GRPO. **That number is only measured on held-out tasks
-from the same source**, so nobody has checked whether it transfers. This project checks, then asks
-whether small clean data or big noisy data is the better starting point.
+**What exists.** A complete eval harness: the four-rung ladder with a Blackwell-tested ordering
+(`tests/test_blackwell.py`), the offline sealed grading pass, the SmolDataEnvs grader unmodified, a
+solver that talks to any OpenAI-compatible endpoint, and the two upstream 2B protocols (`program`,
+`bash`) alongside ours (`tools`) so every arm can be run under the protocol it was trained in
+(`docs/LOCAL_MODELS.md`). Reference generation, plain-language hint generation and validation, the
+tagged jupyter-agent pool, per-rung summarisation with a bootstrap CI, offline regrading, and
+`--run-tag`/`RUN.json` so a sweep records the code, command line, model, protocol, rungs, samples,
+climb setting and reference denominator at launch. 256 tests pass.
 
-- **Post #1 (fast, ~1–2 weeks):** evaluate the *released* models on an in-distribution and an
-  out-of-distribution benchmark. No training needed.
-- **Post #2 (~3–4 more weeks):** train our own arms: clean-5K vs noisy-51K SFT, plus GRPO, and do
-  error analysis.
+**Measured, on `test` (250 tasks, `stealth/space-bunny-alpha`):** L1 187/250 = 74.8%; schema control
+23/63 = 36.5% on L1 failures; L2 167/181 = 92.3%; L3 8/14 = 57.1%; L4 6/6 = 100%. Reference funnel:
+181/250 (72%) have a verified reference. First-passing rung: L1 187, L2 17, L3 3, L4 3, and 40 tasks
+with no reference. 20 of the 23 information-rung rescues are also control rescues, so on this split a
+hint rung and a no-information prompt are close to interchangeable. `test` L1 by family: `agg` 68.0%,
+`stat_test` 78.1%, label-typed answers 66.3% vs numeric 77.2%, hard tier 61.6%.
 
-Goal: learning + a portfolio piece + a blog post people cite. Being first to evaluate SmolDataEnvs
-independently is the hook, so move fast on post #1.
+**Withdrawn — the 92% schema-control claim is dead.** The numbers audit recomputed every figure in
+the old headline from raw per-trial results and withdrew the `test` table in full: no artefact of the
+92% run survives, its denominator (179) is impossible against its own L1 count (184), and it predates
+a verifier-mount fix. The surviving control is 23/63 = 36.5%, which does **not** support "the failures
+are overwhelmingly an exploration problem". Withdrawn with it: `L1 184/250`, `L2 9/14`, `L3 2/5`,
+`L4 3/3`, and the "of 19 climbed tasks" summary.
 
----
+**Found wrong and fixed on this branch.** The schema control leaked the gold answer on 30/250 tasks
+(it printed sample rows; it is now built from dtypes and column profiles that emit no value), and it
+was *vacuous* on 243/250 — `schema_dump` passed `usecols=range(40)` and a bare `except` swallowed the
+error, so the median dump was 37 characters and 191/250 named no column; median is now 1404 chars and
+250/250 name a column. `Method: join` was emitted for `os.path.join` on 56/181 references.
+`summarize.py` double-counted, summing 266 for 250 tasks. The `ANSWER:` prefix cost 8 of 490 stored
+predictions; the fix went into the prompt, because the grader is not the defect and was left matching
+upstream. L2/L3 are now written in plain language from the verified reference instead of extracted
+from its AST (98/181 references are hand-written csv/sqlite, so the AST gave empty filters on 71% and
+a method line reading "get, items, values"): 167/181 hints validate, 14 fall back to the AST,
+non-empty content 62.4% → 88.4% (columns), 28.2% → 56.9% (filters), 66.9% → 92.3% (method).
 
-## Research questions (commit to these before running anything)
+**Still broken or open.** The `synthetic` split's gold answers are wrong: `iter_tables` reads 50,000
+rows to compute the answer but the agent reads the untruncated file, so 58 of 275 tables over 50k
+rows are ungradeable by construction — the 87 "never" there is a grading artefact, not a result.
+jupyter-agent has 274 attempted references and 23 passing, so the ladder cannot yet run on the source
+that needs it most. 8/181 tasks pass at L1 and fail at L2, a real monotonicity violation. 18.9% of
+tasks flip across four identical L1 runs, so "first passing rung" is not identifiable at k=1. No
+instruction stack is installed on this machine.
 
-- **RQ1: Transfer.** Do SmolDataEnvs-trained models improve on an out-of-distribution data-analysis
-  benchmark (DABstep), or only on in-distribution tasks (SmolDataEnvs `test`)?
-- **RQ2: Quality vs quantity.** For SFT, which is better: ~5K verified traces (SmolDataEnvs-sft) or
-  ~51K noisy traces (jupyter-agent, real-execution subset)? Measured in- and out-of-distribution.
-- **RQ3: RL on top.** Does GRPO after the better SFT add anything, and does *that* gain transfer?
+## Objective
 
-- **RQ4 — Skill or information? (via an information ladder, see below)** When a model fails, is it
-  missing *skill* or missing *information*? Does training (SFT / GRPO) lower the amount of information a
-  model needs to pass?
+Get to a first SFT and then an RL training run of the 2B model as fast as the data allows, and use
+the information ladder three ways:
 
-Primary metric: pass@1 (greedy, one attempt per task) with 95% CIs.
-Secondary: pass@4, and per-difficulty-tier breakdown.
-Every outcome is reportable. "It doesn't transfer" is a result, not a failure.
+1. **Verify tasks** before they enter training — a reference solution that reproduces the gold answer
+   is what makes a task's gold trustworthy, and it is what L2/L3 are written from.
+2. **Produce hint rungs L2/L3 as a curriculum for RL.** At the ~28% pass rate of the released GRPO
+   eval, many GRPO groups score all-zero and give no gradient. Train the hard tasks *with* a hint rung
+   and withdraw it as per-task pass rate rises (the adaptive curriculum the ladder post suggests).
+3. **Measure skill versus information before and after training** — does training lower the rung
+   needed, or close the L1 vs L1+schema gap, or both?
 
----
+Every outcome is reportable. "Hints do not help RL" is a result, not a failure.
 
-## Background (facts gathered so far)
+## Data assets
 
-### SmolDataEnvs ([dataset](https://huggingface.co/datasets/FineEnvs/SmolDataEnvs), [code](https://github.com/adithya-s-k/FineEnvs/tree/main/04-smoldataenvs))
-- 5,394 verified tasks: train 5,000 / test 250 / eval 144. Built from 471 Kaggle datasets.
-- Held-out splits are deliberately harder (~38–40% hard vs 14% in train).
-- Row = question, gold answer, `reward_mode` + `atol`/`rtol`, pointer to data in HF bucket
-  `AdithyaSK/jupyter-agent-kaggle-all` (use `bucket_prefix`), full agent `instruction`.
-- `grader.py`: exact → numeric w/ tolerance (+ percent/fraction bridge) → list → math-verify.
-  No LLM in the reward path. `--json` mode also reports `tool_efficiency` (1 − calls/15).
-- Tasks were "verified": strong agent models had to reproduce the gold answer in a sandbox.
-  Pass rate / attempt counts are **not published**.
-- `-sft`: 4,677 verified trajectories (TRL-ready `messages` + `tools`).
-- Released models (Qwen3.5-2B base, **no eval numbers in the model cards**):
-  - [`AdithyaSK/smoldataenvs-sft-2b-v0`](https://huggingface.co/AdithyaSK/smoldataenvs-sft-2b-v0)
-  - [`AdithyaSK/smoldataenvs-grpo-2b-v0`](https://huggingface.co/AdithyaSK/smoldataenvs-grpo-2b-v0)
-- Their published result (read off `curves.gif`, `eval` split, 144 tasks): pass@1 ~0.28 → 0.41 / 0.40
-  (shuffled / curriculum), pass@4 → 0.60 after 1,119 GRPO steps. Unclear whether GRPO started from SFT.
-- Their eval script: `scripts/eval_pass1.py` (greedy, `SPLIT=test` for the benchmark split).
-- Lessons from their README:
-  - The "+0.1 if the program runs" shaping reward got hacked: empty programs collected the bonus.
-    Fixed by requiring the program to *print* something.
-  - Run everything non-thinking (same chat template for SFT, RL and eval).
-  - Reuse one sandbox per process; don't start one per rollout.
+| Asset | Count | Status | For | Blocked by |
+|---|---|---|---|---|
+| SmolDataEnvs `train` | 5,000 tasks | on disk, graded by `grader.py` | RL tasks + reward | nothing for RL; SFT needs traces we do not have |
+| SmolDataEnvs-sft | 4,677 verified trajectories | **usable for SFT today** | SFT traces | nothing — but it is `bash`-protocol; conversion needed if arms must share one tool format |
+| SmolDataEnvs `test` / `eval` | 250 / 144 | held out, never trained on | in-distribution eval | nothing; 69/250 `test` tasks have no reference, so L2–L4 are measurable on 181 only |
+| jupyter-agent pool (v2) | 9,187 tasks, **5,124 ladder-grade** | built and tagged; references being generated | RL tasks + reward; eval (L1 41.9%, twice the headroom) | verified references (23 passing so far); 519 tasks across 148 uncached datasets need ~69 GB |
+| Plain-language hints (L2/L3) | 167/181 `test` refs validate | written, validated, cached | RL curriculum; measurement | 14 fall back to the AST, and 9 of those are label-answers that *are* column names — unfixable; needs generating on jupyter-agent refs |
+| Synthetic tasks | 275 | **gold broken, repair outstanding** | RL tasks (unlimited supply) | the `nrows=50,000` truncation is still in `synthetic.py`: regenerate all gold and re-verify every spec against the shipped table before any trial |
 
-### jupyter-agent ([dataset](https://huggingface.co/datasets/jupyter-agent/jupyter-agent-dataset))
-- 51,389 examples, duplicated as `thinking` / `non_thinking` splits (same examples, different formatting).
-- ~72 GB download, mostly the `original_notebook` column (0.2–5.6 MB per row). Load only the columns you need.
-- Columns: `id`, `messages`, `tools`, `question`, `answer`, `edu_score`, `files_used`, `packages_used`,
-  `kaggle_dataset_name`, `executor_type`, `original_notebook`.
-- Traces use tools `add_and_execute_jupyter_code_cell` + `final_answer` (a different format from SmolDataEnvs).
-- Known noise:
-  - `executor_type = llm` means the outputs were simulated by an LLM, not executed.
-  - Some `kaggle_dataset_name` values are wrong. Seen: an SVM-on-`vehicle.csv` question labelled `ukveteran/retail-food`.
-  - Answers are free text (e.g. "61,257 USD (70,187 for failed minus 8,930 for successful)").
-- HF's own result: Qwen3-4B fine-tuned on it gained up to 20% on DABstep-easy.
+The `jtasks_v2` ladder-grade subset deliberately keeps the method-ambiguous families (`ml_fit`,
+`stat_test`, `groupby`, `lookup`, `join` — 1,055 tasks) and does not tune towards `count`/`agg`,
+because those are the families the ladder has nothing to disambiguate. 8,668 of 9,187 pool tasks
+(94.3%) reuse datasets already in the Kaggle cache.
 
-### Information ladder ([Evan Kim, "Difficulty is an information gap"](https://evan-kim2028.github.io/evan_writings/writings/difficulty-is-an-information-gap/))
-- Thesis: difficulty is a relation between a task, a model and an *amount of information*, not a fixed property of the task.
-- Method: a ladder of prompts, each rung containing everything below it (bug report → full description →
-  test names → signatures → hidden tests). Measure the **lowest rung where each model first passes**.
-- Findings (242 certified Go coding tasks, 2 agents, ~$1.4k of tokens):
-  - Extra information replaces search: 24–32% fewer read/search calls when it turned a fail into a pass.
-  - The two models disagree on what's hard: 56% agreement, 0.29 rank correlation.
-  - 59% of graded tasks fail at L1 and become solvable with more information.
-- Suggested uses: adaptive curricula (withhold information as the model improves), multiple prompt variants per task.
-- Caveat: small study, SWE tasks, not data analysis. We borrow the *method*, not the findings.
+**Contamination, measured.** 74% of `test` tasks share a source table with a `train` task (185/250 by
+`bucket_prefix`), and 4 `test` questions appear verbatim in the released SmolDataEnvs-sft blob. The
+split is by question, not by table, so an arm trained on SmolDataEnvs-sft has seen the tables L4 is
+written about. The clean version partitions the 471 Kaggle datasets, not the 5,394 tasks.
 
-### Benchmarks
-| Benchmark | Role | Notes |
+## Critical path to the first training run
+
+**Ordered; steps marked [non-blocking] are not on the path to the first training run.**
+
+| # | step | depends on |
 |---|---|---|
-| SmolDataEnvs `test` (250) | in-distribution | No published score yet |
-| [DABstep](https://huggingface.co/spaces/adyen/DABstep) (450) | **out-of-distribution** | Top of leaderboard saturated by benchmark-specific agents, still discriminative for small models. Answers hidden: submit to the leaderboard; a small dev split has public answers (verify details) |
-| [AgenticDataBench](https://arxiv.org/html/2607.01647) (344) | stretch OOD | Best 48.8%. Heavy tasks (~490 MB, 6.4 files avg), so a 2B model will likely score near 0 |
-| [DataAgentBench](https://github.com/ucbepic/DataAgentBench) | skip | Top 94.7%, essentially beaten |
+| 1 | **SFT (LoRA) on SmolDataEnvs-sft** — the first training run | a serving/training stack, nothing else. The 4,677 trajectories are `bash`-protocol (`messages` + `tools`, answer in `/workdir/answer.txt`, 3–12 turns; upstream's config used `max_length=8192`) |
+| 2 | Converter: the two trace formats → one tool format + chat template | (1), which defines the format. Without it, arm-vs-arm differences are format, not data |
+| 3 | SFT on our own verified traces | (2) for the format, plus our own trace collection — **and our trace collection is [non-blocking] for step 1** |
+| 4 | GRPO (LoRA) on SmolDataEnvs `train` | (1) as its starting point, and a non-degenerate reward. `num_generations=8` at the ~28% pass rate is the problem this project exists to solve |
+| 5 | Hint-curriculum GRPO | verified references + validated L2/L3 hints for the *training* tasks. Hints exist for `test` refs today, not for `train` |
+| 6 | Ladder measurement of every arm, before and after | each arm existing. Cheap relative to training, so it can run on the baseline as soon as (1) lands |
 
----
+**Reference generation** is needed for 5 and 6 but **[non-blocking]** for the first training run. Run it
+early anyway: it is the long pole for the ladder and it is what validates a task's gold.
 
-## Experiment design
+- [ ] 1. SFT (LoRA) on SmolDataEnvs-sft, 4,677 traces — first training run
+- [ ] 2. Converter: upstream `bash` traces and our traces → one tool format + chat template
+- [ ] 3. Reference solutions for the training split (`gen_refs` / `gen_solutions`), verified offline
+- [ ] 4. Plain-language L2/L3 hints for the training split (`gen_hints`), validated and cached
+- [ ] 5. Synthetic gold repair: drop the 50k truncation, regenerate, re-verify every spec
+- [ ] 6. Our own verified SFT traces in the converted format
+- [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the step-1 model
+- [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises
+- [ ] 9. jupyter-agent references at scale (the 5,124 ladder-grade subset)
+- [ ] 10. Ladder measurement of every arm, before and after, same tasks and protocol
+- [ ] 11. Open decisions below, then the write-up
 
-| Arm | Model | Training | Used in |
+## Training arms
+
+| Arm | Model | Training | Notes |
 |---|---|---|---|
-| 0 | Qwen3.5-2B | none | post #1, #2 |
-| R-SFT | `smoldataenvs-sft-2b-v0` | theirs | post #1 |
-| R-GRPO | `smoldataenvs-grpo-2b-v0` | theirs | post #1 |
-| A | Qwen3.5-2B | SFT on SmolDataEnvs-sft (~4.7K) | post #2 |
-| B | Qwen3.5-2B | SFT on jupyter-agent real-execution subset (all of it) | post #2 |
-| C | best of A/B | + GRPO (LoRA) on SmolDataEnvs train | post #2 |
+| 0 | Qwen3.5-2B | none | the control; base model, no instruction tuning for either protocol |
+| R-SFT | `smoldataenvs-sft-2b-v0` | theirs | a **93 MB LoRA adapter** (r=16, α=32) on the base, not a model |
+| R-GRPO | `smoldataenvs-grpo-2b-v0` | theirs | shipped in **fp32, 8.85 GB**; must be cast to bf16 (4.43 GB) |
+| A | Qwen3.5-2B | SFT (LoRA) on SmolDataEnvs-sft, ~4.7K traces | the baseline we can run today |
+| B | Qwen3.5-2B | SFT on our verified traces | depends on our trace collection |
+| C | best of A/B | + GRPO (LoRA) on SmolDataEnvs `train` | |
+| D | C | + hint-curriculum GRPO (L2/L3 withdrawn as pass rate rises) | **promoted from stretch goal**; the ~28% pass rate makes all-zero groups the binding constraint |
 
-Controls that decide whether results mean anything:
-- **Same format** for A and B. Convert both trace sets into one tool/prompt format and the same chat
-  template, or A vs B measures format rather than data.
-- Same hyperparameters, sequence length and template across arms. Log token counts per arm.
-- ≥2 seeds for A and B if budget allows. Report 95% CIs (on ~250–450 tasks, <~5 pt differences are noise).
-- **Leakage check:** drop jupyter-agent rows whose notebook/dataset overlaps SmolDataEnvs `test`/`eval`
-  tasks (match on `source_row_id` notebook id and `kaggle_dataset`). Also check DABstep overlap with training data.
+Controls that still decide whether the numbers mean anything:
 
-### Information ladder for data-analysis tasks (RQ4)
+- **Same chat template and tool format across A and B**, or A vs B measures format. Render
+  non-thinking everywhere (`enable_thinking=False`): upstream trains and scores that way, and
+  omitting it changes the rendered template and is itself a measurement.
+- **Each arm runs under the protocol it was trained in.** A 2B model trained on "one program, then
+  stop" has never produced a multi-turn tool transcript; run it in a 40-turn loop and you measure
+  format transfer, not the model. Cross-arm ladder comparison needs all arms on one protocol, or the
+  asymmetry stated in the table.
+- **Held-out discipline.** No `test` or `eval` task, and no reference solution, ever enters training
+  data. References come only from held-out splits, and the ladder's rungs nest within a task, so any
+  split keeps all of a task's rungs on one side.
+- **Seeds and CIs.** ≥2 seeds for A and B if hours allow; 95% CIs throughout. On ~250–450 tasks,
+  differences under ~5 points are noise. Report the run-to-run spread next to every headline: four
+  identical L1 runs spanned 71.5–74.8%.
+- **Reward integrity.** SmolDataEnvs' "+0.1 if the code runs" shaping reward got hacked by empty
+  programs. Inspect samples every N steps and require printed output.
 
-Full definition and the Blackwell argument: [`LADDER.md`](LADDER.md). Every rung adds information
-the agent cannot compute from the tables (L1 < L2 < L3 < L4):
+## Evaluation protocol
 
-| Rung | Model gets | Source |
-|---|---|---|
-| L1 | question + file names (the normal prompt) | dataset row |
-| L2 | + which files/columns/filters the computation uses | verified reference solution |
-| L3 | + method (e.g. "Pearson correlation after dropping nulls") | verified reference solution |
-| L4 | + full reference code, final print removed | verified reference solution |
+- **The ladder** (`docs/LADDER.md`): L1 < L2 < L3 < L4, cumulative, each rung Blackwell-garbling the
+  one below. Metric is the lowest passing rung **and** the per-rung pass-rate curve, from **k samples
+  per rung, no climb** — every rung on every task, so each pass rate shares a denominator and the
+  monotonicity test is well defined. `--no-climb` and `--samples` both exist; climbing biases the
+  lowest-passing-rung histogram toward whichever rung a task happened to be reached at.
+- **Run tags**: every sweep gets `--run-tag TAG` → `data/runs/TAG/<split>/`, plus a `RUN.json`
+  written at launch. Cached results are never silently inherited across ladder versions.
+- **In-distribution first**: SmolDataEnvs `test` (250) and `eval` (144), with the reference funnel
+  reported alongside every rung table — L2–L4 exist only where a verified reference was built
+  (181/250), so every rung number is conditional on that.
+- **The schema control** (L1+schema) is not a rung: it adds no information, so it isolates
+  processing/skill gain. Run it on L1 failures.
+- **OOD later**: DABstep, after the in-distribution protocol is stable. No public gold code there,
+  so only L1 and the control.
+- Reference solutions are generated by the same model family under evaluation, so "training lowered
+  the rung" cannot be separated from recognising its own teacher's code without a shuffled-reference
+  control.
 
-Exploration control, **not a rung**: L1+schema (L1 plus an auto-generated schema dump). It adds
-no information, so a fail at L1 that passes at L1+schema is a skill failure, not an information failure.
-
-- Metric per task and model: **lowest passing rung** (or "never"), from k samples per rung.
-  Headline numbers are aggregate pass-rate curves by rung.
-- Reference solutions: the SFT traces cover only `train`, so we generate one verified solution per
-  `test`/`eval` task (`smol_ladder/gen_solutions.py`, a headless `cmd` agent, re-run offline and graded).
-- DABstep has no public gold code, so only L1 and the L1+schema control there.
-- Hints must not leak the answer. Check with a script that the final value doesn't appear in any hint.
-- Cost: only climb on tasks that fail the rung below.
-
----|---|---|
-| L1 | question + file names (the normal prompt) | as-is |
-| L2 | + schema / `df.head()` of the relevant files | generated automatically from the data |
-| L3 | + which files/columns/filters matter | extracted from verified solution code |
-| L4 | + method hint (e.g. "Pearson correlation after dropping nulls") | extracted from verified solution code |
-
-- Metric per task and model: **lowest passing rung** (or "never"). Compare distributions across arms:
-  "GRPO lowered the rung needed on X% of tasks" is more informative than a single pass@1.
-- Full ladder only on SmolDataEnvs `test`: the SmolDataEnvs-sft traces contain verified code to derive L3/L4 from.
-  DABstep has no public gold code, so only L1–L2 there, plus DABstep's own docs (e.g. the manual) as an optional rung.
-- Hints must not leak the answer. Check with a script that the final value doesn't appear in any hint.
-- Cost: each rung is a full eval pass (~3–4× eval time). To save budget, only run L2+ on tasks failed at the rung below.
-
----
-
-## Compute plan
+## Compute
 
 | Resource | Amount | Use for |
 |---|---|---|
-| Laptop RTX 4050 (6 GB) | free | pipeline dev, grader tests, tiny GRPO smoke test (sub-1B, QLoRA via Unsloth), few-task evals |
-| Kaggle (2× T4 16 GB) | 30 h/week free | all evals, SFT arms A and B |
-| AMD Developer Cloud (MI300X 192 GB, $1.99/h) | $100 ≈ 50 h, **expires 30 days after applying** | GRPO arm C only |
+| Laptop RTX 4050 Laptop GPU | 6 GB VRAM (5.3 GB free), 94 GB RAM, **no inference stack installed** | pipeline dev, grader tests, harness sanity checks on 5–20 tasks. Base bf16 weights are 4.55 GB, leaving ~1.0 GB for KV at `--gpu-memory-utilization 0.92`; `--max-model-len 4096`, or 8192 if it fits |
+| Kaggle | 2× T4 16 GB, 30 h/week | all real training, and every multi-arm × five-rung sweep |
+| AMD Developer Cloud (MI300X 192 GB, $1.99/h) | $100 ≈ 50 h, **expires 30 days after applying** | GRPO arms only. Whether the credit has been applied is **unknown** |
 
-Gotchas:
-- **Kaggle:**
-  - Use T4 (vLLM doesn't support P100).
-  - fp16 only: watch for NaNs/loss spikes with Qwen.
-  - No FlashAttention 2.
-  - 12 h session cap and the disk is wiped: push checkpoints to the Hub regularly.
-  - Enable internet (needs phone verification).
-  - Split evals across both T4s.
-- **AMD:**
-  - ROCm: smoke-test vLLM + TRL in the first hour.
-  - Don't use QLoRA (bitsandbytes on ROCm is less mature and memory isn't the bottleneck).
-  - Only apply the credit once the GRPO script already works on laptop/Kaggle.
-- **Sandbox:** the upstream scripts run code in HF Jobs sandboxes, which bill your HF account. Replace
-  them with a local sandbox: a subprocess with a timeout + a working dir with the task's files, or
-  Docker where available.
-- **Laptop:** use WSL2 if on Windows.
+Corrections from `docs/LOCAL_MODELS.md`: the SFT release is a **LoRA adapter** (93 MB, r=16 on
+`all-linear` — it must be served with the base model and the adapter loaded), and the GRPO release is
+**fp32 at 8.85 GB**, which does not fit this card in any precision it runs well — cast to bf16
+(4.43 GB) first. The released models only evaluate meaningfully under each one's own protocol, and
+that doc's throughput figures are bandwidth arithmetic rather than measurements (±2×).
 
-### Environment variables / secrets
-| Var | Needed for |
-|---|---|
-| `HF_TOKEN` | downloading bucket data, pushing models/datasets, DABstep submission |
-| `KAGGLE_USERNAME`, `KAGGLE_KEY` (or `~/.kaggle/kaggle.json`) | `kagglehub` downloads for jupyter-agent source data |
-| `WANDB_API_KEY` or trackio (optional) | experiment tracking |
+Gotchas: Kaggle needs a **T4** (vLLM does not support P100), fp16 only (watch for NaN loss spikes with
+Qwen — LoRA and a lower LR), no FlashAttention 2, a 12 h session cap, and the disk is wiped between
+sessions, so checkpoint to the Hub and write results to `data/runs/`. Internet must be enabled (phone
+verification). On AMD, smoke-test vLLM + TRL in the first hour, do not use QLoRA (bitsandbytes on ROCm
+is less mature and memory is not the bottleneck), and do not apply the credit until the GRPO script
+already runs on laptop/Kaggle. Use WSL2 if on Windows.
 
-On Kaggle, add these as notebook **Secrets** (Add-ons → Secrets), never inline.
+Secrets, from `.env` (git-ignored, never committed): `HF_TOKEN`, `KAGGLE_USERNAME`/`KAGGLE_KEY` (or
+`~/.kaggle/kaggle.json`), `OPENROUTER_API_KEY`, and optionally `WANDB_API_KEY`. On Kaggle add them as
+notebook **Secrets**, never inline.
 
----
+## Open decisions for the owner
 
-## Milestones
-
-### M1: Eval harness (laptop → Kaggle)
-- [ ] Repo scaffold (`uv` or `pip` + `requirements.txt`), config via env vars
-- [ ] Download a SmolDataEnvs task's files from the HF bucket (see the dataset card snippet)
-- [ ] Local sandbox runner: run model code with a timeout in a working dir containing the task's files, capture stdout/answer file
-- [ ] Wire in upstream `grader.py`; unit test: gold answer → 1.0, wrong → 0.0
-- [ ] Agent loop: vLLM generation → tool call → sandbox → … → answer (cap turns/tool calls)
-- [ ] Run on 5 tasks on the laptop, then the full `eval` split on Kaggle
-- [ ] Sanity check: reproduce their chart numbers roughly with `smoldataenvs-grpo-2b-v0` on `eval` (~0.40)
-- [ ] DABstep adapter: load tasks + context files, same agent loop, write the submission file; validate on the dev split
-
-### M2: Post #1, "Does it transfer?"
-- [ ] Evaluate arms 0, R-SFT, R-GRPO on SmolDataEnvs `test` and DABstep (submit to leaderboard)
-- [ ] CIs, per-tier breakdown, 20–30 failures read by hand
-- [ ] Write the post: question, setup, table + one chart, limitations, cost
-- [ ] Release the harness on GitHub, results on the Hub
-- [ ] Post a friendly note in the SmolDataEnvs Community tab with the results
-
-### M3: Data prep
-- [ ] Load jupyter-agent `non_thinking` **without** `original_notebook`; filter `executor_type == "e2b"`
-- [ ] Deduplicate; leakage filter vs SmolDataEnvs `test`/`eval`
-- [ ] Converter: both trace formats → one common tool format + chat template
-- [ ] Data card: row counts before/after each filter, token counts per arm
-- [ ] (Optional) release the cleaned real-execution subset as a dataset
-
-### M4: SFT arms (Kaggle)
-- [ ] Arm A: SFT on SmolDataEnvs-sft
-- [ ] Arm B: SFT on the cleaned jupyter-agent subset (multi-session, resume from Hub checkpoints)
-- [ ] Second seed for A and B if hours allow
-- [ ] Evaluate both with the M1 harness
-
-### M5: GRPO (laptop smoke test → AMD)
-- [ ] Reward: correctness from `grader.py` + small shaping ("program printed something"); watch for hacking
-- [ ] Laptop/Kaggle: 20–50 step smoke run on a tiny model; confirm non-zero, varied rewards
-- [ ] AMD: ROCm smoke test, then GRPO (LoRA) from the better SFT arm; checkpoint to Hub
-- [ ] Evaluate arm C on both benchmarks
-
-### M6: Error analysis
-- [ ] Generate verified reference solutions for `test`/`eval` (running)
-- [ ] Build ladder prompts L2–L4 from them + the L1+schema control; leak check
-- [ ] Run the ladder for every arm, only on tasks failed at the rung below; record the lowest passing rung
-- [ ] DABstep: L1 vs L1+schema for every arm; the skill-vs-information split for the transfer question
-- [ ] Tool-call analysis: read/inspect calls per trace by arm and rung (does training or information replace exploration?)
-- [ ] Sample ~50 failures per arm per benchmark
-- [ ] Categories, e.g.: wrong column/file, bad join/filter, wrong aggregation, answer formatting, crashed code, gave up/ran out of turns, misread question
-- [ ] Table: failure categories × arm × benchmark
-
-### M7: Post #2 + release
-- [ ] Write-up: RQ1–RQ4, results table, transfer chart, ladder chart (pass rate by rung per arm), error analysis, limitations
-- [ ] Cost accounting (free hours used + $ spent)
-- [ ] Release models, configs, cleaned dataset, harness
-
-### Stretch: hint-scaffolded GRPO (possible post #3)
-Problem it targets: at ~28% pass rate many GRPO groups score all zeros and give no gradient, and SmolDataEnvs'
-"+0.1 if the code runs" shaping reward got gamed. Idea: train hard tasks with a higher ladder rung and
-withdraw hints as per-task pass rate rises (the adaptive curriculum the ladder post suggests).
-- [ ] Literature check first: hint- or guidance-based RL for LLMs already exists; find what's new here
-- [ ] Only start after post #2 ships
-
----
+1. Which protocol is the project protocol — upstream's one-turn `program`, the `bash` agent, or our
+   `tools` loop? This decides the converter, the held-out discipline and every cross-arm table.
+2. Does the first run go on the laptop or straight to Kaggle? The laptop has no inference stack and
+   6 GB; a 2B LoRA SFT is small enough that Kaggle is likely the cheaper path to a first run.
+3. Is the AMD credit still valid, and do we spend it on arm C or hold it?
+4. Do we hold the 74%-table-overlap contamination and report it, or partition the 471 Kaggle datasets
+   for a clean held-out set (which shrinks `test`)?
+5. Synthetic: repair the gold and keep it as unlimited RL task supply, or drop the split?
+6. Do we do our own trace collection at all, or is arm B's question ("is our data better than
+   SmolDataEnvs-sft?") answered by a smaller, higher-precision set built only from verified traces?
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Effects within noise | CIs, 2 seeds, whole splits (no subsets) |
-| A vs B confounded by format | common converter + template (M3) |
-| DABstep submission limits/format | check leaderboard rules early (M1) |
+| All-zero GRPO groups at the ~28% pass rate give no gradient | hint-curriculum arm D: train with L2/L3, withdraw as pass rate rises |
+| Reward hacking on the shaping reward | require printed output; inspect samples every N steps |
+| Effects within noise | CIs, ≥2 seeds, whole splits, rerun spread reported beside every headline |
+| A vs B confounded by format or chat template | one converter, one template, non-thinking everywhere |
+| Protocol mismatch between arms | each arm run under its training protocol; asymmetry stated |
+| Contamination through shared tables (74% of `test`) | no `test`/`eval` tables or references in training; dataset-level partition if the owner prefers |
+| Ladder hints leak the answer | already enforced (text, differential, run-and-grade oracle) and a hint that fails is regenerated or falls back |
+| Ladder hints are useless for RL | that is the measurement; arm D is designed to be able to return "no" |
+| Hint cost degrades the rung (L3 below L2) | already observed; report monotonicity violations as results, with k samples and no climb |
+| Training on broken gold | synthetic's 50k truncation is the known case; the rule is that a task's gold must be re-derivable from the table the agent sees |
 | fp16 instability on T4 | LoRA, lower LR, watch the first few hundred steps |
-| Reward hacking in GRPO | require printed output, inspect samples every N steps |
-| AMD credit clock | don't apply the credit until M5 smoke test passes |
-| Scope creep | post #1 ships before M3 starts; scaffolded GRPO only after post #2 |
-| Ladder hints leak the answer | automatic leak check; hand-inspect a sample |
-| Ladder eval cost | only climb on failed tasks; full ladder on SmolDataEnvs `test` only |
+| Ladder eval cost | no-climb grid only where needed; run L1 across all arms first, spend rungs second |
+
+## Background (facts that still hold)
+
+### SmolDataEnvs ([dataset](https://huggingface.co/datasets/FineEnvs/SmolDataEnvs), [code](https://github.com/adithya-s-k/FineEnvs/tree/main/04-smoldataenvs))
+- 5,394 verified tasks: train 5,000 / test 250 / eval 144, from 471 Kaggle datasets. Held-out splits
+  are deliberately harder (~38–40% hard vs 14% in train). A row is question, gold answer,
+  `reward_mode` + `atol`/`rtol`, a pointer into HF bucket `AdithyaSK/jupyter-agent-kaggle-all` (use
+  `bucket_prefix`), and the full agent `instruction`.
+- `grader.py`: exact → numeric with tolerance → list → math-verify. **No LLM in the reward path.**
+- "Verified" means the grader accepted an answer, not that this is the unique correct computation; on
+  a loose `rtol` a materially different method also grades 1.0. Pass rates were never published.
+- `-sft`: 4,677 verified trajectories, TRL-ready `messages` + `tools`.
+- Released: [`smoldataenvs-sft-2b-v0`](https://huggingface.co/AdithyaSK/smoldataenvs-sft-2b-v0)
+  (LoRA adapter), [`smoldataenvs-grpo-2b-v0`](https://huggingface.co/AdithyaSK/smoldataenvs-grpo-2b-v0)
+  (full weights, fp32). Their published result, read off `curves.gif`: pass@1 ~0.28 → 0.40, pass@4 →
+  0.60 after 1,119 GRPO steps. Whether GRPO started from SFT is **unknown**.
+- Their lessons: the "+0.1 if the program runs" shaping reward was hacked by empty programs (fixed by
+  requiring the program to print something); run everything non-thinking with one shared template;
+  reuse one sandbox per process rather than one per rollout.
+
+### jupyter-agent ([dataset](https://huggingface.co/datasets/jupyter-agent/jupyter-agent-dataset))
+51,389 rows across 103 shards, duplicated as `thinking`/`non_thinking`, ~72 GB mostly
+`original_notebook` — load only the columns you need. `executor_type = llm` rows have simulated
+outputs, so their answers are fiction (66% of rows); some `kaggle_dataset_name` values are wrong;
+answers are free text, so a gradable-answer filter is required before SmolDataEnvs' grader applies.
+
+### Information ladder ([Evan Kim, "Difficulty is an information gap"](https://evan-kim2028.github.io/evan_writings/writings/difficulty-is-an-information-gap/))
+- Thesis: difficulty is a relation between a task, a model and an *amount of information*.
+- Method: nested prompts, each containing everything below; measure the lowest rung where the model
+  first passes. Findings (242 Go tasks): extra information replaces search (24–32% fewer read calls);
+  the two agents disagreed on what was hard (56% agreement, 0.29 rank correlation); 59% of graded
+  tasks failed at L1 and became solvable with more information.
+- Caveat: small study, SWE tasks. We borrow the method, not the findings. Blackwell's theorem
+  compares information *sets* and says nothing about cost, which is why a higher rung can genuinely
+  lower the pass rate for a real agent with a turn budget.
+
+### Benchmarks
+| Benchmark | Role | Notes |
+|---|---|---|
+| SmolDataEnvs `test` (250) | in-distribution | 74.8% L1 for a strong agent; the ladder's funnel is 181/250 |
+| [DABstep](https://huggingface.co/spaces/adyen/DABstep) (450) | OOD, later | answers hidden; no public gold code, so L1 and the control only |
+| [AgenticDataBench](https://arxiv.org/html/2607.01647) (344) | stretch OOD | heavy (~490 MB, 6.4 files/task); a 2B model will likely score near 0 |
+| [DataAgentBench](https://github.com/ucbepic/DataAgentBench) | skip | top 94.7%, essentially beaten |
 
 ## Links
+- Ladder definition and the Blackwell argument: [`LADDER.md`](LADDER.md) · serving the released
+  models: [`LOCAL_MODELS.md`](LOCAL_MODELS.md) · read-only audits and the superseded-findings list:
+  [`audits/`](audits/README.md)
 - SmolDataEnvs: https://huggingface.co/datasets/FineEnvs/SmolDataEnvs · code: https://github.com/adithya-s-k/FineEnvs/tree/main/04-smoldataenvs
 - SmolDataEnvs-sft: https://huggingface.co/datasets/FineEnvs/SmolDataEnvs-sft
 - jupyter-agent: https://huggingface.co/datasets/jupyter-agent/jupyter-agent-dataset · blog: https://huggingface.co/blog/jupyter-agent-2
-- DABstep: https://huggingface.co/spaces/adyen/DABstep · paper: https://arxiv.org/abs/2506.23719
-- AgenticDataBench: https://arxiv.org/html/2607.01647
-- Information ladder post: https://evan-kim2028.github.io/evan_writings/writings/difficulty-is-an-information-gap/
-- AMD Developer Cloud notes: https://lilting.ch/en/articles/amd-developer-cloud-credit-journey
+- DABstep: https://huggingface.co/spaces/adyen/DABstep · AgenticDataBench: https://arxiv.org/html/2607.01647
+- Information ladder post: https://evan-kim2028.github.io/evan_writings/writings/difficulty-is-an-information-gap/ · AMD credit notes: https://lilting.ch/en/articles/amd-developer-cloud-credit-journey
