@@ -25,7 +25,7 @@ import pandas as pd
 
 from smol_ladder.grade import grade, last_line
 from smol_ladder.sandbox import run_script
-from smol_ladder.tasks import DATA, input_dir, load_split
+from smol_ladder.tasks import DATA, input_dir, load_split, read_tables
 
 RUNGS = ("L1", "L2", "L3", "L4")
 
@@ -163,17 +163,67 @@ def _bucket_sizes(values: pd.Series) -> pd.Series:
 
 
 def _shape(buckets: pd.Series) -> str:
-    """A histogram of the column, as decimal fractions.
+    """What the column's distribution looks like, in words.
 
-    Two properties, both forced by how the grader reads a candidate. Its numeric tier takes
-    the first number in the string and compares it to the gold answer, so a leading integer
-    is read as the whole prompt: "200+ rows" graded 1.0 against a gold answer of "more than
-    200 million". And its percent/fraction bridge puts 0 < 1 <= 1 on the shortlist for
-    matching a gold answer of 1, so a bucket holding every row printed as 1.00 matched the
-    gold answer of "more than 1 million". Every number this function emits is therefore
-    strictly between 0 and 1, printed with a leading zero.
+    The first version of this printed the decile fractions as decimal numbers, and every number
+    in a dump is a lottery ticket: the grader's numeric tier reads each candidate number in the
+    prompt and scores it against the gold answer, so a printed 0.83 hands over a task whose
+    answer is 0.827742. Profiling every table turned those from a few accidents into eighteen.
+    The shape survives as a word, which carries the same signal -- is this column skewed, is it
+    one value repeated -- and cannot be graded.
     """
-    return " ".join(f"0.{n:.2f}" for n in buckets)
+    widest = float(buckets.max())
+    if widest > 0.5:
+        return "almost all its values in one band"
+    if widest < 0.25:
+        return "spread evenly across its range"
+    return "spread across its range, heaviest in one band"
+
+
+def _presence(series: pd.Series) -> str:
+    """How much of the column is filled, in words. A missingness count is a number like any
+    other, so the dump says "all values present" rather than "200 non-null"."""
+    n_missing = int(series.isna().sum())
+    if not n_missing:
+        return "all values present"
+    if n_missing >= len(series):
+        return "no values present"
+    if n_missing * 100 < len(series):
+        return "a few values missing"
+    if n_missing * 2 < len(series):
+        return "some values missing"
+    return "most values missing"
+
+
+_COLUMN_PHRASES = ((2, "a single column"), (5, "a few columns"), (13, "about a dozen columns"),
+                   (31, "a couple of dozen columns"), (float("inf"), "dozens of columns"))
+_ROW_PHRASES = ((10, "under ten rows"), (100, "fewer than a hundred rows"),
+                (1000, "fewer than a thousand rows"), (float("inf"), "thousands of rows"))
+_SIZE_PHRASES = ((1024, "under a kilobyte"), (1024 ** 2, "a few hundred kilobytes"),
+                 (1024 ** 3, "a few megabytes"), (float("inf"), "a few gigabytes"))
+
+
+def _phrases(count: int, phrases: tuple[tuple[float, str], ...]) -> str:
+    for bound, phrase in phrases:
+        if count < bound:
+            return phrase
+    return phrases[-1][1]
+
+
+def _column_label(column) -> str:
+    """How a column is named in the dump, with a positional name spelled in words.
+
+    pandas labels a headerless first column "Unnamed: 0", and the "0" in that name is a number
+    the grader will read as a candidate: one test task answers 0.000 and its dump was offering
+    a 0. The name also carries nothing -- it names the column's position, which the line above
+    it already says. A real column name is left exactly as it is, because that is the one thing
+    the dump must not rewrite: the question asks about it, and "Size(sqf)" is the string the
+    agent has to match against the file.
+    """
+    text = str(column)
+    if text == "Unnamed: 0":
+        return "an unnamed first column"
+    return "an unnamed column" if text.startswith("Unnamed:") else text
 
 
 def _profile(series: pd.Series) -> str:
@@ -181,9 +231,13 @@ def _profile(series: pd.Series) -> str:
 
     Only statistics over the rows read, and no cell value appears anywhere: not the values,
     not a category name, not a quantile boundary that could coincide with one.
+
+    Not a digit either. The grader scans every number in the prompt and scores it against the
+    gold answer, so "3 distinct" or "82 non-null" can hand over a task whose answer is 82. Every
+    count here is a word -- "a few distinct", "all values present" -- which says the same thing
+    about the column and cannot be graded against anything.
     """
-    n_missing = int(series.isna().sum())
-    seen = f"{len(series) - n_missing} non-null"
+    seen = _presence(series)
     if pd.api.types.is_bool_dtype(series):
         return f"bool, {seen}"
     if pd.api.types.is_datetime64_any_dtype(series):
@@ -192,13 +246,20 @@ def _profile(series: pd.Series) -> str:
         values = series.dropna()
         if values.empty:
             return f"numeric, {seen}"
-        return f"numeric, {seen}, deciles {_shape(_bucket_sizes(values))}"
+        return f"numeric, {seen}, {_shape(_bucket_sizes(values))}"
     text = series.dropna().astype(str)
     if text.empty:
         return f"text, {seen}"
     if text.nunique() == 1:
         return f"constant text, {seen}"
-    return f"text, {seen}, {text.nunique()} distinct, longest {text.str.len().max()} chars"
+    n_distinct = int(text.nunique())
+    spread = ("a couple of distinct values" if n_distinct <= 2 else
+              "a few distinct values" if n_distinct <= 5 else
+              "a handful of distinct values" if n_distinct <= 12 else
+              "many distinct values" if n_distinct <= 50 else
+              "a different value in most rows")
+    labels = "short labels" if text.str.len().max() <= 20 else "long labels"
+    return f"text, {seen}, {spread}, {labels}"
 
 
 def schema_dump(row: dict, split: str = "test") -> str:
@@ -226,31 +287,52 @@ def schema_dump(row: dict, split: str = "test") -> str:
     Three caps keep the size bounded for a wide table or a seven-file task: rows read per
     file, columns and files described, and finally a character budget applied over whole
     lines. That last one is what the test asserts, so the marker cannot push the dump past it.
+
+    Every file the task ships is described, and one that cannot be read is named with its size
+    rather than dropped. The dump is useless when it is short: a control that tells the agent
+    nothing measures nothing, and an unreadable table that is silently absent reads as an empty
+    one. An earlier version read_csv'd each file with usecols=range(40), which makes pandas
+    raise "columns expected but not found" on any table narrower than 40 columns -- 243 of the
+    250 test tasks -- and a bare except reported those as "(not readable as csv)". The median
+    dump was 37 characters. The column cap now trims a frame already read, and read_tables
+    sniffs the delimiter and falls back through the encodings, so a semicolon- or tab-separated
+    table and a latin-1 one are read like any other.
     """
     src = inputs_of(split)(row)
     parts: list[str] = []
     for position, name in enumerate(row["files"]):
         f = src / name
         if position >= SCHEMA_DUMP_MAX_FILES:
-            parts.append(f"{SCHEMA_DUMP_TRIM_MARKER} and {len(row['files']) - position} "
-                         f"further files")
+            parts.append(f"{SCHEMA_DUMP_TRIM_MARKER} further files, not described")
             break
-        if not f.exists() or f.suffix.lower() in {".sqlite", ".db"}:
+        if not f.exists():
+            parts.append(f"{name}: unreadable, no file in the input directory")
             continue
-        try:
-            head = pd.read_csv(f, nrows=SCHEMA_DUMP_ROWS, usecols=range(SCHEMA_DUMP_MAX_COLS))
-        except Exception:
-            parts.append(f"{name}: (not readable as csv)")
+        frames = read_tables(f, SCHEMA_DUMP_ROWS)
+        if not frames:
+            # Named, sized, and explicitly unreadable. A file that silently vanishes from the
+            # dump is the failure this control cannot have: the agent would be told the table's
+            # absence rather than shown it, and an unreadable table reads as an empty one.
+            parts.append(f"{name}: unreadable, {_phrases(f.stat().st_size, _SIZE_PHRASES)}")
             continue
-        # No "+" and no count: the grader's numeric tier reads the first number in a prompt
-        # as a candidate, so "200+ rows" graded 1.0 against a gold answer of "more than 200
-        # million". A lower bound printed as a range reads as the range.
-        parts.append(f"{name}: {len(head.columns)} columns, at least {head.shape[0]} rows")
-        if len(head.columns) > SCHEMA_DUMP_MAX_COLS:
-            parts.append(f"  {SCHEMA_DUMP_TRIM_MARKER} the first {SCHEMA_DUMP_MAX_COLS} "
-                         f"columns are described below")
-        for column in head.columns:
-            parts.append(f"  {column}: {head[column].dtype}, {_profile(head[column])}")
+        if len(frames) > 1:
+            parts.append(f"{name}: several tables, each described below")
+        for table_index, head in enumerate(frames):
+            label = name if len(frames) == 1 else f"{name} ({SCHEMA_DUMP_TRIM_MARKER} table)"
+            # The column cap is applied to the frame we already hold, not passed to read_csv
+            # as usecols. A usecols=range(40) makes pandas raise "columns expected but not
+            # found" on every table with fewer than 40 columns -- which is 243 of 250 test
+            # tasks -- and the bare except turned that into "not readable as csv".
+            truncated = head.shape[1] > SCHEMA_DUMP_MAX_COLS
+            head = head.iloc[:, :SCHEMA_DUMP_MAX_COLS]
+            # Counts in words, like everything else numeric here: the grader reads every number
+            # in the prompt as a candidate, so "11 columns" hands over a task whose answer is 0.11.
+            parts.append(f"{label}: {_phrases(head.shape[1], _COLUMN_PHRASES)}"
+                         f"{', the first ones only' if truncated else ''}, "
+                         f"{_phrases(head.shape[0], _ROW_PHRASES)}")
+            for column in head.columns:
+                parts.append(f"  {_column_label(column)}: {head[column].dtype}, "
+                             f"{_profile(head[column])}")
     dump = "\n".join(parts) if parts else "(no readable tables)"
     if len(dump) <= SCHEMA_DUMP_CHARS:
         return dump
@@ -262,8 +344,7 @@ def schema_dump(row: dict, split: str = "test") -> str:
         # subtracted first, since the marker's own length depends on how many lines are left.
         room -= 44
         if len("\n".join(kept + [line])) > room:
-            kept.append(f"{SCHEMA_DUMP_TRIM_MARKER} {len(lines) - len(kept)} more lines "
-                        f"of the same shape")
+            kept.append(f"{SCHEMA_DUMP_TRIM_MARKER} further lines of the same shape")
             break
         kept.append(line)
     return "\n".join(kept)

@@ -1,8 +1,31 @@
 import ast
+import re
 
-from smol_ladder.ladder import (SCHEMA_DUMP_CHARS, code_facts, leaks, method_hint, normalise,
-                                prompt_for, redact_literals, schema_dump, strip_output)
-from smol_ladder.tasks import input_dir, load_split
+from smol_ladder.ladder import (SCHEMA_DUMP_CHARS, SCHEMA_DUMP_MAX_COLS, SCHEMA_DUMP_MAX_FILES,
+                                SCHEMA_DUMP_ROWS, code_facts, inputs_of,
+                                leaks, method_hint, normalise, prompt_for, redact_literals,
+                                schema_dump, strip_output)
+from smol_ladder.tasks import input_dir, load_split, read_tables
+
+# The tasks whose gold answer is a column name, so the name appears in any dump that profiles
+# the table. Each is an exact_short "which feature has the highest ..." question: the answer is
+# picked out of the candidate set by a computation, and naming the set is what makes the task
+# solvable at all. Pinned by test_every_schema_dump_exemption_is_a_column_name_and_nothing_else.
+SCHEMA_DUMP_COLUMN_NAME_EXEMPTIONS = frozenset({
+    "0000_347_347102_qa_1",  # "Sp. Atk"
+    "0000_421_421838_qa_1",  # "Glucose"
+    "0000_440_440038_qa_5",  # "PetalLengthCm"
+    "0000_471_471618_qa_2",  # "IncidentLocation"
+    "0000_656_656399_qa_4",  # "ParentAnsweringSurvey"
+    "0000_658_658395_qa_1",  # "gill-color"
+    "0000_862_862257_qa_5",  # "Petal", a prefix of PetalLengthCm
+    "0001_347_1347384_qa_1",  # "Judaism", a prefix of judaism_orthodox
+    "0001_364_1364973_qa_2",  # "year"
+    "0001_497_1497755_qa_4",  # "chlorides"
+    "0001_533_1533644_qa_3",  # "Alkaline_Phosphotase"
+    "0001_638_1638152_qa_5",  # "Size(sqf)"
+    "0001_696_1696691_qa_1",  # "OverTime"
+})
 
 
 def test_strip_output_removes_prints_at_every_depth():
@@ -203,20 +226,63 @@ def test_schema_dump_is_answer_free_on_every_test_task():
     than the one spot check in test_leaks_ignores_an_answer_the_question_already_states, is
     what keeps the control's one guarantee measured.
 
-    One task is exempt, and the exemption is named rather than filtered: its table has a
-    column called for the category its question asks about, so "Judaism" is a substring of the
-    column listing whatever the dump prints. schema_dump never reads a cell, so the dump adds
-    the shape of the candidate set and nothing that picks the winner out of it, and no
-    summary statistic can narrow fourteen religions to one;
-    test_schema_dump_leaks_only_a_bare_category_in_a_column_name pins that reading.
+    Every exempt task is listed below, and each is checked to be the same single phenomenon
+    rather than merely skipped: an exact_short task whose gold answer is a column name, so the
+    name is a substring of the column listing whatever the dump prints. That is not the dump
+    handing over an answer -- schema_dump never reads a cell, so the dump adds the shape of the
+    candidate set and nothing that picks the winner out of it. A column name cannot be dropped,
+    because "which feature has the highest correlation" is unanswerable without it, and
+    narrowing the names to the ones the answer is not would be a redaction that announces where
+    the answer is.
+
+    The list grew from one to thirteen when the dump was fixed to profile every table. The
+    earlier version was not safer: it described no columns at all on 243 of 250 tasks, so it
+    could not contain a column name because it contained nothing. The exemption count is the
+    price of a dump that says anything, and test_schema_dump_names_a_column_on_every_task pins
+    what was bought with it.
     """
-    leaking = []
     for r in load_split("test"):
-        if r["task_id"] == "0001_347_1347384_qa_1":
+        if r["task_id"] in SCHEMA_DUMP_COLUMN_NAME_EXEMPTIONS:
             continue
-        if leaks(r, schema_dump(r)):
-            leaking.append(r["task_id"])
-    assert leaking == []
+        assert not leaks(r, schema_dump(r)), r["task_id"]
+
+
+def test_every_schema_dump_exemption_is_a_column_name_and_nothing_else():
+    """The exemption list may not drift into tolerating a real leak.
+
+    Each named task must leak exactly "answer-substring" -- no numeric hit -- and its answer
+    must be a genuine column of its table. A task that stops leaking is a bug too: the
+    exemption is meant to describe this split, and it should be pruned when it stops applying.
+    """
+    rows = {r["task_id"]: r for r in load_split("test")}
+    for task_id in SCHEMA_DUMP_COLUMN_NAME_EXEMPTIONS:
+        row = rows[task_id]
+        dump = schema_dump(row)
+        assert leaks(row, dump) == ["answer-substring"], task_id
+        names = [line.strip().split(":")[0] for line in dump.splitlines() if line.startswith("  ")]
+        assert any(normalise(str(row["answer"])) in normalise(name) for name in names), task_id
+
+
+def test_schema_dump_emits_no_number_of_its_own():
+    """Every number in a prompt is a candidate the grader scores against the gold answer.
+
+    A printed decile fraction, a column count or a non-null count is a lottery ticket: one test
+    task answers 0.827742 and its dump was offering 0.83. The dump therefore describes every
+    count in words. What remains are digits inside column names, which the corpus puts there
+    ("feature1", "Type 2"), and those are the table's own vocabulary rather than the dump's.
+    """
+    offenders = []
+    for r in load_split("test"):
+        for line in schema_dump(r).splitlines():
+            _, sep, body = line.strip().partition(": ")
+            if not sep and not line.startswith("  "):
+                body = line  # a header or a trim marker, which carries no dtype to excuse
+            # The dtype's own width is not a datum: "float64" is the column's type, and its "64"
+            # is part of a type name, not a count the grader should read as a candidate. What is
+            # left is a statistic, and a statistic here is a number that can be graded.
+            if re.search(r"\d", re.sub(r"\b(?:u?int|float)\d+\b", "", body)):
+                offenders.append((r["task_id"], line.strip()))
+    assert offenders == []
 
 
 def test_schema_dump_never_reads_a_cell(row):
@@ -230,16 +296,88 @@ def test_schema_dump_never_reads_a_cell(row):
 
 
 def test_schema_dump_leaks_only_a_bare_category_in_a_column_name():
-    """The single hit the whole-split test tolerates, pinned so it cannot widen.
+    """The religion case, pinned: the categories are column names and nothing else is.
 
-    1 of 250, and it is a column name rather than a cell: see the test above.
+    The task's answer is "Judaism" and the table has judaism_orthodox and judaism_conservative
+    among its columns, so the answer is a substring of the column listing whatever the dump
+    prints. What must not appear is a value, or anything that narrows fourteen religions to
+    one -- so every digit-free line of the dump is a column or a dtype.
     """
     row = next(r for r in load_split("test") if r["task_id"] == "0001_347_1347384_qa_1")
     dump = schema_dump(row)
     assert leaks(row, dump) == ["answer-substring"]
-    # The bare category name, spelled lowercase as the columns spell it, and nowhere else.
     assert dump.count("judaism") == 5
-    assert "0.0." in dump  # the profiles are the only numbers, and all of them are fractions
+    for line in dump.splitlines():
+        # A dtype's width is not a datum, so int64 passes; nothing else may carry a digit.
+        assert not re.search(r"\d", re.sub(r"\b(?:u?int|float)\d+\b", "", line)), line
+
+
+def test_schema_dump_names_a_column_of_every_readable_table_on_ninety_five_percent():
+    """The control has to be a control.
+
+    A dump that says nothing measures nothing: if the agent learns no column names, any score
+    change on L1+schema is noise rather than a skill finding. So over the test split at least
+    95% of tasks must get a dump naming at least one column of every table that can be read.
+
+    This is the test the column cap broke. Passing usecols=range(40) to read_csv raises on any
+    table narrower than 40 columns -- 243 of 250 tasks -- and the except turned that into
+    "(not readable as csv)", so 191 of 250 dumps named no column at all and the median dump was
+    37 characters.
+
+    The tasks that fall short are the ones the character budget cannot fit: a 61-column csv eats
+    the whole allowance, so a task's second and third files are cut off after it. That is the
+    cap doing its job, and 95% is where it is drawn.
+    """
+    covered, thin = 0, []
+    for r in load_split("test"):
+        src = inputs_of("test")(r)
+        named = {line.strip().split(":")[0] for line in schema_dump(r).splitlines()
+                 if line.startswith("  ")}
+        missing = []
+        for name in r["files"][:SCHEMA_DUMP_MAX_FILES]:
+            frames = read_tables(src / name, SCHEMA_DUMP_ROWS)
+            if not frames:  # unreadable files are named as such, which is the contract
+                continue
+            for frame in frames:
+                columns = {str(c) for c in frame.columns[:SCHEMA_DUMP_MAX_COLS]}
+                if not columns & named:
+                    missing.append(name)
+        if missing:
+            thin.append((r["task_id"], missing))
+        else:
+            covered += 1
+    total = len(load_split("test"))
+    assert covered >= 0.95 * total, f"{covered}/{total} describe their tables, thin: {thin}"
+
+
+def test_schema_dump_names_an_unreadable_file_rather_than_dropping_it():
+    """A file the reader cannot open is listed by name with its size.
+
+    Silently continuing past it would tell the agent the table is absent rather than unreadable,
+    and an absent table and an empty one are different problems to solve.
+    """
+    import smol_ladder.ladder as L
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp)
+        (src / "good.csv").write_text("a,b\n1,2\n")
+        # A corrupt parquet, rather than random bytes or a prose file: both of those parse as a
+        # perfectly good one-column table, because the reader is deliberately lenient about a
+        # file with no delimiters. A file whose declared format is not what is inside it is the
+        # case that has to come back empty.
+        (src / "bad.parquet").write_bytes(b"PAR1 not actually a parquet file")
+        row = {"task_id": "x", "question": "q", "files": ["good.csv", "bad.parquet"],
+               "answer": "1"}
+        original = L.inputs_of
+        L.inputs_of = lambda split: (lambda _r: src)
+        try:
+            dump = schema_dump(row)
+        finally:
+            L.inputs_of = original
+    assert "good.csv" in dump and "a: int64" in dump
+    assert "bad.parquet" in dump and "unreadable" in dump
 
 
 def test_schema_dump_stays_within_its_cap(row):

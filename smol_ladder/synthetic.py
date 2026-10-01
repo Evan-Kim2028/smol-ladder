@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from smol_ladder.tasks import DATA, input_dir, load_split
+from smol_ladder.tasks import DATA, input_dir, load_split, read_tables
 
 # A column name that is itself the answer would make the task a lookup, so those are skipped
 # for label answers and never used as the target of an "which X" question.
@@ -254,11 +254,14 @@ def iter_tables(limit_tables: int) -> list[tuple[str, pd.DataFrame]]:
             if key in seen:
                 continue
             seen.add(key)
-            try:
-                sep = "\t" if path.suffix.lower() == ".tsv" else ","
-                out.append((str(path), pd.read_csv(path, sep=sep, nrows=50_000)))
-            except Exception:
+            # The shared reader, not a local read_csv: this loop's own "sep = tab if .tsv else
+            # comma" is what made it miss a semicolon-separated table, and a table it could not
+            # read it skipped silently.
+            frames = read_tables(path, 50_000)
+            if not frames:
                 continue
+            for frame in frames:
+                out.append((str(path), frame))
             if len(out) >= limit_tables:
                 return out
     return out
