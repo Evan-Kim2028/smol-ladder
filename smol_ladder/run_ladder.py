@@ -477,24 +477,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         # smoke run's clean-exit trials were exactly this. A timeout now keeps the agent's own
         # status for the trial but marks the verification separately, so the trial leaves the
         # denominator instead of reading as a 0.
-        verify_status = "exit 0"
-        try:
-            run = _run_jailed(
-                ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
-                 "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
-                 "--bind", str(verify), "/tmp/work",
-                 "--chdir", "/tmp/work", "--die-with-parent",
-                 "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
-                 sys.executable, "solution.py"],
-                verify, {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
-                         "HOME": str(verify), "LANG": "C.UTF-8",
-                         "OMP_NUM_THREADS": "1", "MPLBACKEND": "Agg"}, VERIFY_TIMEOUT)
-            out = run.stdout.decode("utf-8", "replace") if isinstance(run.stdout, bytes) \
-                else (run.stdout or "")
-            if run.returncode != 0:
-                verify_status = f"verify exit {run.returncode}"
-        except subprocess.TimeoutExpired:
-            out, verify_status = "", "verify timeout"
+        verify_status, out = sealed_grading_pass(verify, timeout=VERIFY_TIMEOUT)
         if verify_status != "exit 0":
             result["verify_status"] = verify_status
         lines = [l.strip() for l in out.splitlines() if l.strip()]
@@ -512,6 +495,36 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     if stderr:
         result["stderr"] = stderr
     return result
+
+
+def sealed_grading_pass(verify: Path, timeout: int = VERIFY_TIMEOUT) -> tuple[str, str]:
+    """Run `<verify>/solution.py` in the sealed jail, and return (status, stdout).
+
+    Extracted rather than written twice because reverify.py exists to re-run this exact pass: a
+    second copy of the argv would be free to drift from this one -- a different deadline, a
+    missing thread cap, a different chdir -- and then a "re-verification" would be measuring
+    something other than what the run measured, which is the one error this module cannot make.
+
+    The status is "exit 0" for a clean run, "verify exit N" for a non-zero return, and "verify
+    timeout" for one that outran the deadline. A timeout returns empty stdout, because a program
+    that was killed printed nothing to grade.
+    """
+    try:
+        run = _run_jailed(
+            ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
+             "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
+             "--bind", str(verify), "/tmp/work",
+             "--chdir", "/tmp/work", "--die-with-parent",
+             "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
+             sys.executable, "solution.py"],
+            verify, {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+                     "HOME": str(verify), "LANG": "C.UTF-8",
+                     "OMP_NUM_THREADS": "1", "MPLBACKEND": "Agg"}, timeout)
+        out = run.stdout.decode("utf-8", "replace") if isinstance(run.stdout, bytes) \
+            else (run.stdout or "")
+        return ("exit 0" if run.returncode == 0 else f"verify exit {run.returncode}"), out
+    except subprocess.TimeoutExpired:
+        return "verify timeout", ""
 
 
 def _drop_verify_copy(verify: Path) -> None:

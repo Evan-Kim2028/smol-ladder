@@ -32,7 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -97,6 +97,15 @@ def collect(split: str, tag: str | None = None) -> dict[str, dict[str, list[dict
         if not isinstance(index, int):
             index = int(match.group(1)) if match else 0
         result["_index"] = index
+        # A re-verification lives beside the trial, never inside result.json, so it is read here
+        # and attached for the counting below to prefer. A missing or unreadable file leaves the
+        # trial exactly as recorded.
+        reverified = path.parent / "reverify.json"
+        if reverified.exists():
+            try:
+                result["reverify"] = json.loads(reverified.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
         out.setdefault(task, {}).setdefault(rung_name(directory), []).append(result)
     for rungs in out.values():
         for trials in rungs.values():
@@ -139,8 +148,39 @@ def has_reference_at_launch(record: dict, live: Callable[[str], bool]) -> Callab
     return lambda task: task in allowed
 
 
+def _reverified(result: dict | None) -> dict | None:
+    """The re-verification of a trial whose first offline pass failed, when one succeeded.
+
+    `reverify.json` is written beside the trial, never into it, so `result.json` still says the
+    first pass failed. Reading it here is what lets the recovered trial back into the denominator
+    without rewriting the run: a program the model wrote and the first pass merely failed to
+    grade is a real observation, and dropping it forever is how 90 trials went missing from v2.
+
+    A re-verification that itself failed is ignored, so the trial stays a harness failure: a
+    second timeout is an answer about how slow the program is, not a recovery.
+    """
+    if not result:
+        return None
+    record = result.get("reverify")
+    if not isinstance(record, dict) or record.get("new_verify_status") != "exit 0":
+        return None
+    return record
+
+
+def _effective(result: dict | None) -> dict | None:
+    """The trial's verdict: the re-verification if one succeeded, else the trial as recorded."""
+    reverified = _reverified(result)
+    if reverified is None:
+        return result
+    merged = dict(result)
+    merged["reward"] = reverified.get("reward", 0.0)
+    merged["prediction"] = reverified.get("prediction", "")
+    return merged
+
+
 def _passed(result: dict | None) -> bool:
-    return bool(result) and result.get("reward", 0.0) >= 1.0
+    effective = _effective(result)
+    return bool(effective) and effective.get("reward", 0.0) >= 1.0
 
 
 def _finished(result: dict | None) -> bool:
@@ -152,10 +192,16 @@ def _finished(result: dict | None) -> bool:
     grade. The agent's own exit code says the model loop finished; it says nothing about whether the
     answer exists, and scoring the empty output of an unrunnable program as 0.0 books the harness's
     deadline in the model's pass rate.
+
+    A later successful re-verification makes the trial finished after all: the pass is known to be
+    able to grade this program, and it did. An agent timeout is never rescued this way -- there the
+    model loop itself failed, and no amount of re-running the same program changes that.
     """
     if not result or result.get("agent_status") != "exit 0":
         return False
-    return result.get("verify_status", "exit 0") == "exit 0"
+    if result.get("verify_status", "exit 0") == "exit 0":
+        return True
+    return _reverified(result) is not None
 
 
 def _scored(trials: list[dict]) -> list[dict]:
@@ -291,10 +337,16 @@ def _bootstrap_ci(values: list[float], draws: int = BOOTSTRAP_DRAWS,
     return [float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))]
 
 
-def rung_stats(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
-    """Per rung: mean pass probability over tasks, its bootstrap CI, and the raw counts."""
+def rung_stats(runs: dict[str, dict[str, list[dict]]],
+               rungs: Sequence[str] | None = None) -> dict[str, dict]:
+    """Per rung: mean pass probability over tasks, its bootstrap CI, and the raw counts.
+
+    `runs` is the task set, so passing a subset restricts every rung to it. That is how the
+    common-set table is built: the same measurement, over one population, rather than L1 read on
+    250 tasks and L2 on the 213 that have a reference.
+    """
     out: dict[str, dict] = {}
-    for rung in ALL:
+    for rung in (ALL if rungs is None else rungs):
         fractions: list[float] = []
         trials = scored = harness = 0
         attempted = 0
@@ -474,6 +526,187 @@ def control_block(runs: dict[str, dict[str, list[dict]]],
     return block
 
 
+def reverified_block(runs: dict[str, dict[str, list[dict]]]) -> dict:
+    """How many trials a re-verification recovered, and how many it did not.
+
+    Reported because the pass rates below silently include the recovered trials. Without this
+    number a reader cannot tell a rung measured on more trials from one measured on fewer, and
+    the whole point of re-verifying was to make that difference visible.
+    """
+    recovered = still = attempts = 0
+    for rungs in runs.values():
+        for trials in rungs.values():
+            for trial in trials:
+                record = trial.get("reverify")
+                if not isinstance(record, dict):
+                    continue
+                attempts += 1
+                if _reverified(trial) is not None:
+                    recovered += 1
+                else:
+                    still += 1
+    return {"recovered": recovered, "still_failing": still, "attempts": attempts}
+
+
+# --- the analyses a ladder curve cannot be read off a pass-rate table ----------------------------
+
+def common_set(runs: dict[str, dict[str, list[dict]]], keep: Callable[[str], bool],
+               inside: bool = True) -> dict[str, dict]:
+    """The per-rung table restricted to one task set, so every rung shares a denominator.
+
+    L2-L4 are gated on a verified reference, so they run on 213 of the 250 test tasks while L1
+    runs on all 250. Reading a curve off each rung's own denominator compares two populations, and
+    the difference between them is the reference gate rather than the ladder. The referenced set
+    is the one population every rung was measured on, so it is the only one a curve can be drawn
+    on; `inside=False` reports the 37 tasks outside it, which is the only place the control and
+    L1 have anything to say.
+    """
+    subset = {task: rungs for task, rungs in runs.items() if keep(task) == inside}
+    return rung_stats(subset)
+
+
+def control_effect(runs: dict[str, dict[str, list[dict]]]) -> dict:
+    """L1+schema minus L1, paired per task, with a sign test and a bootstrap CI.
+
+    The control adds no information -- only a schema dump, which is cheaper reading, not a hint.
+    So a gain here is not the ladder working: it is the model getting better at reading a table it
+    could already read, and the number is what tells us how much of any L2 gain is really just
+    that. Paired because both arms ran on the same tasks, and the question is per task.
+
+    A task whose control trials all crashed is dropped from the pair rather than counted as a
+    regression: the harness's failure is not an effect of the schema dump.
+    """
+    deltas: list[float] = []
+    paired = rescued = hurt = unpaired = 0
+    for rungs in runs.values():
+        base = pass_fraction(rungs["L1"]) if "L1" in rungs else None
+        ctrl = pass_fraction(rungs[CONTROL]) if CONTROL in rungs else None
+        if base is None or ctrl is None:
+            unpaired += 1
+            continue
+        paired += 1
+        delta = ctrl - base
+        deltas.append(delta)
+        if delta > 0:
+            rescued += 1
+        elif delta < 0:
+            hurt += 1
+    mean = float(np.mean(deltas)) if deltas else float("nan")
+    return {
+        "paired": paired,
+        "rescued": rescued,
+        "hurt": hurt,
+        "discordant": rescued + hurt,
+        "excluded_unpaired": unpaired,
+        "mean_delta": mean,
+        "ci95": _bootstrap_ci(deltas),
+        "p_value": _sign_test(hurt, rescued),
+    }
+
+
+def consistency(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
+    """Per rung, the share of tasks whose samples of the same cell agree on pass or fail.
+
+    The noise floor. At k=2 two samples either agree or they do not, and a rung whose samples
+    disagree often is a rung whose pass probability carries most of its width in sampling error
+    rather than in the difference between rungs. A task needs two *scored* samples to say
+    anything: one sample cannot agree with itself, and a crashed partner is a harness failure
+    rather than a disagreeing verdict.
+    """
+    out: dict[str, dict] = {}
+    for rung in ALL:
+        agree = disagree = 0
+        for rungs in runs.values():
+            block = _scored(rungs[rung]) if rung in rungs else []
+            if len(block) < 2:
+                continue
+            verdicts = [_passed(t) for t in block]
+            if all(v == verdicts[0] for v in verdicts):
+                agree += 1
+            else:
+                disagree += 1
+        total = agree + disagree
+        out[rung] = {
+            "tasks": total, "agree": agree, "disagree": disagree,
+            "agreement": agree / total if total else float("nan"),
+        }
+    return out
+
+
+def hint_source_split(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
+    """L2-L4 pass probability split by which hand wrote the rung's text.
+
+    A rung's prose is either a validated model hint or, where none was cached, what the AST
+    extractor could say. Those are different instruments: one names the computation in the task's
+    own terms, the other lists operations. A curve that blends them averages over the instrument
+    as well as the rung, so if the AST rungs are weaker the blended number says neither. Results
+    that never recorded a hand -- gen_refs drives once() without the split -- are booked under
+    `none` rather than dropped, so the counts still sum to the rung's task count.
+    """
+    out: dict[str, dict] = {}
+    for rung in CLIMBABLE:
+        groups: dict[str, dict[str, dict[str, list[dict]]]] = {}
+        trials = harness = 0
+        for task, rungs in runs.items():
+            block = rungs.get(rung)
+            if not block:
+                continue
+            source = next((t.get("hint_source") for t in block if t.get("hint_source")), "none")
+            groups.setdefault(source, {})[task] = rungs
+            trials += len(block)
+            harness += sum(not _finished(t) for t in block)
+        out[rung] = {"hands": {source: rung_stats(tasks, rungs=[rung])[rung]
+                               for source, tasks in sorted(groups.items())},
+                     "trials": trials, "harness_failures": harness}
+    return out
+
+
+def ceiling(runs: dict[str, dict[str, list[dict]]]) -> dict:
+    """How many referenced tasks the model already passes at L1 in BOTH samples.
+
+    A task it solves from the question alone has no headroom: L2 cannot improve on a pass, so it
+    contributes a flat 1.0 to every rung and hides whatever the rungs do on the tasks that
+    actually need them. The "failed L1 in at least one sample" count is the population where a
+    hint can show an effect at all, and its size is the first thing to check before reading a
+    curve as evidence about hints.
+
+    A task with a single scored L1 sample is `unmeasured`: it has not been shown to pass reliably,
+    so calling it ceiling would overstate the headroom left.
+    """
+    both = at_least_one = unmeasured = 0
+    for rungs in runs.values():
+        scored = _scored(rungs["L1"]) if "L1" in rungs else []
+        if not scored:
+            continue
+        verdicts = [_passed(t) for t in scored]
+        if len(verdicts) < 2:
+            unmeasured += 1
+        elif all(verdicts):
+            both += 1
+        else:
+            at_least_one += 1
+    headroom = at_least_one / (both + at_least_one) if both + at_least_one else float("nan")
+    return {"passed_l1_both": both, "failed_l1_at_least_once": at_least_one,
+            "unmeasured": unmeasured, "headroom": headroom}
+
+
+def _has_headroom(rungs: dict[str, list[dict]]) -> bool:
+    """Did this task fail L1 in at least one scored sample? Over a task's whole rung dict."""
+    scored = _scored(rungs["L1"]) if "L1" in rungs else []
+    return len(scored) >= 2 and not all(_passed(t) for t in scored)
+
+
+def headroom_curve(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
+    """The rung curve restricted to the tasks that failed L1 in at least one sample.
+
+    This is the only version of the curve on which a hint can move a number. On the full set the
+    tasks the model already solves contribute a constant 1.0 at every rung, so the curve is
+    partly a measure of how many tasks were easy to begin with; here each task started from a
+    failure, and any rise is the ladder working.
+    """
+    return rung_stats({task: rungs for task, rungs in runs.items() if _has_headroom(rungs)})
+
+
 def summarise(split: str, runs: dict[str, dict[str, list[dict]]],
               has_reference: Callable[[str], bool], allow_mixed: bool = False,
               record: dict | None = None) -> dict:
@@ -490,6 +723,14 @@ def summarise(split: str, runs: dict[str, dict[str, list[dict]]],
         "first_passing_rung": hist,
         "control": control_block(runs, has_reference),
         "marginality": marginality(runs),
+        "reverified": reverified_block(runs),
+        "common_set": common_set(runs, has_reference),
+        "outside_common_set": common_set(runs, has_reference, inside=False),
+        "control_effect": control_effect(runs),
+        "consistency": consistency(runs),
+        "hint_source": hint_source_split(runs),
+        "ceiling": ceiling(runs),
+        "headroom_curve": headroom_curve(runs),
     }
 
 
@@ -554,6 +795,84 @@ def _print(report: dict) -> None:
     rate = control["rescued"] / control["attempted"] if control["attempted"] else float("nan")
     print(f"  {'all':<20} {control['rescued']:>3}/{control['attempted']:<3} = {_pct(rate)}"
           f"   (harness failures {control['harness_failures']})")
+
+    effect = report["control_effect"]
+    low, high = effect["ci95"]
+    p = "   n/a" if effect["p_value"] is None else f" p={effect['p_value']:.3g}"
+    print(f"  paired effect     {effect['paired']:>3} paired: {effect['rescued']} rescued, "
+          f"{effect['hurt']} hurt, delta {_pct(effect['mean_delta'])} "
+          f"[{_pct(low)}, {_pct(high)}]{p}")
+
+    reverified = report["reverified"]
+    if reverified["attempts"]:
+        print()
+        print(f"re-verification: {reverified['recovered']} of {reverified['attempts']} trials "
+              f"recovered by a later offline pass, {reverified['still_failing']} still failing")
+
+    common = report["common_set"]
+    outside = report["outside_common_set"]
+    print()
+    print("every rung on the SAME task set (the referenced tasks), so the curve is comparable")
+    for rung in ALL:
+        block = common[rung]
+        if not block["scored_tasks"]:
+            print(f"  {rung:<10} not run on this set")
+            continue
+        low, high = block["ci95"]
+        print(f"  {rung:<10} {_pct(block['mean_pass_probability'])}"
+              f"  [{_pct(low)}, {_pct(high)}]  "
+              f"{block['trials_scored']}/{block['trials']} trials scored, "
+              f"{block['scored_tasks']} tasks, {block['harness_failures']} harness failures")
+    if any(b["scored_tasks"] for b in outside.values()):
+        print()
+        print("the tasks outside that set (no reference, so no rung above L1 was ever run)")
+        for rung in ALL:
+            block = outside[rung]
+            if not block["scored_tasks"]:
+                continue
+            low, high = block["ci95"]
+            print(f"  {rung:<10} {_pct(block['mean_pass_probability'])}"
+                  f"  [{_pct(low)}, {_pct(high)}]  "
+                  f"{block['trials_scored']}/{block['trials']} trials scored, "
+                  f"{block['scored_tasks']} tasks, {block['harness_failures']} harness failures")
+
+    print()
+    print("rerun consistency: share of tasks whose two samples agree on pass or fail")
+    for rung in ALL:
+        block = report["consistency"][rung]
+        if not block["tasks"]:
+            print(f"  {rung:<10} not measured twice")
+            continue
+        print(f"  {rung:<10} {block['agree']:>3}/{block['tasks']:<3} = {_pct(block['agreement'])}"
+              f"   ({block['disagree']} disagreed)")
+
+    print()
+    print("L2-L4 by which hand wrote the rung's text")
+    for rung in CLIMBABLE:
+        block = report["hint_source"][rung]
+        parts = [f"{source} {hand['scored_tasks']} tasks "
+                 f"{_pct(hand['mean_pass_probability'])}"
+                 for source, hand in block["hands"].items()]
+        if parts:
+            print(f"  {rung:<10} " + "; ".join(parts)
+                  + f"   ({block['harness_failures']} harness failures)")
+
+    ceiling = report["ceiling"]
+    headroom = report["headroom_curve"]
+    print()
+    print("ceiling: how many tasks the model already passes at L1, where a hint has no room")
+    print(f"  passed L1 in both samples: {ceiling['passed_l1_both']}; "
+          f"failed in at least one: {ceiling['failed_l1_at_least_once']}; "
+          f"L1 measured once: {ceiling['unmeasured']}")
+    print("  the curve restricted to the tasks that failed L1 in at least one sample:")
+    for rung in ALL:
+        block = headroom[rung]
+        if not block["scored_tasks"]:
+            continue
+        low, high = block["ci95"]
+        print(f"  {rung:<10} {_pct(block['mean_pass_probability'])}"
+              f"  [{_pct(low)}, {_pct(high)}]  {block['scored_tasks']} tasks, "
+              f"{block['harness_failures']} harness failures")
 
 
 def main() -> None:
