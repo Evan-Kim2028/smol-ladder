@@ -15,6 +15,12 @@ task, which is what gives each rung the same denominator.
     uv run python -m smol_ladder.run_ladder --split test --rungs L1 --workers 20
     uv run python -m smol_ladder.run_ladder --split test --workers 20
     uv run python -m smol_ladder.run_ladder --split test --samples 3 --no-climb --workers 20
+    uv run python -m smol_ladder.run_ladder --run-tag v2 --split test --no-climb --workers 32
+
+Results of two different ladder versions must not share a directory, so `--run-tag TAG` gives a
+sweep its own tree: data/runs/TAG/<split>/, summarised to data/runs/TAG/summary_<split>.json, with
+the run's own provenance and counts in data/runs/TAG/RUN.json. No tag is exactly the old tree,
+because the existing results live there and nothing is ever moved.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +100,29 @@ def source_for(split: str):
 
         return load_synthetic(), synthetic_input_dir
     return load_split(split), input_dir
+
+
+def runs_dir(split: str, tag: str | None = None, data: Path | None = None) -> Path:
+    """Where a split's trials live. `data/runs/<split>`, or `data/runs/<tag>/<split>` under a tag.
+
+    The tag exists because two ladder versions used to land in one tree, and the prompt-hash check
+    only refuses to pool them at summary time -- after the second version has been written over the
+    first, and after a resumed sweep has reused the first version's cached result.json as its own.
+    The separation has to be in the path.
+
+    The tag is one path segment and is checked as one. Unchecked, `--run-tag ../v2` is a way to
+    write into another run's tree, and `--run-tag ../../..` is a way out of data/runs entirely.
+
+    `data` is the tree's root, passed rather than read from the module so a caller with its own root
+    (a test, or a summariser pointed somewhere else) gets the same layout and the same validation.
+    """
+    root = (data or DATA) / "runs"
+    if not tag:
+        return root / split
+    if tag in {".", ".."} or "/" in tag or "\\" in tag or tag.startswith("-"):
+        raise ValueError(f"invalid --run-tag {tag!r}: a tag is a single path segment "
+                         f"(letters, digits, dot, dash, underscore)")
+    return root / tag / split
 
 
 def jail(work: Path, inputs: Path, venv: Path, scratch: Path | None = None) -> list[str]:
@@ -555,10 +585,126 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
     return out
 
 
+def _stamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# The keys a launch owns: what code was running, what it was asked to do, and when it started.
+# The top-level copy of each describes the RUN and the first launch wins it, so a relaunch cannot
+# restamp the provenance of the trials already on disk; `launches` keeps one entry per launch.
+_LAUNCH_KEYS = ("git_commit", "git_dirty", "command_line", "start_time", "model", "agent",
+                "rungs", "samples", "climb", "workers", "max_turns", "limit", "split",
+                "run_tag", "tasks_planned")
+# What a launch reports when it ends, so these are not part of the run's lasting shape.
+_COUNT_KEYS = ("tasks", "trials", "skipped", "trials_scored", "passes")
+
+
+def _read_run_record(path: Path) -> dict:
+    """The record as it stands, or an empty one. A corrupt file is not worth crashing a sweep over:
+    the results themselves are on disk and the sweep is resumable, so the cost of losing the record
+    is far lower than the cost of refusing to run."""
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_run_record(path: Path, record: dict) -> dict:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=1))
+    return record
+
+
+def open_run_record(path: Path, header: dict) -> int:
+    """Register this launch in RUN.json and return its index. Called before the first trial.
+
+    A resumed sweep is a second launch of the same run, and the first launch's code and start time
+    are the ones that produced the results already on disk -- so the top-level keys keep the first
+    launch's values, and this launch is appended to `launches` with its own provenance. Written
+    before the sweep rather than after, because a sweep that dies an hour in has to still say which
+    code was running.
+    """
+    existing = _read_run_record(path)
+    launches = list(existing.get("launches") or [])
+    this = dict(header)
+    if launches:
+        # Carry the run's shape forward so a launch entry reads on its own, but never an earlier
+        # launch's provenance: this is a record of what ran now.
+        this = {**{k: v for k, v in header.items() if k not in _LAUNCH_KEYS},
+                **{k: v for k, v in launches[0].items()
+                   if k not in _COUNT_KEYS and k not in {"start_time", "command_line",
+                                                         "git_commit", "git_dirty", "error",
+                                                         "end_time"}},
+                **{k: v for k, v in header.items() if k in _LAUNCH_KEYS}}
+    launches.append(this)
+    record = {k: v for k, v in existing.items() if k != "launches"}
+    for key in _LAUNCH_KEYS:
+        record.setdefault(key, header.get(key))
+    record = {k: v for k, v in record.items() if v is not None}
+    record["launches"] = launches
+    record.pop("end_time", None)
+    record.pop("error", None)
+    _save_run_record(path, record)
+    return len(launches) - 1
+
+
+def close_run_record(path: Path, index: int, counts: dict, error: str | None = None) -> dict:
+    """Fill in one launch's counts and end time. Always called, including on the way out of a crash.
+
+    `end_time` is set even for a failed launch: a sweep that stopped without one cannot say when it
+    stopped, and that is the first question anyone asks of a partial tree.
+    """
+    record = _read_run_record(path)
+    launches = list(record.get("launches") or [])
+    if 0 <= index < len(launches):
+        launches[index].update(counts)
+        if error is not None:
+            launches[index]["error"] = error
+    record["launches"] = launches
+    record.update(counts)
+    record["end_time"] = _stamp()
+    if error is not None:
+        record["error"] = error
+    else:
+        record.pop("error", None)
+    return _save_run_record(path, record)
+
+
+def reference_state(rows: list[dict], split: str, rungs: list[str]) -> dict:
+    """Which tasks could run a rung that needs a reference, as of this launch.
+
+    L2-L4 are gated on a verified reference, and references arrive while a sweep runs -- a retry
+    sweep is building them concurrently with this one. So the set of tasks that could attempt L2 is
+    not a property of the run, it is a property of when the run started, and reading it back off
+    disk at summary time silently moves the denominator: a task that had no reference when L2 was
+    skipped would later count as one that was never scored, and the rung's pass rate would be read
+    against the wrong population.
+
+    So the ids are recorded here, at launch, and the summary's "not climbable" bucket is pinned to
+    this list rather than to whatever read_source says today.
+    """
+    needed = any(r.replace("_schema", "+schema") in {"L2", "L3", "L4"} for r in rungs)
+    if not needed:
+        return {}
+    with_ref = sorted(row["task_id"] for row in rows if read_source(row, split) is not None)
+    return {"reference_task_ids_at_launch": with_ref,
+            "reference_tasks_at_launch": len(with_ref),
+            "tasks_at_launch": len(rows)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
                     choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
+    ap.add_argument("--run-tag", default=None,
+                    help="keep this run's results to themselves: trials go to "
+                         "data/runs/<tag>/<split>/ and the summary to "
+                         "data/runs/<tag>/summary_<split>.json. Without a tag the legacy "
+                         "data/runs/<split>/ tree is used and nothing moves. Use it whenever the "
+                         "ladder text has changed: two ladder versions in one tree are pooled or "
+                         "worse.")
     ap.add_argument("--rungs", default="L1", help="comma-separated, e.g. L1,L1+schema,L2,L3,L4")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--workers", type=int, default=20)
@@ -587,23 +733,59 @@ def main() -> None:
     rows = rows[: args.limit]
     rungs = args.rungs.split(",")
     venv = Path(sys.prefix)
-    (DATA / "runs" / args.split).mkdir(parents=True, exist_ok=True)
+    try:
+        root = runs_dir(args.split, args.run_tag)
+    except ValueError as e:
+        ap.error(str(e))
+    root.mkdir(parents=True, exist_ok=True)
+    # RUN.json is written before the first trial, not after: a sweep that dies an hour in has to
+    # still say which code was running and what it was asked to do. It is only written for a
+    # tagged run -- the legacy tree is shared by every run that ever used it, so one launch's
+    # provenance stamped there would be a lie about who owns the directory.
+    run_record = (root.parent / "RUN.json") if args.run_tag else None
+    header = {
+        "run_tag": args.run_tag, "split": args.split, "model": args.model, "agent": args.agent,
+        "rungs": rungs, "samples": args.samples, "climb": bool(args.climb),
+        "workers": args.workers, "max_turns": args.max_turns, "limit": args.limit,
+        "tasks_planned": len(rows),
+        "command_line": [sys.executable, "-m", "smol_ladder.run_ladder", *sys.argv[1:]],
+        "start_time": _stamp(), **git_provenance(),
+        **reference_state(rows, args.split, rungs),
+    }
+    if run_record is not None:
+        launch = open_run_record(run_record, header)
     print(f"{len(rows)} tasks x {len(rungs)} rungs x {args.samples} samples"
-          f"{'' if args.climb else ', no climb'}; code {git_provenance()['git_commit'][:8]}")
+          f"{'' if args.climb else ', no climb'}; code {git_provenance()['git_commit'][:8]}"
+          f"; results under {root}")
     done = 0
-    with ThreadPoolExecutor(args.workers) as pool:
-        futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
-                               args.max_turns, args.retry_failed, inputs_of,
-                               None, args.samples, args.climb, args.agent) for row in rows]
-        for f in as_completed(futures):
-            done += 1
-            for r in f.result():
-                if r.get("skipped"):
-                    continue
-                print(f"[{done}/{len(rows)}] {r['task_id']} {r['rung']} "
-                      f"s{r.get('sample', 0)} "
-                      f"reward={r['reward']} pred={r.get('prediction','')[:40]!r} "
-                      f"{r.get('agent_status','')}", flush=True)
+    counts = {"tasks": 0, "trials": 0, "skipped": 0, "trials_scored": 0, "passes": 0}
+    try:
+        with ThreadPoolExecutor(args.workers) as pool:
+            futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
+                                   args.max_turns, args.retry_failed, inputs_of,
+                                   root, args.samples, args.climb, args.agent) for row in rows]
+            for f in as_completed(futures):
+                done += 1
+                for r in f.result():
+                    if r.get("skipped"):
+                        # Not attempted, so not a trial: a rung the task could not run is in
+                        # neither the numerator nor the denominator of anything measured here.
+                        counts["skipped"] += 1
+                        continue
+                    counts["trials"] += 1
+                    counts["trials_scored"] += r.get("agent_status") == "exit 0"
+                    counts["passes"] += r.get("reward", 0.0) >= 1.0
+                    print(f"[{done}/{len(rows)}] {r['task_id']} {r['rung']} "
+                          f"s{r.get('sample', 0)} "
+                          f"reward={r['reward']} pred={r.get('prediction','')[:40]!r} "
+                          f"{r.get('agent_status','')}", flush=True)
+    except BaseException as e:  # noqa: BLE001 - the record is what has to survive the crash
+        if run_record is not None:
+            close_run_record(run_record, launch, {**counts, "tasks": done},
+                             error=f"{type(e).__name__}: {e}")
+        raise
+    if run_record is not None:
+        close_run_record(run_record, launch, {**counts, "tasks": done})
     print(f"done: {done} tasks x {len(rungs)} rungs x {args.samples} samples")
 
 

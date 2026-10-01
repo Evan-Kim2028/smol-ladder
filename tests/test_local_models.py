@@ -26,8 +26,9 @@ from smol_ladder.upstream import (BASH_TOOL, PROGRAM_SYSTEM, extract_code, local
 class Stub:
     """An OpenAI-compatible chat/completions endpoint that replies from a script."""
 
-    def __init__(self, replies):
+    def __init__(self, replies, error_aware=False):
         self.replies = list(replies)
+        self.error_aware = error_aware
         self.requests: list[dict] = []
         self.headers: list[dict] = []
         outer = self
@@ -44,8 +45,11 @@ class Stub:
                 outer.headers.append({k.lower(): v for k, v in self.headers.items()})
                 reply = outer.replies.pop(0) if outer.replies else {
                     "choices": [{"message": {"content": ""}}]}
+                status = 200
+                if outer.error_aware and isinstance(reply, tuple):
+                    status, reply = reply
                 body = json.dumps(reply).encode()
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -61,6 +65,16 @@ class Stub:
     def __exit__(self, *_exc):
         self.server.shutdown()
         self.server.server_close()
+
+
+def flaky_stub(replies):
+    """A stub whose replies may be an error: `(status, body)` replies an HTTP status and a body.
+
+    The free OpenRouter endpoint fails in two shapes that both have to be retried rather than
+    booked as a model failure: a 429, and an HTTP 200 whose body carries no "choices" (a routed
+    provider's error or a rate limit surfaced as JSON). Neither says anything about the model.
+    """
+    return Stub(replies, error_aware=True)
 
 
 def assistant(content="", calls=None):
@@ -434,3 +448,86 @@ def test_a_program_that_reads_a_bare_filename_still_finds_its_table(tmp_path, mo
 def runner_bash_prompt() -> str:
     from smol_ladder.upstream import bash_prompt
     return bash_prompt("Q?", ["t.csv"])[1]["content"]
+
+
+# ── the endpoint's transient failures ─────────────────────────────────────────
+
+def call_with_retries(monkeypatch, stub, model="m"):
+    """call_model() against the stub, with the backoff collapsed to nothing.
+
+    The backoff is not the thing under test and costs 5s+ per attempt if it is left real, so it is
+    stubbed; the number of attempts, and what is retried, are.
+    """
+    from smol_ladder.or_agent import call_model, endpoint
+    monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+    monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr("smol_ladder.or_agent.time.sleep", lambda _s: None)
+    return call_model([{"role": "user", "content": "Q?"}], model, None, endpoint())
+
+
+def test_a_429_is_retried_rather_than_recorded_as_a_model_failure(monkeypatch):
+    """The free endpoint rate-limits under a parallel sweep, and a 429 says nothing about the model.
+
+    Booking it as a failure would put the sweep's own concurrency into the pass rate, and the trial
+    would then be unrecoverable: once() reuses a cached result.json, so a 429 written to disk
+    survives every rerun that is not passed --retry-failed.
+    """
+    with flaky_stub([(429, {"error": {"message": "rate limited"}}),
+                     (429, {"error": {"message": "rate limited"}}),
+                     assistant("42")]) as stub:
+        reply = call_with_retries(monkeypatch, stub)
+
+    assert reply["choices"][0]["message"]["content"] == "42"
+    assert len(stub.requests) == 3, "the 429s were not retried"
+
+
+def test_a_200_with_no_choices_is_retried(monkeypatch):
+    """The same endpoint intermittently answers 200 with a body that carries no "choices" at all --
+    a routed provider's error, or a rate limit surfaced as JSON. A 200 status is not a completion,
+    and taking the empty body for one loses a whole trial to a transient."""
+    with flaky_stub([{"id": "gen-1", "error": {"message": "No endpoints available"}},
+                     {"id": "gen-2", "choices": []},
+                     assistant("42")]) as stub:
+        reply = call_with_retries(monkeypatch, stub)
+
+    assert reply["choices"][0]["message"]["content"] == "42"
+    assert len(stub.requests) == 3, "an empty-choices 200 was treated as a completion"
+
+
+def test_a_transient_burst_still_leaves_a_working_completion(monkeypatch):
+    """The realistic shape under load: a few failures of each kind, then a real answer. This is the
+    sequence a parallel sweep has to survive without any trial being booked as a model failure."""
+    replies = [(429, {"error": "slow down"}),
+               {"error": "no provider"},
+               (503, {"error": "unavailable"}),
+               {"choices": []},
+               assistant("7")]
+    with flaky_stub(replies) as stub:
+        reply = call_with_retries(monkeypatch, stub)
+
+    assert reply["choices"][0]["message"]["content"] == "7"
+    assert len(stub.requests) == 5
+
+
+def test_an_endpoint_that_never_answers_fails_the_trial_rather_than_hanging(monkeypatch):
+    """After the retries are spent the call has to raise. A solve_loop that simply returned would
+    look like a clean exit-0 trial with an empty prediction -- a model failure that was the
+    endpoint's, scored into the pass rate."""
+    with flaky_stub([(429, {"error": "rate limited"})] * 8) as stub:
+        with pytest.raises(RuntimeError, match="no completion"):
+            call_with_retries(monkeypatch, stub)
+
+    assert len(stub.requests) == 5, "the retry budget is not 5 attempts"
+
+
+def test_the_retry_budget_is_spent_and_the_error_says_why(monkeypatch):
+    """The message has to name the endpoint and the last failure: a bare "gave no completion" in a
+    32-worker log is 32 identical lines and no diagnosis at all."""
+    with flaky_stub([(429, {"error": {"message": "rate limited"}})] * 8) as stub:
+        with pytest.raises(RuntimeError) as caught:
+            call_with_retries(monkeypatch, stub)
+
+    message = str(caught.value)
+    assert "429" in message, message
+    assert stub.base_url in message, message

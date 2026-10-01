@@ -73,15 +73,21 @@ def rung_name(directory: str) -> str:
     return directory
 
 
-def collect(split: str) -> dict[str, dict[str, list[dict]]]:
+def collect(split: str, tag: str | None = None) -> dict[str, dict[str, list[dict]]]:
     """task_id -> rung -> [result, ...], one entry per sample, sample 0 first.
 
     The unsuffixed <task>/<rung>/result.json is sample 0 and <task>/<rung>/s<k>/result.json is
     sample k, so a tree written before --samples existed reads as k=1 with no migration.
+
+    `tag` reads one run's own tree (data/runs/<tag>/<split>) instead of the legacy shared one, so a
+    summary can never average two ladder versions even if --allow-mixed was forgotten.
     """
+    from smol_ladder.run_ladder import runs_dir
+
+    root = runs_dir(split, tag, data=DATA)
     out: dict[str, dict[str, list[dict]]] = {}
-    for path in (DATA / "runs" / split).glob("*/*/**/result.json"):
-        parts = path.parent.relative_to(DATA / "runs" / split).parts
+    for path in root.glob("*/*/**/result.json"):
+        parts = path.parent.relative_to(root).parts
         task, directory = parts[0], parts[1]
         result = json.loads(path.read_text())
         # The recorded index wins over the directory name; the name is only the fallback for
@@ -96,6 +102,41 @@ def collect(split: str) -> dict[str, dict[str, list[dict]]]:
         for trials in rungs.values():
             trials.sort(key=lambda r: r["_index"])
     return out
+
+
+def summary_path(split: str, tag: str | None = None) -> Path:
+    """Where the report is written: beside the run it describes, inside the tag's own directory."""
+    return DATA / "runs" / tag / f"summary_{split}.json" if tag \
+        else DATA / "runs" / f"summary_{split}.json"
+
+
+def read_run_record(tag: str | None) -> dict:
+    """The RUN.json a tagged run wrote, or an empty record. Never raises on a missing or bad file."""
+    if not tag:
+        return {}
+    path = DATA / "runs" / tag / "RUN.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def has_reference_at_launch(record: dict, live: Callable[[str], bool]) -> Callable[[str], bool]:
+    """Did this task have a verified reference when the run started? Prefers the launch record.
+
+    The `not climbable (no reference)` bucket is only true of the population the run was actually
+    given. A task whose L2 was skipped because it had no reference then would, once a concurrent
+    retry sweep lands one, be re-read as climbable and booked `not attempted` instead -- so the
+    ladder's L2 pass rate would be read against a denominator that includes tasks the reference gate
+    excluded. RUN.json fixes the set at launch; `live` is only the fallback for a run with no record.
+    """
+    ids = record.get("reference_task_ids_at_launch")
+    if not isinstance(ids, list):
+        return live
+    allowed = set(ids)
+    return lambda task: task in allowed
 
 
 def _passed(result: dict | None) -> bool:
@@ -436,6 +477,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
                     choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
+    ap.add_argument("--run-tag", default=None,
+                    help="summarise one run's own tree, data/runs/<tag>/<split>, and write the "
+                         "report to data/runs/<tag>/summary_<split>.json. Omit it for the legacy "
+                         "data/runs/<split>/ tree.")
     ap.add_argument("--out", type=Path, help="where to write the JSON report")
     ap.add_argument("--allow-mixed", action="store_true",
                     help="pool results in one rung that have different prompt hashes, and record "
@@ -443,21 +488,31 @@ def main() -> None:
     args = ap.parse_args()
 
     rows, has_reference = _rows_for(args.split)
-    runs = collect(args.split)
-    n_ref = sum(has_reference(row["task_id"]) for row in rows)
+    runs = collect(args.split, args.run_tag)
+    record = read_run_record(args.run_tag)
+    # Pinned to the launch when RUN.json has it, so a reference that landed mid-run cannot move the
+    # `not climbable` denominator out from under the numbers computed above it.
+    reference_at_launch = has_reference_at_launch(record, has_reference)
+    n_ref = sum(reference_at_launch(row["task_id"]) for row in rows)
     total = len(rows)
+    pinned = record.get("reference_tasks_at_launch")
     print(f"split={args.split}  tasks in the source={total}  "
-          f"with verified reference={n_ref} ({n_ref/total:.0%})")
+          f"with verified reference={n_ref} ({n_ref/total:.0%})"
+          f"{f'  [pinned at launch: {pinned}]' if pinned is not None else ''}"
+          f"{f'  run tag={args.run_tag}' if args.run_tag else ''}")
 
     try:
-        report = summarise(args.split, runs, has_reference, args.allow_mixed)
+        report = summarise(args.split, runs, reference_at_launch, args.allow_mixed)
     except MixedPrompts as e:
         raise SystemExit(f"refusing to pool results from different prompts: {e}")
     report["source_tasks"] = total
     report["with_reference"] = n_ref
+    report["reference_pinned_at_launch"] = pinned is not None
+    report["run_tag"] = args.run_tag
     _print(report)
 
-    dest = args.out or DATA / "runs" / f"summary_{args.split}.json"
+    dest = args.out or summary_path(args.split, args.run_tag)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(report, indent=1))
     print(f"\nwrote {dest}")
     missing = {r["task_id"] for r in rows} - set(runs)

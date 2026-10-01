@@ -50,10 +50,17 @@ def regrade_prediction(row: dict, prediction: str) -> tuple[float, float]:
     return grade(row, prediction), grade(row, strip_prefix(prediction))
 
 
-def collect(split: str) -> dict[str, dict[str, dict]]:
-    """task_id -> rung dir -> stored result, read off disk and left exactly as found."""
+def collect(split: str, tag: str | None = None) -> dict[str, dict[str, dict]]:
+    """task_id -> rung dir -> stored result, read off disk and left exactly as found.
+
+    `tag` reads one run's own tree (data/runs/<tag>/<split>) rather than the legacy shared one, so
+    a regrade of one ladder version cannot include another's results.
+    """
+    from smol_ladder.run_ladder import runs_dir
+
+    root = runs_dir(split, tag, data=DATA)
     out: dict[str, dict[str, dict]] = {}
-    for path in (DATA / "runs" / split).glob("*/*/result.json"):
+    for path in root.glob("*/*/result.json"):
         out.setdefault(path.parent.parent.name, {})[path.parent.name] = json.loads(path.read_text())
     return out
 
@@ -134,12 +141,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
                     choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
+    ap.add_argument("--run-tag", default=None,
+                    help="regrade one run's own tree, data/runs/<tag>/<split>. Omit it for the "
+                         "legacy data/runs/<split>/ tree.")
     ap.add_argument("--flips", action="store_true", help="list every flipping task, not the first 10")
     args = ap.parse_args()
 
     source, _ = source_for(args.split)
     rows = {r["task_id"]: r for r in source}
-    _print(args.split, report(collect(args.split), rows), args.flips)
+    _print(args.split, report(collect(args.split, args.run_tag), rows), args.flips)
 
 
 if __name__ == "__main__":
