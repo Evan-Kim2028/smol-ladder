@@ -744,6 +744,20 @@ def open_run_record(path: Path, header: dict) -> int:
     for key in _LAUNCH_KEYS:
         record.setdefault(key, header.get(key))
     record = {k: v for k, v in record.items() if v is not None}
+    # The reference set is the one key that does NOT belong to the first launch. It is the
+    # denominator of the whole tree, not of a launch: a task may attempt L2 if ANY launch had a
+    # reference for it, and references only ever accumulate, so the union over launches is exactly
+    # "the tasks this tree could ever have run L2 on". Taking the first launch's set instead -- a
+    # 6-task smoke before a 250-task full run -- would pin the summary to five tasks and report
+    # every other climbable task as never attempted.
+    ids = record.get("reference_task_ids_at_launch")
+    here = header.get("reference_task_ids_at_launch")
+    if isinstance(here, list):
+        merged = sorted(set(ids if isinstance(ids, list) else []) | set(here))
+        record["reference_task_ids_at_launch"] = merged
+        record["reference_tasks_at_launch"] = len(merged)
+        record["tasks_at_launch"] = max(record.get("tasks_at_launch") or 0,
+                                        header.get("tasks_at_launch") or 0)
     record["launches"] = launches
     record.pop("end_time", None)
     record.pop("error", None)

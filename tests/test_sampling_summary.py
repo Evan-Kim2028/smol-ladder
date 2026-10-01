@@ -276,6 +276,16 @@ def test_results_with_no_prompt_hash_are_never_pooled_with_hashed_ones():
         S.summarise("test", runs, lambda _t: True)
 
 
+def test_a_whole_run_of_distinct_tasks_is_accepted():
+    """The regression in one assertion: 20 real tasks, each measured on its own prompt, all of
+    which the old check refused to report."""
+    runs = tree(**{f"t{i}": {"L1": [trial(i % 2, hash_=f"{i:064x}"),
+                                    trial(i % 2, hash_=f"{i:064x}")]} for i in range(20)})
+    report = S.summarise("test", runs, lambda _t: True)
+    assert report["mixed_prompts"] == {}
+    assert report["rungs"]["L1"]["tasks"] == 20
+
+
 def test_one_consistent_hash_across_a_rung_is_fine():
     runs = tree(**{f"t{i}": {"L1": [trial(i % 2)]} for i in range(10)})
     assert S.summarise("test", runs, lambda _t: True)["mixed_prompts"] == {}

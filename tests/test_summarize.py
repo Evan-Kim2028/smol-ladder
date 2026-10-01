@@ -216,6 +216,54 @@ def test_results_written_before_this_marker_still_read_as_clean():
     assert S._finished(trial(0.0)) is True
 
 
+# --- the prompt-hash check -----------------------------------------------------------------
+
+def test_a_whole_consistent_run_is_not_refused_for_having_different_tasks():
+    """The bug the v2 run's summary hit: the check pooled every task's L1 hash into one set.
+
+    Each task has its own question, so its prompt is its own and its hash necessarily differs from
+    its neighbour's. A 250-task run therefore presented 250 "different prompts" at L1 and the
+    summary refused to report a tree in which all 1139 (task, rung) groups hold exactly one hash.
+    """
+    runs = {f"t{i}": {"L1": [trial(0.0, hash_=f"hash{i}")],
+                      "L2": [trial(0.0, hash_=f"l2{i}")]} for i in range(5)}
+
+    assert S.check_prompts(runs) == {}, "a run where every task is internally consistent was refused"
+
+
+def test_two_ladder_versions_of_the_same_task_are_still_refused():
+    """The check has to keep its teeth: only a task's OWN samples can be two versions of one
+    measurement, so the comparison is per (task, rung) and a disagreement there is still fatal."""
+    runs = {"t1": {"L1": [trial(0.0, hash_="aaa"), trial(0.0, hash_="bbb")]}}
+
+    with pytest.raises(S.MixedPrompts, match="t1 at rung L1"):
+        S.check_prompts(runs)
+
+
+def test_a_resumed_rung_written_by_different_code_is_refused():
+    """The case the check exists for: sample 0 from the old ladder text, sample 1 from the new."""
+    runs = {"t1": {"L1": [trial(0.0, hash_="old")], "L2": [trial(0.0, hash_="old"),
+                                                          trial(0.0, hash_="new")]}}
+    with pytest.raises(S.MixedPrompts, match="t1 at rung L2"):
+        S.check_prompts(runs)
+
+
+def test_allow_mixed_records_which_task_and_rung_were_pooled():
+    runs = {"t1": {"L1": [trial(0.0, hash_="aaa"), trial(0.0, hash_="bbb")],
+                   "L2": [trial(0.0, hash_="same")]}}
+
+    mixed = S.check_prompts(runs, allow_mixed=True)
+
+    assert mixed == {"t1/L1": ["aaa", "bbb"]}, mixed
+    assert "L2" not in mixed["t1/L1"]
+
+
+def test_an_unrecorded_hash_still_does_not_match_a_recorded_one():
+    runs = {"t1": {"L1": [trial(0.0, hash_="aaa"), trial(0.0)]}}
+    with pytest.raises(S.MixedPrompts, match="<unrecorded>"):
+        S.check_prompts(runs)
+
+
 def test_a_pass_needs_reward_one():
     assert S.first_passing_rung({"L1": [trial(1.0)]}, has_reference=True) == "L1"
     assert S.first_passing_rung({"L1": [trial(0.999)]}, has_reference=True) == "never"

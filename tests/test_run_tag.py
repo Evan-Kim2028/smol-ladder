@@ -364,6 +364,67 @@ def test_the_summary_pins_the_not_climbable_bucket_to_the_launch(monkeypatch):
     assert has_ref["t1"] is True, "the test no longer reproduces the moving denominator"
 
 
+def test_the_pinned_reference_set_covers_every_launch(monkeypatch, tmp_path):
+    """A smoke run is usually the first launch and a full run the second, and the smoke's six
+    tasks are a subset of the full run's 250.
+
+    Keeping the FIRST launch's reference set -- which is right for provenance, where the earliest
+    code really did produce the earliest trials -- would pin the summary to those six tasks and
+    report the other 244 climbable tasks as never attempted, when all of them were in fact run at
+    L2. The reference set is a property of the tree, not of a launch: a task could attempt L2 if
+    any launch had its reference, and references only accumulate.
+    """
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(runner, "DATA", tmp_path)
+    ids = {"t0", "t1"}
+    monkey.setattr(runner, "read_source", lambda row, split: "REF" if row["task_id"] in ids else None)
+    monkey.setattr(runner, "git_provenance", lambda: {"git_commit": "abc", "git_dirty": False})
+    rows = [f"t{i}" for i in range(4)]
+    rows[3] = "t3"
+
+    def run_for(selected, limit=None):
+        keep = set(selected)
+        monkey.setattr(runner, "source_for", lambda split: (
+            [{"task_id": t} for t in (rows[:limit] if limit else rows) if t in keep],
+            lambda r: tmp_path / "in"))
+        monkey.setattr(runner, "task_trials", lambda row, split, rungs, *a, **k: [
+            {"task_id": row["task_id"], "rung": "L1", "sample": 0, "reward": 0.0,
+             "agent_status": "exit 0", "prediction": ""}])
+        monkey.setattr(sys, "argv", ["run_ladder", "--run-tag", "v2", "--split", "test",
+                                     "--rungs", "L1,L2", "--limit", str(limit or 4)])
+        runner.main()
+
+    try:
+        run_for(["t0", "t1"], limit=2)          # the smoke
+        run_for(rows)                           # the full run
+        record = json.loads((tmp_path / "runs" / "v2" / "RUN.json").read_text())
+    finally:
+        monkey.undo()
+
+    assert len(record["launches"]) == 2
+    # each launch keeps its own scope
+    assert record["launches"][0]["reference_task_ids_at_launch"] == ["t0", "t1"]
+    assert record["launches"][0]["tasks_at_launch"] == 2
+    # and the tree-level set is the union, which is what the summary is pinned to
+    assert record["reference_task_ids_at_launch"] == ["t0", "t1"]
+    assert record["reference_tasks_at_launch"] == 2
+    assert record["tasks_at_launch"] == 4, "the tree holds four tasks even though the smoke saw two"
+
+
+def test_a_reference_pinned_by_an_earlier_launch_still_counts_after_a_wider_one(monkeypatch, tmp_path):
+    """The union has to keep a task the early launch saw, in case that launch's trials are the
+    only ones that ran it -- union the wrong way round and a real L2 population shrinks."""
+    path = tmp_path / "runs" / "v2" / "RUN.json"
+    runner.open_run_record(path, {"run_tag": "v2", "reference_task_ids_at_launch": ["t0", "t9"],
+                                  "reference_tasks_at_launch": 2, "tasks_at_launch": 2})
+    runner.open_run_record(path, {"run_tag": "v2", "reference_task_ids_at_launch": ["t1"],
+                                  "reference_tasks_at_launch": 1, "tasks_at_launch": 3})
+    record = json.loads(path.read_text())
+    assert record["reference_task_ids_at_launch"] == ["t0", "t1", "t9"]
+    assert record["reference_tasks_at_launch"] == 3
+    assert record["tasks_at_launch"] == 3
+
+
 def _fake_once(ran: list):
     def once(row, prompt, work, venv, model, max_turns, retry_failed=False, inputs_of=None,
              rung_label="run", provenance=None, was_run=None, agent="tools",
