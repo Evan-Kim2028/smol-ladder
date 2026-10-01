@@ -1,5 +1,8 @@
 .env
 .venv/
-data/
 __pycache__/
-logs/
+# Anchored, no trailing slash: a trailing slash matches a directory only, so the
+# `data` symlink that worktrees use to reach the shared results tree showed up
+# untracked in every one of them.
+/data
+/logs
