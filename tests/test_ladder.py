@@ -1,7 +1,7 @@
 import ast
 
-from smol_ladder.ladder import (code_facts, leaks, method_hint, normalise, prompt_for,
-                                redact_literals, schema_dump, strip_output)
+from smol_ladder.ladder import (SCHEMA_DUMP_CHARS, code_facts, leaks, method_hint, normalise,
+                                prompt_for, redact_literals, schema_dump, strip_output)
 from smol_ladder.tasks import input_dir, load_split
 
 
@@ -184,6 +184,66 @@ def test_a_bound_literal_nothing_compares_against_is_not_a_column():
 def test_schema_dump_is_deterministic():
     row = load_split("test")[0]
     assert schema_dump(row) == schema_dump(row)
+
+
+def test_schema_dump_carries_no_cell_value(row):
+    """A control that prints sample rows names the answer for any "which value" question.
+
+    The gold answer here is 3.5, the mean of the three col_a values the dump used to print
+    verbatim, and 3.5 is also what a bare column listing of the same file would show if the
+    dump regressed to values.
+    """
+    assert "3.5" not in schema_dump(row)
+
+
+def test_schema_dump_is_answer_free_on_every_test_task():
+    """The whole test split, checked with the dataset's own grader.
+
+    30 of 250 dumps used to grade 1.0 against their gold answer. A whole-split test, rather
+    than the one spot check in test_leaks_ignores_an_answer_the_question_already_states, is
+    what keeps the control's one guarantee measured.
+
+    One task is exempt, and the exemption is named rather than filtered: its table has a
+    column called for the category its question asks about, so "Judaism" is a substring of the
+    column listing whatever the dump prints. schema_dump never reads a cell, so the dump adds
+    the shape of the candidate set and nothing that picks the winner out of it, and no
+    summary statistic can narrow fourteen religions to one;
+    test_schema_dump_leaks_only_a_bare_category_in_a_column_name pins that reading.
+    """
+    leaking = []
+    for r in load_split("test"):
+        if r["task_id"] == "0001_347_1347384_qa_1":
+            continue
+        if leaks(r, schema_dump(r)):
+            leaking.append(r["task_id"])
+    assert leaking == []
+
+
+def test_schema_dump_never_reads_a_cell(row):
+    """The property the guarantee rests on, and the one the old dump broke.
+
+    An answer-independent dump is a function of the tables. The row fixture drops the answer
+    key as well as its value, so a schema_dump that read row["answer"] to redact a cell, as
+    the old one did, raises here rather than passing quietly.
+    """
+    assert schema_dump({k: v for k, v in row.items() if k != "answer"}) == schema_dump(row)
+
+
+def test_schema_dump_leaks_only_a_bare_category_in_a_column_name():
+    """The single hit the whole-split test tolerates, pinned so it cannot widen.
+
+    1 of 250, and it is a column name rather than a cell: see the test above.
+    """
+    row = next(r for r in load_split("test") if r["task_id"] == "0001_347_1347384_qa_1")
+    dump = schema_dump(row)
+    assert leaks(row, dump) == ["answer-substring"]
+    # The bare category name, spelled lowercase as the columns spell it, and nowhere else.
+    assert dump.count("judaism") == 5
+    assert "0.0." in dump  # the profiles are the only numbers, and all of them are fractions
+
+
+def test_schema_dump_stays_within_its_cap(row):
+    assert len(schema_dump(row)) <= SCHEMA_DUMP_CHARS
 
 
 def test_sandbox_reads_input_offline():
