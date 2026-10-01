@@ -129,8 +129,15 @@ def split_train_val(rows: list[dict], val_fraction: float, seed: int) -> tuple[l
 
 
 def report(name: str, kept: list[dict], dropped: dict, out: Path | None,
-           val_fraction: float, seed: int) -> dict:
-    """Write the split and print the counts. Returns the record for the caller's own summary."""
+           val_fraction: float, seed: int, extra: dict | None = None) -> dict:
+    """Write the split and print the counts. Returns the record for the caller's own summary.
+
+    `extra` carries whatever the source knows that the caller cannot see from the rows -- for
+    traces, how many rows came from a real conversation and how many from the contract fallback.
+    Both are `messages` + `tools` rows and TRL cannot tell them apart, so a dataset that is mostly
+    invented exploration would train fine and be reported as ours. The numbers are in the record
+    rather than only on the console because the record is what a run gets quoted from.
+    """
     if out is not None:
         train_rows, val_rows = split_train_val(kept, val_fraction, seed)
         write_jsonl(train_rows, out / "train.jsonl")
@@ -146,6 +153,8 @@ def report(name: str, kept: list[dict], dropped: dict, out: Path | None,
     record = {"source": name, "kept": len(kept), "dropped_by_column": dropped,
               "dropped_total": sum(dropped.values()), "written": counts,
               "out": str(out) if out else None}
+    if extra:
+        record.update(extra)
     print(json.dumps(record, indent=1))
     return record
 
@@ -189,11 +198,18 @@ def main() -> None:
                   f"dataset ({len(rows) - resolved} unresolved)")
             rows = [{**r, "bucket_prefix": table_of.get(r["task_id"])} for r in rows]
         kept, dropped = export_upstream(rows, keys, args.limit)
+        extra = None
     elif args.source == "traces":
-        kept, dropped = export_traces(DATA, args.limit, keys)
+        # The traces exporter returns a report rather than a bare drop count, so the record can
+        # say how many rows are real trajectories and how many are the contract fallback. Both
+        # are `messages` + `tools` rows, so nothing downstream can tell them apart.
+        kept, report_fields = export_traces(DATA, args.limit, keys)
+        dropped = report_fields["dropped"]
+        extra = {k: v for k, v in report_fields.items() if k != "dropped"}
     else:
         kept, dropped = export_rungs(args.rung, DATA, args.limit, keys)
-    report(args.source, kept, dropped, args.out, args.val_fraction, args.seed)
+        extra = None
+    report(args.source, kept, dropped, args.out, args.val_fraction, args.seed, extra)
 
 
 if __name__ == "__main__":

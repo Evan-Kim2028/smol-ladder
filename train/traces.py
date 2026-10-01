@@ -54,8 +54,15 @@ from train.format import (answer_file_command, bash_row, closing_turn, heldout_k
 # Where verified trials live, and which of them we are allowed to train on. `solutions/test` and
 # `solutions/eval` are listed for completeness and contribute nothing: they are held out, and
 # `gen_solutions.py` says so itself ("Never train on them: they come from the held-out splits").
+#
+# `runs/ja3/jupyter-agent-v3` is the transcript sweep: the only source written by a run that saved
+# its conversations, and so the only one that yields real traces rather than the fallback. It is
+# listed under the v3 pool, which `task_rows` reads for the question and file list -- the split
+# name and the pool are one thing, so a trace cannot be paired with the wrong task's question.
 SOURCES = (
     ("solutions/jupyter-agent", "jupyter-agent"),
+    ("solutions/jupyter-agent-v3", "jupyter-agent-v3"),
+    ("runs/ja3/jupyter-agent-v3", "jupyter-agent-v3"),
     ("runs/jupyter-agent.bak-pre-rerun-20261001", "jupyter-agent"),
     ("runs/synthetic", "synthetic"),
     ("runs/test", "smoldataenvs"),
@@ -151,10 +158,13 @@ def parse_transcript(path: Path) -> list[dict]:
 
 def task_rows(source: str) -> dict[str, dict]:
     """`task_id -> row` for a source's tasks, for the question and file list."""
-    if source == "jupyter-agent":
-        from smol_ladder.jtasks import load_rows
+    if source.startswith("jupyter-agent"):
+        from smol_ladder import pool
+        from smol_ladder.pool import V3_SPLIT
 
-        return {row["task_id"]: row for row in load_rows()}
+        return {row["task_id"]: row
+                for row in pool.load_pool(V3_SPLIT if source == "jupyter-agent-v3"
+                                          else "jupyter-agent")}
     if source == "synthetic":
         from smol_ladder.jtasks import load_synthetic
 
@@ -202,13 +212,56 @@ def fallback_turns(code: str, prediction: str) -> list[dict]:
     ]
 
 
+def turns_from_conversation(messages: list[dict]) -> list[dict]:
+    """A `transcript.json` conversation -> bash-format turns.
+
+    The file is already the assistant/tool conversation in wire shape, so this is a regrouping
+    rather than a translation: each assistant message becomes one turn carrying its `tool_calls`,
+    and the `tool` messages that follow are attached to it by `tool_call_id`. The system and user
+    turns are skipped -- `bash_row` supplies the protocol's own, and the sweep's rung prompt is
+    not the text an SFT row should carry.
+
+    A result whose `tool_call_id` matches no call is dropped rather than attached to whatever
+    came before it. Guessing would put one command's output under a different command, and that
+    error is invisible downstream: the row renders, TRL accepts it, and the trajectory teaches a
+    conversation that never happened.
+    """
+    by_call: dict[str, dict] = {}
+    order: list[dict] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            turn: dict = {"content": message.get("content") or ""}
+            calls = message.get("tool_calls") or []
+            if calls:
+                turn["tool_calls"] = calls
+                turn["results"] = []
+                for call in calls:
+                    by_call[str(call.get("id"))] = turn
+            elif not turn["content"]:
+                # An assistant turn with neither text nor a call renders as an empty block, which
+                # is what upstream's format has no way to express.
+                continue
+            order.append(turn)
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            turn = by_call.get(call_id)
+            if turn is not None:
+                turn["results"].append({"tool_call_id": message.get("tool_call_id"),
+                                        "content": message.get("content") or "",
+                                        "name": "bash"})
+    return order
+
+
 def collect_traces(data: Path | None = None, limit: int | None = None,
                    keys: dict[str, set[str]] | None = None) -> tuple[list[dict], dict]:
     """Our verified trials as upstream-format rows, firewall applied.
 
-    Returns `(rows, dropped_by_column)`. `dropped` is reported rather than logged because the
-    number that matters -- how many held-out tasks were refused -- is the one a training run has to
-    be able to state.
+    Returns `(rows, report)`. The report carries the firewall's `dropped` counts *and* how many
+    rows came from a real transcript versus the contract fallback, because the two are the
+    numbers a training run has to be able to state: the first says what was refused and why, the
+    second says whether the dataset is traces at all. Both are returned rather than logged, since
+    the value of a report nobody can quote is only that it was written.
     """
     data = data or DATA
     if keys is None:
@@ -216,6 +269,7 @@ def collect_traces(data: Path | None = None, limit: int | None = None,
 
         keys = heldout_keys({"test": load_split("test"), "eval": load_split("eval")})
     dropped: dict[str, int] = {}
+    real = fallback = no_prediction = 0
     rows: list[dict] = []
     for relative, source in SOURCES:
         root = data / relative
@@ -235,15 +289,35 @@ def collect_traces(data: Path | None = None, limit: int | None = None,
             if not prediction:
                 # No prediction means the sealed run printed nothing, so there is no value to
                 # submit and the trajectory would teach a model to submit an empty answer.
+                no_prediction += 1
                 continue
-            transcript = directory / "transcript.jsonl"
-            if transcript.exists():
-                turns = parse_transcript(transcript)
-            else:
+            turns, path = None, None
+            # The conversation this harness writes, first: every sweep from 2026-10-01 produces
+            # it, and it is the only format here that is already a multi-turn trajectory.
+            conversation = directory / "transcript.json"
+            legacy = directory / "transcript.jsonl"
+            if conversation.exists():
+                try:
+                    turns = turns_from_conversation(json.loads(conversation.read_text()))
+                    path = conversation
+                except (OSError, ValueError):
+                    turns = None
+            elif legacy.exists():
+                turns = parse_transcript(legacy)
+                path = legacy
+            if turns is None or len(turns) < 2:
+                # A conversation of one turn teaches nothing about exploration, so it is treated
+                # as absent rather than exported as a trace. Reported either way.
                 turns = fallback_turns(
                     (directory / "solution.py").read_text(errors="replace"), prediction)
+                path = None
+                fallback += 1
+            else:
+                real += 1
             rows.append(bash_row(row["question"], row.get("files") or [], turns))
             rows[-1]["task_id"] = task_id
             if limit and len(rows) >= limit:
-                return rows, dropped
-    return rows, dropped
+                return rows, {"dropped": dropped, "real_traces": real, "fallback_rows": fallback,
+                              "no_prediction": no_prediction}
+    return rows, {"dropped": dropped, "real_traces": real, "fallback_rows": fallback,
+                  "no_prediction": no_prediction}

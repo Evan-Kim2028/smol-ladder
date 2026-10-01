@@ -181,17 +181,155 @@ def test_a_solution_with_no_transcript_yields_the_fallback_not_nothing(tmp_path,
     (work / "solution.py").write_text("print(42)\n")
     monkeypatch.setattr(traces, "SOURCES", (("runs/jupyter-agent", "jupyter-agent"),))
     monkeypatch.setattr(traces, "task_rows", lambda source: {"ja_1": dict(ROW)})
-    rows, dropped = traces.collect_traces(tmp_path, keys={"task_id": set(), "bucket_prefix": set()})
+    rows, report = traces.collect_traces(tmp_path, keys={"task_id": set(), "bucket_prefix": set()})
     assert len(rows) == 1
-    assert dropped == {}
+    assert report["dropped"] == {}
     assert "print(42)" in json.dumps(rows[0])
     assert "echo -n 42 > /workdir/answer.txt" in json.dumps(rows[0])
+
+
+def test_a_whole_conversation_transcript_becomes_a_real_multi_turn_row():
+    """`transcript.json` -- what every sweep from 2026-10-01 writes -- must be read as a trace.
+
+    Without this the exporter keeps taking the fallback for every new sweep, because it only
+    looked for `transcript.jsonl`, the cmd event-stream format `gen_solutions.py` wrote. The file
+    on disk is the assistant/tool conversation itself and it converts to bash-format turns with
+    nothing invented: each tool result already sits beside the call that produced it.
+    """
+    from train.traces import turns_from_conversation
+
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "Q?"},
+        {"role": "assistant", "content": "let me look",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "run_shell", "arguments": {"command": "ls"}}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "t.csv"},
+        {"role": "assistant", "content": "now the answer",
+         "tool_calls": [{"id": "c2", "type": "function",
+                         "function": {"name": "bash", "arguments": {"command": "echo hi"}}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": ""},
+        {"role": "assistant", "content": "done"},
+    ]
+    turns = turns_from_conversation(messages)
+
+    assert [t["content"] for t in turns if t.get("content")] == ["let me look",
+                                                                 "now the answer", "done"]
+    # Each turn carries its call and every result, in order. A turn with a call but no result
+    # teaches the model to expect an observation that never arrived.
+    assert [c["id"] for t in turns for c in (t.get("tool_calls") or [])] == ["c1", "c2"]
+    assert [r["tool_call_id"] for t in turns for r in (t.get("results") or [])] == ["c1", "c2"]
+    assert turns[0]["results"][0]["content"] == "t.csv"
+    assert all(t.get("tool_calls") for t in turns[:2])
+    assert not turns[-1].get("tool_calls"), "the closing turn should carry no call"
+
+
+def test_a_result_with_no_matching_call_is_dropped_rather_than_guessed_at():
+    """Pairing a stray result with the wrong call would put one command's output under another.
+
+    That trains the model on a conversation which never happened, and it is the one error here
+    that is invisible downstream: the row renders, TRL accepts it, and the training set is wrong.
+    Dropping the result keeps the call and loses one observation, which is a smaller and visible
+    loss.
+    """
+    from train.traces import turns_from_conversation
+
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "Q?"},
+        {"role": "assistant", "content": "x",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "bash", "arguments": {"command": "ls"}}}]},
+        {"role": "tool", "tool_call_id": "nope", "content": "stray"},
+    ]
+    turns = turns_from_conversation(messages)
+    assert [r["tool_call_id"] for t in turns for r in (t.get("results") or [])] == []
+    assert len(turns) == 1 and turns[0]["tool_calls"][0]["id"] == "c1"
+
+
+def test_collect_traces_prefers_the_conversation_over_the_fallback(tmp_path, monkeypatch):
+    """End to end: a trial with `transcript.json` exports as a multi-turn row.
+
+    The fallback is not used, because using it here is the bug this branch exists to fix -- and it
+    would be invisible in the output, since both are `messages` + `tools` rows.
+    """
+    from train import traces
+
+    root = tmp_path / "runs" / "jupyter-agent-v3"
+    work = root / "ja_1" / "L1"
+    work.mkdir(parents=True)
+    (work / "result.json").write_text(json.dumps({"task_id": "ja_1", "reward": 1.0,
+                                                  "prediction": "42"}))
+    (work / "solution.py").write_text("print(42)\n")
+    (work / "transcript.json").write_text(json.dumps([
+        {"role": "system", "content": "SYS"}, {"role": "user", "content": "Q?"},
+        {"role": "assistant", "content": "look",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "run_shell", "arguments": {"command": "ls"}}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "t.csv"},
+        {"role": "assistant", "content": "ok",
+         "tool_calls": [{"id": "c2", "type": "function",
+                         "function": {"name": "bash", "arguments": {"command": "ls"}}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "t.csv"},
+        {"role": "assistant", "content": "done"},
+    ]))
+    monkeypatch.setattr(traces, "SOURCES", (("runs/jupyter-agent-v3", "jupyter-agent"),))
+    monkeypatch.setattr(traces, "task_rows", lambda source: {"ja_1": dict(ROW)})
+
+    rows, report = traces.collect_traces(tmp_path,
+                                         keys={"task_id": set(), "bucket_prefix": set()})
+
+    assert len(rows) == 1
+    # Two tool results is the distinguishing fact: the fallback invents none, so a dataset whose
+    # exploration was fabricated cannot look like one that has some.
+    roles = [m["role"] for m in rows[0]["messages"]]
+    assert roles.count("tool") == 2, roles
+    assert "echo -n 42 > /workdir/answer.txt" not in json.dumps(rows[0])
+    assert report["real_traces"] == 1 and report["fallback_rows"] == 0, report
+
+
+def test_the_export_reports_how_many_rows_came_from_a_real_trace(tmp_path, monkeypatch):
+    """A training run must be able to say which of its rows are real traces.
+
+    The fallback and a real trajectory are both `messages` + `tools`, and TRL cannot tell them
+    apart, so a dataset that is mostly invented exploration would train fine and be reported as
+    ours. The counts are returned rather than logged because the number a run has to be able to
+    state is the one that decides what it measured.
+    """
+    from train import traces
+
+    root = tmp_path / "runs" / "jupyter-agent-v3"
+    for name, has_trace in (("ja_1", True), ("ja_2", False)):
+        work = root / name / "L1"
+        work.mkdir(parents=True)
+        (work / "result.json").write_text(json.dumps({"task_id": name, "reward": 1.0,
+                                                      "prediction": "42"}))
+        (work / "solution.py").write_text("print(42)\n")
+        if has_trace:
+            (work / "transcript.json").write_text(json.dumps([
+                {"role": "system", "content": "S"}, {"role": "user", "content": "Q?"},
+                {"role": "assistant", "content": "x",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "bash",
+                                              "arguments": {"command": "ls"}}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "t.csv"},
+                {"role": "assistant", "content": "done"},
+            ]))
+    monkeypatch.setattr(traces, "SOURCES", (("runs/jupyter-agent-v3", "jupyter-agent"),))
+    monkeypatch.setattr(traces, "task_rows", lambda source: {
+        "ja_1": {**ROW, "task_id": "ja_1"}, "ja_2": {**ROW, "task_id": "ja_2"}})
+
+    rows, report = traces.collect_traces(tmp_path,
+                                         keys={"task_id": set(), "bucket_prefix": set()})
+
+    assert len(rows) == 2
+    assert report["real_traces"] == 1, report
+    assert report["fallback_rows"] == 1, report
 
 
 def test_a_trial_that_failed_is_not_exported(tmp_path, monkeypatch):
     """Only verified trials: reward comes from the sealed offline pass, not the agent's claim."""
     from train import traces
-
     work = tmp_path / "runs" / "jupyter-agent" / "ja_1" / "L1"
     work.mkdir(parents=True)
     (work / "result.json").write_text(json.dumps({"task_id": "ja_1", "reward": 0.0,
@@ -213,10 +351,10 @@ def test_a_heldout_task_is_refused_and_counted(tmp_path, monkeypatch):
     (work / "solution.py").write_text("print(42)\n")
     monkeypatch.setattr(traces, "SOURCES", (("runs/jupyter-agent", "jupyter-agent"),))
     monkeypatch.setattr(traces, "task_rows", lambda source: {"ja_1": dict(ROW)})
-    rows, dropped = traces.collect_traces(
+    rows, report = traces.collect_traces(
         tmp_path, keys={"task_id": {"t1"}, "bucket_prefix": set()})
     assert rows == []
-    assert dropped == {"task_id": 1}
+    assert report["dropped"] == {"task_id": 1}
 
 
 def test_an_unprintable_trial_is_not_exported(tmp_path, monkeypatch):
