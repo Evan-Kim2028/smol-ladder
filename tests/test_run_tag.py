@@ -242,11 +242,17 @@ def test_a_resumed_launch_appends_and_keeps_the_earlier_records(tmp_path):
     assert second["end_time"] >= first["end_time"]
 
 
-def test_a_crash_mid_sweep_still_closes_run_json_out(tmp_path):
-    """A sweep that dies has to leave the end time behind, or "when did this stop" is unanswerable."""
+def test_a_dead_launch_still_closes_run_json_out(tmp_path):
+    """A sweep that dies has to leave the end time behind, or "when did this stop" is unanswerable.
+
+    Raised as a `KeyboardInterrupt` rather than an `Exception`: since one task raising became a
+    harness failure for that task (`tests/test_task_isolation.py`), the only things that still end
+    a run are the ones that are not a task -- a kill, an out-of-memory abort, a closed pipe on the
+    way out. An `except Exception` around the loop would swallow all of them.
+    """
     def explode(row, *a, **k):
         if row["task_id"] == "t1":
-            raise RuntimeError("endpoint on fire")
+            raise KeyboardInterrupt
         return [{"task_id": row["task_id"], "rung": "L1", "sample": 0, "reward": 0.0,
                  "agent_status": "exit 0", "prediction": ""}]
 
@@ -258,14 +264,14 @@ def test_a_crash_mid_sweep_still_closes_run_json_out(tmp_path):
     monkey.setattr(runner, "task_trials", explode)
     monkey.setattr(sys, "argv", ["run_ladder", "--run-tag", "v2", "--split", "test", "--rungs", "L1"])
     try:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(KeyboardInterrupt):
             runner.main()
     finally:
         monkey.undo()
 
     run = json.loads((tmp_path / "runs" / "v2" / "RUN.json").read_text())
     assert run["end_time"], "a crashed sweep left no end time"
-    assert run["error"] == "RuntimeError: endpoint on fire"
+    assert run["error"].startswith("KeyboardInterrupt")
 
 
 def test_no_tag_writes_no_run_json(tmp_path):

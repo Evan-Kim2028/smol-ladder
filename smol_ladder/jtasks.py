@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -238,6 +240,55 @@ def synthetic_input_dir(row: dict) -> Path:
     return input_dir(row)
 
 
+def link_table(link: Path, target: Path) -> None:
+    """Point `link` at `target`, atomically, whether or not something is already there.
+
+    Three defects, all of them the same one line called twice. `os.symlink` fails with
+    `FileExistsError` if the path exists at all, and it is called on a per-task directory that a
+    resumed sweep, a `--retry-failed` pass, and two workers of the same sweep all legitimately ask
+    for. Three rows of `data/jtasks_v3.jsonl` name one table twice within a task, so even a single
+    call raised on its second link; that exception came back through `f.result()` in `run_ladder`
+    and killed the ja3 sweep 2,257 tasks before the end.
+
+    So:
+
+    - **already correct** -- same target, nothing to do. Not "close enough": the link is resolved
+      and compared, so a link left over from an older cache version (same name, different file) is
+      replaced rather than served.
+    - **absent** -- `symlink_to`. `FileExistsError` means another thread won the race and the
+      correct link is already there, so it is success, not an error; anything else propagates.
+    - **wrong** -- link a temporary name beside it and `os.replace` it over the top. Rename within
+      one directory is atomic, so a reader never sees a moment with no table in the directory, and
+      a crash mid-replacement leaves either the old link or the new one.
+
+    `target` is resolved by the caller: `input_dir` resolves so the link points into the Kaggle
+    cache rather than through another symlink chain that the jail would not follow.
+    """
+    target = Path(target)
+    try:
+        current = os.readlink(link) if link.is_symlink() else None
+    except OSError:
+        current = None
+    if current is not None and Path(current) == target:
+        return
+    try:
+        link.symlink_to(target)      # atomic create: it fails if anything is there at all
+        return
+    except FileNotFoundError:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        return
+    except FileExistsError:
+        pass                        # an older run, or another thread, got there first
+    temporary = link.with_name(f".{link.name}.{os.getpid()}.{threading.get_ident()}")
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+    temporary.symlink_to(target)
+    os.replace(temporary, link)     # rename within one directory: no window with no table in it
+
+
 def input_dir(row: dict, fetch: bool = True) -> Path:
     """The task's tables, fetched from Kaggle and cached.
 
@@ -255,9 +306,11 @@ def input_dir(row: dict, fetch: bool = True) -> Path:
     it, or asking costs a dataset archive. The path is the same either way; only the download
     differs, and a caller that passes fetch=False and gets nothing back gets a directory that
     does not exist, which is the honest answer.
-    """
-    import os
 
+    Idempotent, and that is not a nicety: this is called once per trial, by up to `--workers`
+    threads over a resumable sweep, so "the directory exists" cannot mean "the links are there"
+    or "they are the right ones". `link_table` decides, per file, what exists and what should.
+    """
     import kagglehub
 
     dataset = row.get("kaggle_dataset_name")
@@ -265,19 +318,17 @@ def input_dir(row: dict, fetch: bool = True) -> Path:
         raise ValueError(f"{row['task_id']}: no kaggle_dataset_name")
     cache = Path(os.environ.get("SMOL_LADDER_CACHE", "/var/tmp/smol-ladder")) / "kaggle"
     dest = cache / "tasks" / row["task_id"]
-    if dest.exists() or not fetch:
-        if not fetch:
-            cache.mkdir(parents=True, exist_ok=True)
+    if not fetch:
         return dest
+    dest.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("KAGGLEHUB_CACHE", str(cache))
     root = Path(kagglehub.dataset_download(dataset))
-    dest.mkdir(parents=True)
     for name in row["files"]:
         matches = list(root.rglob(Path(name).name))
         if not matches:
             raise FileNotFoundError(f"{row['task_id']}: {name} not in {dataset}")
-        (dest / name).symlink_to(matches[0].resolve())
+        link_table(dest / name, matches[0].resolve())
     return dest
 
 

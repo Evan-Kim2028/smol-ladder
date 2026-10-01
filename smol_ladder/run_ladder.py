@@ -292,11 +292,8 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     """
     if was_run is not None:
         was_run.clear()
-    cached = work / "result.json"
-    if cached.exists():
-        prior = json.loads(cached.read_text())
-        if prior.get("agent_status") == "exit 0" or not retry_failed:
-            return prior
+    if reuse_recorded(work, retry_failed):
+        return json.loads((work / "result.json").read_text())
     if was_run is not None:
         was_run.append(True)
     work.mkdir(parents=True, exist_ok=True)
@@ -619,6 +616,82 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
     raise ValueError(f"unknown agent protocol {agent!r}")
 
 
+def reuse_recorded(work: Path, retry_failed: bool) -> bool:
+    """Whether the trial's own directory already holds a result this launch can take as its own.
+
+    The rule `once()` has always applied: a clean run (`agent_status == "exit 0"`) is reused
+    whatever the flags say, anything else is reused only when `--retry-failed` asks for another go,
+    and a directory with no result is never reused. Pulled out of `once()` because a launch now
+    needs to ask it too -- see `task_trials`, where it decides whether a recorded harness failure
+    gets retried before `once()` is ever entered, so the answer is one place rather than two.
+    """
+    cached = work / "result.json"
+    if not cached.exists():
+        return False
+    try:
+        prior = json.loads(cached.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    return prior.get("agent_status") == "exit 0" or not retry_failed
+
+
+def write_result(work: Path, result: dict, fresh: bool = False) -> None:
+    """Write one trial's `result.json`.
+
+    Only for a result this launch actually produced (`fresh`), which is `once()`'s contract: a
+    reused result is already on disk with whatever provenance it was written with, and rewriting
+    it here would stamp this run's rung, sample index and git commit onto a trial some earlier
+    code ran -- and would modify results in the shared data tree just by resuming a sweep over
+    them.
+
+    It also takes `task_id` from the row rather than from the result, and that is not cosmetic:
+    `harness_failure` has no row, and a `result.json` without a `task_id` is a file
+    `summarize.collect`, `regrade` and `traces.find_verified` all skip in silence. One writer for
+    one shape, so no caller has to remember which of the two it holds.
+    """
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "result.json").write_text(json.dumps(result, indent=1))
+
+
+def harness_failure(rung_label: str, prompt_rung: str, sample: int, prompt: str,
+                    exc: BaseException, task_id: str = "") -> dict:
+    """A result record for a trial that never ran, because something below it raised.
+
+    Shaped like every other record and for the same reason: `summarize` buckets a trial by
+    `agent_status`, and one that is not `"exit 0"` is what takes it out of every pass rate. A
+    crash is not a model failure, and booking it as a `0.0` puts a bug in this harness into the
+    model's pass rate. That is not hypothetical: the ja3 transcript sweep died on a
+    `FileExistsError` out of `jtasks.input_dir`, taking 2,257 un-attempted tasks with it, because
+    the exception came back out of `f.result()` and nobody caught it.
+
+    `error` is the exception's text, because "harness failure" without the exception is a category
+    nobody can act on. `agent_status` is `"error: <Type>"`, `once()`'s own spelling for a trial
+    that raised inside the jail, so one rule covers both.
+    """
+    result = {"task_id": task_id, "reward": 0.0, "prediction": "",
+              "agent_status": f"error: {type(exc).__name__}", "harness_failure": True,
+              "error": f"{type(exc).__name__}: {exc}"[-2000:]}
+    result.update(git_provenance())
+    if prompt:
+        result["prompt_sha256"] = prompt_sha256(prompt)
+    result["timestamp"] = datetime.now(timezone.utc).isoformat()
+    result["rung"] = prompt_rung
+    result["sample"] = sample
+    return result
+
+
+def record_harness_failure(work: Path, rung_label: str, prompt_rung: str, sample: int,
+                           prompt: str, exc: BaseException, task_id: str = "") -> dict:
+    """Write the failure record to the trial's own directory, and return it.
+
+    On disk rather than only in the return value, because a resumed sweep reuses `result.json`
+    and a trial that left nothing behind is a trial that is attempted again forever.
+    """
+    result = harness_failure(rung_label, prompt_rung, sample, prompt, exc, task_id)
+    write_result(work, result, fresh=True)
+    return result
+
+
 def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
                 runs_root: Path | None = None, samples: int = 1,
@@ -634,6 +707,11 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
     intended to; `--no-climb` is what makes the per-rung denominators equal. A rung's samples are
     always all run before the climb decision is taken, so `--samples 4` is 4 real observations of
     the rung rather than 1 and 3 for whatever split the coin-flip landed on.
+
+    A rung that raises is isolated here, so the record can name the rung and the task's remaining
+    rungs still run. `main` has a second backstop for an exception raised outside this loop --
+    `read_source`, or building the rung's prompt out of a cached hint that is not valid JSON --
+    which is what turns a single bad task into a harness failure rather than a dead sweep.
     """
     out = []
     root = runs_root or (DATA / "runs" / split)
@@ -654,31 +732,37 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
             out.extend({"task_id": row["task_id"], "rung": prompt_rung, "reward": 0.0,
                         "sample": k, "skipped": "no verified reference"} for k in range(samples))
             continue
-        prompt = prompt_for(row, split, prompt_rung)
-        # Resolved once beside the prompt it describes, so the rung's text and the record of where
-        # that text came from cannot disagree: both read the same cached hint.
-        src = hint_source(row, split, prompt_rung)
         rung_dir = root / row["task_id"] / rung.replace("+", "_")
+        # The scratch label carries the sample so two samples of one rung, which run
+        # concurrently, never share a $HOME -- once() rmtree's it on entry.
+        label = rung
+        prompt, src = "", None
         passed = False
         for k in range(samples):
             work = sample_dir(rung_dir, k)
             work.mkdir(parents=True, exist_ok=True)
-            # The scratch label carries the sample so two samples of one rung, which run
-            # concurrently, never share a $HOME -- once() rmtree's it on entry.
             label = rung if k == 0 else f"{rung}s{k}"
-            ran: list = []
-            r = once(row, prompt, work, venv, model, max_turns,
-                     retry_failed, inputs_of, label,
-                     {"rung": prompt_rung, "sample": k, "hint_source": src}, ran,
-                     agent, save_transcript)
-            # Write only what once() actually produced. A reused result is already on disk with
-            # whatever provenance it was written with, and rewriting it here would stamp this
-            # run's rung, sample index and git commit onto a trial some earlier code ran -- and
-            # would modify results in the shared data tree just by resuming a sweep over them.
-            if ran:
-                r["rung"] = prompt_rung
-                r["sample"] = k
-                (work / "result.json").write_text(json.dumps(r, indent=1))
+            try:
+                if not prompt:
+                    # Resolved inside the guard and reused across this rung's samples, so the
+                    # rung's text and the record of where that text came from cannot disagree:
+                    # both read the same cached hint.
+                    prompt = prompt_for(row, split, prompt_rung)
+                    src = hint_source(row, split, prompt_rung)
+                ran: list = []
+                r = once(row, prompt, work, venv, model, max_turns,
+                         retry_failed, inputs_of, label,
+                         {"rung": prompt_rung, "sample": k, "hint_source": src}, ran,
+                         agent, save_transcript)
+                # Write only what once() actually produced.
+                if ran:
+                    r["rung"] = prompt_rung
+                    r["sample"] = k
+                    r.setdefault("task_id", row["task_id"])
+                    write_result(work, r, fresh=True)
+            except Exception as e:  # noqa: BLE001 - one rung of one task is not a dead sweep
+                r = record_harness_failure(work, label, prompt_rung, k, prompt, e,
+                                           row["task_id"])
             out.append(r)
             passed |= r["reward"] >= 1.0
         if climb and passed:
@@ -916,20 +1000,42 @@ def main() -> None:
           f"{'' if args.climb else ', no climb'}; code {git_provenance()['git_commit'][:8]}"
           f"; results under {root}")
     done = 0
-    counts = {"tasks": 0, "trials": 0, "skipped": 0, "trials_scored": 0, "passes": 0}
+    counts = {"tasks": 0, "trials": 0, "skipped": 0, "trials_scored": 0, "passes": 0,
+              "harness_failures": []}
     try:
         with ThreadPoolExecutor(args.workers) as pool:
             futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
                                    args.max_turns, args.retry_failed, inputs_of,
                                    root, args.samples, args.climb, args.agent,
                                    args.transcript) for row in rows]
+            # future -> task_id, so the backstop below can name the task without searching the
+            # list it came from.
+            by_future = dict(zip(futures, (row["task_id"] for row in rows)))
             for f in as_completed(futures):
                 done += 1
-                for r in f.result():
+                try:
+                    results = f.result()
+                except Exception as e:  # noqa: BLE001 - task_trials isolates per rung; this is
+                    # the backstop for anything raised outside it (read_source, a corrupt cached
+                    # hint). One task raising here used to kill the sweep through f.result() and
+                    # leave 2,257 tasks un-attempted; there is no rung to name, so the record says
+                    # so rather than guessing "L1".
+                    results = [harness_failure("?", "?", 0, "", e, by_future.get(f, ""))]
+                for r in results:
                     if r.get("skipped"):
                         # Not attempted, so not a trial: a rung the task could not run is in
                         # neither the numerator nor the denominator of anything measured here.
                         counts["skipped"] += 1
+                        continue
+                    if r.get("harness_failure"):
+                        # Booked apart from trials and passes: it was attempted, it is not a
+                        # pass, and putting it in either of those counters would turn a bug in
+                        # this harness into a number about the model.
+                        counts["harness_failures"].append(
+                            {k: r.get(k) for k in ("task_id", "rung", "sample", "agent_status",
+                                                   "error")})
+                        print(f"[{done}/{len(rows)}] {r.get('task_id')} HARNESS FAILURE "
+                              f"{r.get('error', '')[:160]}", flush=True)
                         continue
                     counts["trials"] += 1
                     counts["trials_scored"] += r.get("agent_status") == "exit 0"
@@ -945,7 +1051,8 @@ def main() -> None:
         raise
     if run_record is not None:
         close_run_record(run_record, launch, {**counts, "tasks": done})
-    print(f"done: {done} tasks x {len(rungs)} rungs x {args.samples} samples")
+    print(f"done: {done} tasks x {len(rungs)} rungs x {args.samples} samples; "
+          f"{len(counts['harness_failures'])} harness failures")
 
 
 if __name__ == "__main__":
