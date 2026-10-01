@@ -16,7 +16,8 @@ hint generation and validation, the tagged jupyter-agent pools v1/v2/**v3** (`jt
 tasks, with the corrected `test`/`eval` bare-name overlap firewall), per-rung summarisation with a
 bootstrap CI, offline regrading, and `--run-tag`/`RUN.json` so a sweep records the code, command
 line, model, protocol, rungs, samples, climb setting and reference denominator at launch.
-305 tests pass (as of 2026-10-01).
+367 tests pass (as of 2026-10-01), 4 of them marked `slow` because they read a whole split from
+disk; `pytest -m "not slow"` is the ~2-minute quick loop and the full suite ~15.
 
 **Measured, on `test` (250 tasks, `stealth/space-bunny-alpha`):** L1 187/250 = 74.8%; schema control
 23/63 = 36.5% on L1 failures; L2 167/181 = 92.3%; L3 8/14 = 57.1%; L4 6/6 = 100%. Reference funnel:
@@ -28,6 +29,23 @@ only each way), so on this split a hint rung and a no-information prompt overlap
 far from interchangeable — a third of the hint's value survives the control, and a third of the
 control's is not explained by information at all. `test` L1 by family: `agg` 68.0%, `stat_test` 78.1%,
 label-typed answers 66.3% vs numeric 77.2%, hard tier 61.6%.
+
+**Measured, jupyter-agent L1 on the v1 pool (2,000 tasks, `stealth/space-bunny-alpha`,
+`logs/ja_L1_full_20261001.log`):** **1,990 of the 2,000 have a result; 838 of those pass, which is
+42.1% of everything attempted and 43.6% of the 1,922 scored** — 68 trials are harness failures
+(67 `agent_status: timeout`, 1 `exit 143`) and leave the denominator, so they are neither passes
+nor model failures. Recomputed off `data/solutions/jupyter-agent` on 2026-10-01 rather than read
+off the log, because the log prints only every tenth task and its final line counts all 840
+attempts at reward 1.0, including the two whose agent run timed out: 840 reward-1.0 results, of
+which 838 are scored trials. So `test` L1 74.8% against jupyter-agent L1 42.1% is the headroom
+this ladder exists to measure, and it is a real difference between the two corpora rather than a
+pool artefact — v3 is the pool built after this run.
+
+**383 of these 2,000 tasks are excluded from `jtasks_v3`.** The corrected overlap firewall fires
+on SmolDataEnvs `test`/`eval` tables by bare dataset name, and those 383 sit on one; 1,617 v1 ids
+survive into v3, 911 of them ladder-grade. So the 42.1% is measured over a population whose
+overlap with the held-out splits was, in v1, only partly removed — the figure to quote for a clean
+pool is the v3 sweep, not this one.
 
 **Withdrawn — the 92% schema-control claim is dead.** The numbers audit recomputed every figure in
 the old headline from raw per-trial results and withdrew the `test` table in full: no artefact of the
@@ -50,6 +68,23 @@ non-empty content 62.4% → 88.4% (columns), 28.2% → 56.9% (filters), 66.9% �
 On disk as of 2026-10-01: 209 `test` hints (193 validated, 16 failed) and 60 `eval` hints; the
 `test` figure above is the 181 that also have a ladder reference, which is the set L2/L3 are
 measured on.
+
+**Every sweep before 2026-10-01 saved no transcripts, and that is what made arm B unbuildable.**
+`run_ladder.once()` copied `solution.py` out of the per-trial scratch and deleted the scratch, so
+the assistant/tool conversation existed only in memory; `turns.json` held `json.dumps(len(log))` —
+a turn *count*. So every verified trial already on disk is a program and an answer, and the
+**existing verified trials yield only single-turn examples** through `train/traces.py`'s fallback:
+write the program, submit the known answer, stop. That teaches the contract and nothing about
+exploration, and it is emphatically not a substitute for a real trace. Measured on this machine
+before the fix: `data/solutions/test` 211 and `data/solutions/eval` 116 transcripts, **all of them
+held out**, and **0** under `data/solutions/jupyter-agent`, `data/runs/test`,
+`data/runs/synthetic` and `data/runs/jupyter-agent.bak-*` — 2,178 verified trials with no
+trainable conversation among them.
+
+`run_ladder` and `gen_refs` now save the whole conversation by default (`--no-transcript` opts
+out), on both paths, including the transcript a promoted reference carries — and **this cannot be
+applied retroactively**, so arm B's data has to come from a new sweep rather than from the tree
+already on disk. That is what the `ja3` transcript sweep is for. See `docs/TRAINING.md` §1.
 
 **Repaired on this branch.** The `synthetic` split's gold answers were wrong and are now fixed.
 `iter_tables` read 50,000 rows to compute the answer while the agent read the untruncated file, so
@@ -89,17 +124,20 @@ Every outcome is reportable. "Hints do not help RL" is a result, not a failure.
 | Asset | Count | Status | For | Blocked by |
 |---|---|---|---|---|
 | SmolDataEnvs `train` | 5,000 tasks | on disk, graded by `grader.py` | RL tasks + reward | nothing for RL; SFT needs traces we do not have |
-| SmolDataEnvs-sft | 4,677 verified trajectories | **usable for SFT today** | SFT traces | nothing — but it is `bash`-protocol; conversion needed if arms must share one tool format |
+| SmolDataEnvs-sft | 4,677 verified trajectories | **usable for SFT today**; the export keeps **4,673** and drops 4 | SFT traces | nothing — but it is `bash`-protocol; conversion needed if arms must share one tool format |
 | SmolDataEnvs `test` / `eval` | 250 / 144 | held out, never trained on | in-distribution eval | nothing; 69/250 `test` tasks have no usable reference, so L2–L4 are measurable on 181 only |
-| jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** | built and tagged; references being generated | RL tasks + reward; eval (L1 41.9%, twice the headroom) | verified references (624 as of 2026-10-01); 500 tasks across 144 uncached datasets need downloads |
+| jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** | built and tagged; references being generated | RL tasks + reward; eval (L1 42.1% on the v1 pool, twice the headroom) | verified references (624 as of 2026-10-01); 500 tasks across 144 uncached datasets need downloads |
 | Plain-language hints (L2/L3) | 167/181 `test` refs validate | written, validated, cached | RL curriculum; measurement | 14 fall back to the AST, and 9 of those are label-answers that *are* column names — unfixable; needs generating on jupyter-agent refs |
 | Synthetic tasks | **6,956** | **gold repaired and gated; unmeasured** | RL tasks (unlimited supply) | the shipped-file gate now refuses any task whose reference does not grade 1.0 against the file the agent is shipped, and the id cache is committed so a regeneration cannot renumber the corpus. But only **275** of the 6,956 have ever been run, so there is no curve: run a full `--no-climb` grid over the corpus before quoting any synthetic number |
 
 The `jtasks_v3` ladder-grade subset (4,217 tasks) deliberately keeps the method-ambiguous families
 (`ml_fit`, `stat_test`, `groupby`, `lookup`, `join`) and does not tune towards `count`/`agg`, because
 those are the families the ladder has nothing to disambiguate. 7,018 of 7,518 v3 tasks (93.4%)
-reuse datasets already in the Kaggle cache, as of 2026-10-01; v2's corresponding figures are 5,124
-ladder-grade and 8,668/9,187 cached.
+reuse datasets already in the Kaggle cache, as of 2026-10-01; restricted to the ladder-grade subset
+it is **3,880 of 4,217**, and the remaining 337 are skipped rather than downloaded (their datasets
+span owners the endpoint was refusing). Run `--split jupyter-agent-v3` to select that pool, which
+never writes `data/jtasks.jsonl`; v2's corresponding figures are 5,124 ladder-grade and 8,668/9,187
+cached.
 
 **Contamination in the jupyter-agent pool, corrected.** v1 and v2 were not clean and the docs
 previously claimed overlap with SmolDataEnvs was "impossible". It was neither: the firewall banned
@@ -117,6 +155,18 @@ new fields, so no `task_id` moved and no existing result is invalidated. See `do
 split is by question, not by table, so an arm trained on SmolDataEnvs-sft has seen the tables L4 is
 written about. The clean version partitions the 471 Kaggle datasets, not the 5,394 tasks.
 
+**The SFT export firewall, and the decision behind it (owner's call, made 2026-10-01).** The export
+drops 4 rows and keeps **4,673** of SmolDataEnvs-sft's 4,677, at the `task_id,question` default. The
+4 are held-out *questions* appearing verbatim in `test` under a different task id, which a `task_id`
+check cannot see; one leaked question is 0.4 points of pass@1 on 250 tasks. The table-level
+(`bucket_prefix`) firewall stays an **opt-in flag**, off by default and not changed here: 115 of the
+170 held-out tables also appear in SmolDataEnvs' own `train` split, so a table-level check refuses
+3,019 of 4,677 rows including every row upstream itself would have trained on, and arm A at 1,658
+rows is no longer arm A. The coarse check is the defensible one for the ladder, where knowing a
+table's shape is the signal being measured, and it must not be flipped silently. **The contamination
+is reported either way** — every export prints the drops by column, so a run can always state how
+many rows it refused and why. Full reasoning and the measured rows: `docs/TRAINING.md` §3 and §7.
+
 ## Critical path to the first training run
 
 **Ordered; steps marked [non-blocking] are not on the path to the first training run.**
@@ -133,7 +183,7 @@ written about. The clean version partitions the 471 Kaggle datasets, not the 5,3
 **Reference generation** is needed for 5 and 6 but **[non-blocking]** for the first training run. Run it
 early anyway: it is the long pole for the ladder and it is what validates a task's gold.
 
-- [ ] 1. SFT (LoRA) on SmolDataEnvs-sft, 4,677 traces — first training run
+- [ ] 1. SFT (LoRA) on SmolDataEnvs-sft, 4,673 exported traces (4,677 minus 4 leaked questions) — first training run
 - [ ] 2. Converter: upstream `bash` traces and our traces → one tool format + chat template
 - [ ] 3. Reference solutions for the training split (`gen_refs` / `gen_solutions`), verified offline
 - [ ] 4. Plain-language L2/L3 hints for the training split (`gen_hints`), validated and cached
@@ -141,7 +191,9 @@ early anyway: it is the long pole for the ladder and it is what validates a task
       corpus is regenerated under the committed id cache, and every spec passes the shipped-file gate
 - [ ] 5b. Run the synthetic split: only 275 of 6,956 tasks have ever been run, so `--no-climb`
       across the corpus before any synthetic number is quoted
-- [ ] 6. Our own verified SFT traces in the converted format
+- [ ] 6. Our own verified SFT traces in the converted format. **The exporter is written and tested;
+      the data is not.** Transcripts are saved from now on, and the existing tree cannot yield
+      them, so this needs the `ja3` sweep (or `gen_refs` on `train`) before it can be checked off.
 - [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the step-1 model
 - [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises
 - [ ] 9. jupyter-agent references at scale (the 4,217 ladder-grade tasks in `jtasks_v3`)
@@ -156,7 +208,7 @@ early anyway: it is the long pole for the ladder and it is what validates a task
 | R-SFT | `smoldataenvs-sft-2b-v0` | theirs | a **93 MB LoRA adapter** (r=16, α=32) on the base, not a model |
 | R-GRPO | `smoldataenvs-grpo-2b-v0` | theirs | shipped in **fp32, 8.85 GB**; must be cast to bf16 (4.43 GB) |
 | A | Qwen3.5-2B | SFT (LoRA) on SmolDataEnvs-sft, ~4.7K traces | the baseline we can run today |
-| B | Qwen3.5-2B | SFT on our verified traces | depends on our trace collection |
+| B | Qwen3.5-2B | SFT on our verified traces | **had no data at all until this branch**: every sweep before 2026-10-01 saved no transcript, so arm B now exists because `run_ladder` and `gen_refs` keep the conversation by default |
 | C | best of A/B | + GRPO (LoRA) on SmolDataEnvs `train` | |
 | D | C | + hint-curriculum GRPO (L2/L3 withdrawn as pass rate rises) | **promoted from stretch goal**; the ~28% pass rate makes all-zero groups the binding constraint |
 
@@ -204,14 +256,22 @@ Controls that still decide whether the numbers mean anything:
 | Resource | Amount | Use for |
 |---|---|---|
 | Laptop RTX 4050 Laptop GPU | 6 GB VRAM (5.3 GB free), 94 GB RAM, **no inference stack installed** | pipeline dev, grader tests, harness sanity checks on 5–20 tasks. Base bf16 weights are 4.55 GB, leaving ~1.0 GB for KV at `--gpu-memory-utilization 0.92`; `--max-model-len 4096`, or 8192 if it fits |
-| Kaggle | 2× T4 16 GB, 30 h/week | all real training, and every multi-arm × five-rung sweep |
-| AMD Developer Cloud (MI300X 192 GB, $1.99/h) | $100 ≈ 50 h, **expires 30 days after applying** | GRPO arms only. Whether the credit has been applied is **unknown** |
+| Kaggle | 2× T4 16 GB, 30 h/week | the first SFT, and every multi-arm × five-rung sweep. The **fallback** if the AMD credit is not taken |
+| AMD Developer Cloud (MI300X 192 GB, $1.99/h) | $100 ≈ 50 h, **expires 30 days after applying** | arms A–D, intended; the credit is to be applied **only once SFT and GRPO run back to back**, so the window is not spent on an SFT with nowhere to put its RL arm. Whether it has been applied is **unknown** |
 
 Corrections from `docs/LOCAL_MODELS.md`: the SFT release is a **LoRA adapter** (93 MB, r=16 on
 `all-linear` — it must be served with the base model and the adapter loaded), and the GRPO release is
 **fp32 at 8.85 GB**, which does not fit this card in any precision it runs well — cast to bf16
 (4.43 GB) first. The released models only evaluate meaningfully under each one's own protocol, and
 that doc's throughput figures are bandwidth arithmetic rather than measurements (±2×).
+
+**Arms A/B/C/D are intended for the AMD Developer Cloud credit** (MI300X 192 GB, $1.99/h, $100 ≈
+50 h, expiring 30 days after applying). Kaggle (2× T4, 30 h/week) is the fallback and stays the
+path for the first SFT, which is small enough to run there. The owner's position on the credit is
+to apply it **only once SFT and GRPO can run back to back** — the credit is a 30-day clock, and
+burning it on an SFT that then has nowhere to put its GRPO arm wastes the window on the wrong
+arm. So the sequence is: land SFT on Kaggle, confirm the GRPO script runs end to end, *then*
+apply the credit and run arms A–D on it.
 
 Gotchas: Kaggle needs a **T4** (vLLM does not support P100), fp16 only (watch for NaN loss spikes with
 Qwen — LoRA and a lower LR), no FlashAttention 2, a 12 h session cap, and the disk is wiped between
@@ -230,12 +290,17 @@ notebook **Secrets**, never inline.
    `tools` loop? This decides the converter, the held-out discipline and every cross-arm table.
 2. Does the first run go on the laptop or straight to Kaggle? The laptop has no inference stack and
    6 GB; a 2B LoRA SFT is small enough that Kaggle is likely the cheaper path to a first run.
-3. Is the AMD credit still valid, and do we spend it on arm C or hold it?
-4. Do we hold the 74%-table-overlap contamination and report it, or partition the 471 Kaggle datasets
+3. **Resolved for now: the firewall stays at `task_id,question` (4,673 rows kept, 4 dropped) and the
+   table-level check stays an opt-in flag.** Revisit if the ladder's L1-vs-L2 comparison becomes the
+   primary result rather than arm A's replication; it must not be changed silently either way.
+4. **Resolved for now: arms A–D target the AMD credit, applied only once SFT and GRPO run back to
+   back, with Kaggle as the fallback** for the first SFT. The credit's 30-day clock is the reason
+   for the ordering, not the hardware.
+5. Do we hold the 74%-table-overlap contamination and report it, or partition the 471 Kaggle datasets
    for a clean held-out set (which shrinks `test`)?
-5. Synthetic: the gold is repaired and gated, so the split is kept as unlimited RL task supply —
+6. Synthetic: the gold is repaired and gated, so the split is kept as unlimited RL task supply —
    but it has never been run beyond 275 of 6,956 tasks. Run it, or drop it?
-6. Do we do our own trace collection at all, or is arm B's question ("is our data better than
+7. Do we do our own trace collection at all, or is arm B's question ("is our data better than
    SmolDataEnvs-sft?") answered by a smaller, higher-precision set built only from verified traces?
 
 ## Risks

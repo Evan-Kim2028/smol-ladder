@@ -14,11 +14,11 @@ uv run --extra train python -m train.grpo     --adapter ... --rung-schedule ladd
 
 ## 1. The headline finding: our sweeps were throwing away the training data
 
-**`run_ladder` saved no transcripts.** Every trial wrote `turns.json` -- which contains
-`json.dumps(len(log))`, a single integer -- copied `solution.py` (and `answer.txt`) out of the
-per-trial scratch, and deleted the scratch. The assistant/tool conversation was never written down.
-A verified trial was therefore a program and an answer, and `data/runs/**` had **zero** trainable
-transcripts in 2,178 verified trials.
+**Every sweep run before 2026-10-01 saved no transcripts.** Every trial wrote `turns.json` --
+which contains `json.dumps(len(log))`, a single integer -- copied `solution.py` (and `answer.txt`)
+out of the per-trial scratch, and deleted the scratch. The assistant/tool conversation was never
+written down. A verified trial was therefore a program and an answer, and `data/runs/**` had
+**zero** trainable transcripts in 2,178 verified trials.
 
 **`gen_solutions` does save them** (`data/solutions/<split>/<task>/transcript.jsonl`), but it has
 only ever been run on the held-out splits:
@@ -36,11 +36,30 @@ only ever been run on the held-out splits:
 There is no trainable multi-turn trace here yet. `gen_solutions.py` says so itself: *"Never train on
 them: they come from the held-out splits."*
 
-**Fixed:** `run_ladder.once()` now copies the loop's log to `<task>/<rung>/transcript.json`,
-default-on, `--no-transcript` opts out. Tested in `tests/test_runner.py` with the file's
-established fake-run pattern, including that a truncated transcript from a killed trial is
-discarded rather than read back as a complete short trajectory. The next sweep produces real
-trajectories; this one cannot retroactively.
+**The consequence, stated where it is easy to miss: the existing verified trials yield only
+single-turn examples.** They are not unusable -- `collect_traces` still emits a row for each one,
+through the fallback that writes the verified program, submits the known answer and stops. That
+teaches the contract and nothing about exploration, so an SFT run on it learns *how to answer* and
+not *how to find out*. A training set of fallback rows is a smaller, honest dataset and must never
+be reported as a trace dataset; the export says how many came from which path.
+
+**Fixed, on both paths.** `run_ladder.once()` and `gen_refs.attempt()` now save the conversation
+to `<task>/<rung>/transcript.json` (and to the reference slot `promote()` copies up), default-on,
+`--no-transcript` opts out on either. The file is the **whole conversation**, not just the replies:
+`or_agent.solve_loop` and `bash_loop` return the message list they sent, so it opens with the
+system and user turns and carries every assistant message, tool call and tool result in order. The
+earlier version of this fix saved only the assistant turns, which is enough to count turns and not
+enough to train on — a chat template has to re-attach a prompt and a system message, and it cannot
+know which prompt the turns answered.
+
+Tested end to end in `tests/test_local_models.py`: `once()` runs against a stub completions
+endpoint, so the file is written by `or_agent`'s own loop and read back by `once()`. They assert
+the roles and their order, that each call carries its arguments, that each result carries its real
+output and the `tool_call_id` of the call that produced it, that the user turn is the rung text
+verbatim, and that the bash protocol's submission is in the transcript with its value.
+
+**This cannot be applied retroactively.** Arm B's data has to come from a new sweep, not from the
+tree already on disk — that is what the `ja3` transcript sweep on the v3 ladder-grade pool is for.
 
 ---
 
@@ -88,7 +107,9 @@ The 4: *"How many samples belong to each species in the dataset?"*, *"Which publ
 highest total global sales in the dataset?"*, and two correlation questions — all in the SFT set,
 all in `test`. One leaked question is 0.4 points of pass@1 on 250 tasks.
 
-**Default: `task_id,question`. Keeps 4,673 rows, drops 4.**
+**Default: `task_id,question`. Keeps 4,673 rows, drops 4. This is the owner's decision, taken
+2026-10-01 and unchanged for now** — it replicates arm A, and the 4 dropped rows are the only
+leak the default actually catches. §7 item 1 is the version of this that is still open.
 
 **Why `bucket_prefix` is off by default.** It is the right idea at the wrong threshold:
 **115 of the 170 held-out tables also appear in SmolDataEnvs' own `train` split.** Upstream
@@ -96,9 +117,12 @@ therefore treats a shared table as training material, not as held out. A table-l
 refuses **3,019 of 4,677 rows** — including every row upstream itself would have trained on — and an
 arm-A replication at 1,658 rows is no longer arm A. (55 tables appear *only* in held-out splits, and
 no SFT row sits on any of them.) For the **ladder** the coarse check is defensible: knowing a
-table's shape is the signal being measured. That is a decision for the owner; §7.
+table's shape is the signal being measured. So it stays available as `--heldout-columns
+bucket_prefix,task_id,question` and is off unless asked for.
 
-The export **reports drops by column**, so a run can always say how many it refused and why.
+**The contamination is reported, not hidden.** Whatever the setting, the export prints the rows it
+dropped **by column**, so a training run can always state how many held-out rows it refused and
+which check refused them: `dropped {"question": 4}` is a fact about the run, not a footnote.
 
 ---
 
@@ -107,7 +131,7 @@ The export **reports drops by column**, so a run can always say how many it refu
 | source | available | format | notes |
 |---|---|---|---|
 | `smoldataenvs-sft` | **4,673** | bash | 4,439 train / 234 val after a 5% deterministic split |
-| `traces` | **1,258** (0 real / 1,258 fallback) | bash | 223 refused: 217 held-out tasks + 6 held-out questions |
+| `traces` | **1,258** (0 real / 1,258 fallback) | bash | 223 refused: 217 held-out tasks + 6 held-out questions. **The "0 real" is the pre-2026-10-01 tree**; the `ja3` sweep is what changes it |
 | `rungs L1` | **590** | program | jupyter-agent only |
 | `rungs L2` | **591** | program | |
 | `rungs L3` | **591** | program | |
@@ -247,26 +271,37 @@ be set on the first run or an interrupted run loses everything.
 
 ## 7. Decisions the owner must make
 
-1. **Firewall strictness** (§3). `task_id,question` keeps 4,673 rows and replicates arm A.
-   Adding `bucket_prefix` keeps 1,658 and is the right call *if* the ladder's L1-vs-L2 comparison is
-   the primary result — knowing a table's shape is exactly what L2 hands over. Recommend: run arm A
-   strict, and say so in the writeup. This changes the dataset and must not be changed silently.
+1. **Firewall strictness** (§3) — **decided 2026-10-01: keep the default**, `task_id,question`, which
+   keeps **4,673** rows and replicates arm A. The table-level `bucket_prefix` check stays an **opt-in
+   flag** and is not turned on for now. Adding it keeps 1,658 rows and is the right call *if* the
+   ladder's L1-vs-L2 comparison becomes the primary result — knowing a table's shape is exactly what
+   L2 hands over. Whichever is used, the export reports the drops by column, so the contamination is
+   stated in the run record rather than left in a report nobody reads. Changing this changes the
+   dataset and must never be done silently.
 2. **Base model.** Everything defaults to `Qwen/Qwen3.5-2B`, the exact `base_model_name_or_path` in
    both released models' configs. The smoke run used `Qwen/Qwen3.5-0.8B` (same architecture, same
    `enable_thinking` template) because 2B does not fit a LoRA smoke run on 6 GB. Real runs use the
-   2B on Kaggle.
+   2B.
 3. **Which SFT arm is "ours".** Arm A is upstream's 4.7K. Arm B is jupyter-agent, and there is **no
-   trainable trace for it today** (§1). `--source traces` currently yields only the contract
-   fallback. Either run `gen_solutions --split train` or re-sweep with transcripts on, or arm B is
-   not yet trainable.
-4. **Rung curriculum format** (§2). Rungs emit the `program` protocol; traces emit `bash`. Whether
+   trainable trace for it on the pre-2026-10-01 tree** (§1) — `--source traces` yields only the
+   contract fallback. `run_ladder` and `gen_refs` now save transcripts by default, so arm B becomes
+   trainable the moment a sweep is run with them; the `ja3` sweep on the v3 ladder-grade pool is
+   that sweep. Until then `--source traces` must not be quoted as a trace dataset.
+4. **Where the arms run** — **leaning, not settled: the AMD Developer Cloud credit** (MI300X 192 GB,
+   $1.99/h, $100 ≈ 50 h, expiring 30 days after applying) carries arms A–D, with **Kaggle as the
+   fallback** and the place the first SFT runs. The credit is to be **applied only once SFT and GRPO
+   can run back to back**: it is a 30-day clock, and spending it on an SFT with nowhere to put its RL
+   arm wastes the window. So the order is Kaggle SFT → GRPO script proven end to end → apply the
+   credit → arms A–D. On AMD: smoke-test vLLM + TRL in the first hour, and do **not** use QLoRA
+   (bitsandbytes on ROCm is less mature, and memory is not the bottleneck on a 192 GB card).
+5. **Rung curriculum format** (§2). Rungs emit the `program` protocol; traces emit `bash`. Whether
    to add a bash-protocol rung exporter, or keep the two protocols separate, is a design call.
-5. **GRPO shaping weight.** Defaults to **0**, matching what upstream now ships. Their history:
+6. **GRPO shaping weight.** Defaults to **0**, matching what upstream now ships. Their history:
    `+0.1` for "no traceback" was collected by empty programs; requiring *printed output* fixed that;
    weighting it then bought verbosity. Turning it on means owning that risk, and the run record
    stores the mean bonus collected so the run cannot be silently compared to one without it.
-6. **Rung schedule parameters.** Default `start=L3, floor=L1, window=8, demote>0.75, promote<0.25`.
+7. **Rung schedule parameters.** Default `start=L3, floor=L1, window=8, demote>0.75, promote<0.25`.
    The gap between the thresholds is deliberate — a task near 50% would otherwise flicker rung every
    step, and a rung that flickers is not a rung.
-7. **Seeds.** PLAN asks for ≥2 seeds for A and B. Nothing here sets one beyond `--seed 42`; a
+8. **Seeds.** PLAN asks for ≥2 seeds for A and B. Nothing here sets one beyond `--seed 42`; a
    second seed is a re-run with a different value and a different `--out`.

@@ -238,7 +238,7 @@ def synthetic_input_dir(row: dict) -> Path:
     return input_dir(row)
 
 
-def input_dir(row: dict) -> Path:
+def input_dir(row: dict, fetch: bool = True) -> Path:
     """The task's tables, fetched from Kaggle and cached.
 
     Cached outside $HOME. The trial jail mounts a tmpfs over the home directory, so anything
@@ -248,6 +248,13 @@ def input_dir(row: dict) -> Path:
 
     One directory per task, holding only the files that task names, so a question never sees
     columns it was not asked about.
+
+    `fetch=False` asks the question without incurring the answer. The per-task directory already
+    exists whenever the tables are cached, and when it does not the alternative is a Kaggle
+    download -- so a caller that only wants to know "are these tables here?" must be able to ask
+    it, or asking costs a dataset archive. The path is the same either way; only the download
+    differs, and a caller that passes fetch=False and gets nothing back gets a directory that
+    does not exist, which is the honest answer.
     """
     import os
 
@@ -257,17 +264,20 @@ def input_dir(row: dict) -> Path:
     if not dataset:
         raise ValueError(f"{row['task_id']}: no kaggle_dataset_name")
     cache = Path(os.environ.get("SMOL_LADDER_CACHE", "/var/tmp/smol-ladder")) / "kaggle"
+    dest = cache / "tasks" / row["task_id"]
+    if dest.exists() or not fetch:
+        if not fetch:
+            cache.mkdir(parents=True, exist_ok=True)
+        return dest
     cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("KAGGLEHUB_CACHE", str(cache))
-    dest = cache / "tasks" / row["task_id"]
-    if not dest.exists():
-        root = Path(kagglehub.dataset_download(dataset))
-        dest.mkdir(parents=True)
-        for name in row["files"]:
-            matches = list(root.rglob(Path(name).name))
-            if not matches:
-                raise FileNotFoundError(f"{row['task_id']}: {name} not in {dataset}")
-            (dest / name).symlink_to(matches[0].resolve())
+    root = Path(kagglehub.dataset_download(dataset))
+    dest.mkdir(parents=True)
+    for name in row["files"]:
+        matches = list(root.rglob(Path(name).name))
+        if not matches:
+            raise FileNotFoundError(f"{row['task_id']}: {name} not in {dataset}")
+        (dest / name).symlink_to(matches[0].resolve())
     return dest
 
 

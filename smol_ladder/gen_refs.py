@@ -291,7 +291,11 @@ Do not look the answer up online or in any dataset; compute it from the files.""
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="jupyter-agent")
+    ap.add_argument("--split", default="jupyter-agent",
+                    help="which pool to build references for. 'jupyter-agent' is the v1 pool "
+                         "(2,000 tasks); 'jupyter-agent-v3' is the corrected pool filtered to its "
+                         "ladder-grade subset. Each writes its own data/solutions/<split>/, so a "
+                         "v3 reference is never served to a rung built from v1's gold.")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--workers", type=int, default=20)
     ap.add_argument("--model", default="stealth/space-bunny-alpha")
@@ -304,10 +308,25 @@ def main() -> None:
                          "this is the path that builds references, and a verified reference whose "
                          "trajectory was thrown away is a program and an answer (train/traces.py).")
     ap.set_defaults(transcript=True)
+    ap.add_argument("--skip-uncached", dest="skip_uncached", action="store_true", default=True,
+                    help="skip tasks whose input tables are not already cached instead of "
+                         "downloading them, and record their ids. On by default for the same "
+                         "reason as in run_ladder: a download failure is not a model failure.")
+    ap.add_argument("--no-skip-uncached", dest="skip_uncached", action="store_false",
+                    help="attempt every task, fetching whatever tables are missing")
     args = ap.parse_args()
 
     rows, inputs_of = source_for(args.split)
     rows = rows[: args.limit]
+    uncached: list[str] = []
+    if args.skip_uncached:
+        from smol_ladder import pool as pool_mod
+
+        rows, uncached = pool_mod.without_cached_inputs(
+            rows, inputs_of, enabled=args.split in pool_mod.POOLS)
+        if uncached:
+            pool_mod.record_skipped(args.split, uncached, planned=len(rows) + len(uncached))
+            print(f"{len(uncached)} tasks skipped: their tables are not cached", flush=True)
     (DATA / "solutions" / args.split).mkdir(parents=True, exist_ok=True)
     skipped = sum(1 for row in rows if verified(DATA / "solutions" / args.split / row["task_id"]))
     print(f"{len(rows)} tasks, {len(rows) - skipped} without a verified reference, "

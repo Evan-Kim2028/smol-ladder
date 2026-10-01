@@ -94,12 +94,17 @@ def source_for(split: str):
     SmolDataEnvs rows come from the Hub, jupyter-agent rows from the local extract with their
     tables from Kaggle, and synthetic rows from a specification we executed ourselves. All
     three return the same row shape, so everything downstream is source-agnostic.
-    """
-    if split == "jupyter-agent":
-        from smol_ladder.jtasks import input_dir as ja_input_dir
-        from smol_ladder.jtasks import load_rows
 
-        return load_rows(), ja_input_dir
+    The jupyter-agent *pools* are delegated to `smol_ladder.pool`, which owns the split names
+    (`jupyter-agent` is v1, `jupyter-agent-v3` is the corrected pool filtered to its ladder-grade
+    subset). Delegating rather than branching here is what keeps one definition of each pool: a
+    sweep and `gen_refs` then agree about which tasks a split name means without either of them
+    restating it.
+    """
+    from smol_ladder import pool
+
+    if split in pool.POOLS:
+        return pool.source_for(split)
     if split == "synthetic":
         from smol_ladder.jtasks import load_synthetic, synthetic_input_dir
 
@@ -676,7 +681,7 @@ def _stamp() -> str:
 # restamp the provenance of the trials already on disk; `launches` keeps one entry per launch.
 _LAUNCH_KEYS = ("git_commit", "git_dirty", "command_line", "start_time", "model", "agent",
                 "rungs", "samples", "climb", "workers", "max_turns", "limit", "split",
-                "run_tag", "tasks_planned")
+                "run_tag", "tasks_planned", "tasks_skipped_no_inputs", "skipped_for_inputs_file")
 # What a launch reports when it ends, so these are not part of the run's lasting shape.
 _COUNT_KEYS = ("tasks", "trials", "skipped", "trials_scored", "passes")
 
@@ -779,7 +784,13 @@ def reference_state(rows: list[dict], split: str, rungs: list[str]) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test",
-                    choices=["test", "eval", "train", "jupyter-agent", "synthetic"])
+                    choices=["test", "eval", "train", "jupyter-agent", "jupyter-agent-v2",
+                             "jupyter-agent-v3", "synthetic"],
+                    help="'jupyter-agent' is the v1 pool (2,000 tasks, what every published "
+                         "jupyter-agent number was measured over); 'jupyter-agent-v3' is the "
+                         "corrected pool filtered to its ladder-grade subset. Each is its own "
+                         "split, so each gets its own results tree and its own solutions "
+                         "directory and neither overwrites the other.")
     ap.add_argument("--run-tag", default=None,
                     help="keep this run's results to themselves: trials go to "
                          "data/runs/<tag>/<split>/ and the summary to "
@@ -811,12 +822,32 @@ def main() -> None:
                          "a verified trial with its transcript is an SFT trajectory, and without "
                          "it a verified trial is only a program and an answer (train/traces.py).")
     ap.set_defaults(climb=True, transcript=True)
+    ap.add_argument("--skip-uncached", dest="skip_uncached", action="store_true",
+                    default=True,
+                    help="skip tasks whose input tables are not already in the Kaggle cache, "
+                         "rather than downloading them. On by default: the pool's uncached tasks "
+                         "span datasets the endpoint was refusing, and a download failure booked "
+                         "against the model is a measurement that says nothing. The skipped ids "
+                         "go to data/skipped_<split>.json.")
+    ap.add_argument("--no-skip-uncached", dest="skip_uncached", action="store_false",
+                    help="attempt every task, fetching whatever tables are missing")
     args = ap.parse_args()
     if args.samples < 1:
         ap.error("--samples must be at least 1")
 
     rows, inputs_of = source_for(args.split)
     rows = rows[: args.limit]
+    # A task whose tables are not already cached is skipped, not fetched. The Kaggle cache holds
+    # 7,018 of the 7,518 v3 tasks; the rest span 144 uncached datasets and the endpoint was
+    # returning 403s, so attempting them would spend the sweep's wall clock on downloads and book
+    # the resulting errors against the model. The ids are recorded beside the run so the
+    # population a pass rate is over is named rather than implied.
+    skipped: list[str] = []
+    if args.skip_uncached:
+        from smol_ladder import pool as pool_mod
+
+        rows, skipped = pool_mod.without_cached_inputs(
+            rows, inputs_of, enabled=args.split in pool_mod.POOLS)
     rungs = args.rungs.split(",")
     venv = Path(sys.prefix)
     try:
@@ -824,6 +855,14 @@ def main() -> None:
     except ValueError as e:
         ap.error(str(e))
     root.mkdir(parents=True, exist_ok=True)
+    # The skipped list is written before the sweep and not at the end: a sweep killed an hour in
+    # still has to be able to say which tasks it was never going to attempt. RUN.json names the
+    # file rather than inlining 500 ids into every launch entry.
+    skipped_path = None
+    if skipped:
+        from smol_ladder import pool as pool_mod
+
+        skipped_path = pool_mod.record_skipped(args.split, skipped)
     # RUN.json is written before the first trial, not after: a sweep that dies an hour in has to
     # still say which code was running and what it was asked to do. It is only written for a
     # tagged run -- the legacy tree is shared by every run that ever used it, so one launch's
@@ -834,6 +873,8 @@ def main() -> None:
         "rungs": rungs, "samples": args.samples, "climb": bool(args.climb),
         "workers": args.workers, "max_turns": args.max_turns, "limit": args.limit,
         "tasks_planned": len(rows),
+        "tasks_skipped_no_inputs": len(skipped),
+        "skipped_for_inputs_file": (str(skipped_path) if skipped_path else None),
         "command_line": [sys.executable, "-m", "smol_ladder.run_ladder", *sys.argv[1:]],
         "start_time": _stamp(), **git_provenance(),
         **reference_state(rows, args.split, rungs),

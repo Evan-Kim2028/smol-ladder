@@ -9,6 +9,7 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 - `docs/PLAN.md`: research questions, arms, milestones
 - `docs/LADDER.md`: rung definitions and the Blackwell ordering
 - `docs/LOCAL_MODELS.md`: what the released 2B models were trained under, and serving them locally
+- `docs/TRAINING.md`: exporting data, LoRA SFT and GRPO
 - `docs/audits/`: read-only audits of the results tree, with the findings later work overturned
 
 ## Modules
@@ -16,8 +17,9 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 | module | what it does |
 |---|---|
 | `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the tagged jupyter-agent pools and writes `data/jtasks_v2.jsonl`; `--out data/jtasks_v3.jsonl` writes the corrected pool, with the overlap firewall firing on SmolDataEnvs `test`/`eval` and matching the bare dataset name instead of the full `owner/name` slug. `--v1-compatible` restores the shipped rule. The rest are the v1 and SmolDataEnvs sources. `tasks.read_tables` is the one table reader the schema dump and the synthetic tables share, so the two cannot drift apart; `tasks.read_shipped` is the uncapped reader the synthetic gold is computed from, so no row cap can sit between a gold and the file the agent is shipped |
+| `pool.py` | which jupyter-agent pool a split name means. `--split jupyter-agent` is v1 (2,000 tasks, what every published jupyter-agent number was measured over); `--split jupyter-agent-v3` is `data/jtasks_v3.jsonl` filtered to its 4,217 ladder-grade tasks. It never writes a pool — `data/jtasks.jsonl` is an input to other checkouts' live sweeps — and naming the split is also what keeps the two sweeps' results and references apart |
 | `ladder.py` | the rungs: prompts, the schema-dump control, and the hint blocks — a validated model hint when one is cached, the AST extraction otherwise |
-| `run_ladder.py` | the runner: one trial per (task, rung, sample), in a jail, graded offline |
+| `run_ladder.py` | the runner: one trial per (task, rung, sample), in a jail, graded offline. Saves each trial's full assistant/tool conversation to `<task>/<rung>/transcript.json` by default — `--no-transcript` opts out — and removes the verifier's copy of the task tables once grading is done |
 | `sandbox.py`, `or_agent.py`, `upstream.py` | the offline grading pass; the solver agent; the two upstream 2B protocols |
 | `grade.py` | the SmolDataEnvs grader |
 | `summarize.py` | per-rung pass rates with a bootstrap CI, and a first-passing-rung partition |
@@ -28,14 +30,27 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 | `hint_report.py`, `hint_audit.py` | coverage, leak and cost numbers for the hints; a seeded side-by-side audit against the references |
 | `refs_for_failures.py` | build references for the tasks that need one |
 | `fetch_inputs.py`, `fetch_shards.py` | task tables and jupyter-agent shards |
-| `reclaim.py` | reclaim disk from a results tree without deleting a result |
+| `reclaim.py` | reclaim disk from a results tree without deleting a result. Also collects the verifier's leftover `verify/input` copies of the task tables, guarded on the trial having a `result.json` |
+
+`train/` is the post-training pipeline, a separate package so the eval harness needs none of it
+and the existing tests run in seconds without torch: `traces.py` converts our verified trials into
+upstream's SFT format, `format.py` owns that format and the held-out firewall, `rungs.py` emits
+the L1–L4 curriculum in the `program` protocol, `export_sft.py` writes the rows, and `sft_lora.py`
+/ `grpo.py` train. The training extras are optional and heavy: `uv run --extra train ...`. See
+`docs/TRAINING.md`.
 
 `data/` (gitignored) holds cached tables and results.
 
 ```sh
 uv sync
-uv run --with pytest pytest -q tests
+uv run --with pytest pytest -m "not slow" -q tests   # quick loop: ~2 min
+uv run --with pytest pytest -q tests                 # full suite: ~15 min
 ```
+
+The four `slow` tests read the tables of a whole split from disk and are ~850 s of the suite on
+their own — three of them profile all 250 `test` tasks to check the schema control's guarantee on
+the population rather than a sample. They are not marked for being fragile, only for being wide,
+and the full suite still runs them.
 
 ## Running a ladder
 
