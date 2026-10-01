@@ -38,7 +38,7 @@ from pathlib import Path
 import pandas as pd
 
 from smol_ladder.ladder import input_files, inputs_of, normalise, read_source
-from smol_ladder.or_agent import API, MODEL
+from smol_ladder.or_agent import MODEL, endpoint
 from smol_ladder.tasks import DATA
 
 # Bump when the prompt or the output contract changes, so a stale cache is regenerated rather
@@ -102,13 +102,10 @@ def call_model(row: dict, source: str, files: list[str], headers: dict[str, list
     without scraping prose; the retry/backoff is needed because the free model 429s under 16
     concurrent threads.
     """
-    import os
     import urllib.error
     import urllib.request
 
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set")
+    ep = endpoint()
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": prompt_for_hint(row, source, files, headers)},
@@ -119,16 +116,11 @@ def call_model(row: dict, source: str, files: list[str], headers: dict[str, list
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
     }).encode()
-    headers_req = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/evan-kim2028/smol-ladder",
-        "X-Title": "smol-ladder",
-    }
+    headers_req = ep.headers()
     last = ""
     for attempt in range(5):
         try:
-            req = urllib.request.Request(API, data=body, headers=headers_req)
+            req = urllib.request.Request(ep.url, data=body, headers=headers_req)
             with urllib.request.urlopen(req, timeout=180) as resp:
                 payload = json.load(resp)
             content = payload["choices"][0]["message"].get("content") or ""
