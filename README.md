@@ -15,14 +15,16 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 
 | module | what it does |
 |---|---|
-| `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the larger tagged jupyter-agent pool; the rest are the v1 and SmolDataEnvs sources |
-| `ladder.py` | the rungs: prompts, the schema-dump control, and the AST extractors that read L2/L3 hints off a reference |
+| `tasks.py`, `jtasks.py`, `jtasks_v2.py`, `synthetic.py` | task loaders. `jtasks_v2` builds the larger tagged jupyter-agent pool; the rest are the v1 and SmolDataEnvs sources. `tasks.read_tables` is the one table reader the schema dump and the synthetic tables share, so the two cannot drift apart |
+| `ladder.py` | the rungs: prompts, the schema-dump control, and the hint blocks — a validated model hint when one is cached, the AST extraction otherwise |
 | `run_ladder.py` | the runner: one trial per (task, rung, sample), in a jail, graded offline |
 | `sandbox.py`, `or_agent.py`, `upstream.py` | the offline grading pass; the solver agent; the two upstream 2B protocols |
 | `grade.py` | the SmolDataEnvs grader |
 | `summarize.py` | per-rung pass rates with a bootstrap CI, and a first-passing-rung partition |
 | `regrade.py` | re-scores stored predictions strict and prefix-normalised, offline. Writes nothing |
 | `gen_refs.py`, `gen_solutions.py` | generate and verify reference solutions |
+| `gen_hints.py` | writes the plain-language L2/L3 hints from each verified reference, validates them, and caches them per task |
+| `hint_report.py`, `hint_audit.py` | coverage, leak and cost numbers for the hints; a seeded side-by-side audit against the references |
 | `refs_for_failures.py` | build references for the tasks that need one |
 | `fetch_inputs.py`, `fetch_shards.py` | task tables and jupyter-agent shards |
 | `reclaim.py` | reclaim disk from a results tree without deleting a result |

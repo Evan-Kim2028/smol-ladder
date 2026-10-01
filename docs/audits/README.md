@@ -61,7 +61,33 @@ text; this is the current position.
   `", ".join(...)` are no longer read as dataframe merges. Measured over all 181 test
   references, bogus `join` goes 60 → 0, empty columns 118 → 58, empty filters 177 → 129.
 
-Findings the later work has *not* addressed are still open and are not listed here: the schema
-control's 12% answer leak and its uncapped prompt size, the `nrows=50_000` synthetic gold
-truncation, the 40 turns/timeout share of failures, and the 8-of-181 L1-pass/L2-fail
-monotonicity violation.
+- **"The schema control leaks the gold answer on 12% of test tasks"** (ladder audit, B4). Fixed.
+  The `L1+schema` dump printed the first three rows of every input table, and 30 of 250 test dumps
+  graded 1.0 against their own gold answer — for a "which value is most common" question the
+  answer is one of the values on the page. The dump is now built from dtypes and per-column
+  profiles that never emit a value, a category name or a quantile boundary, so it is a function of
+  the tables alone and never reads `row["answer"]`. Every count is a word ("a few distinct", "all
+  values present", "dozens of columns"), which keeps the shape and cannot be graded.
+- **"The schema control blows up to a 38.5k-token prompt"** (ladder audit, B4). Fixed, and the
+  audit's own measurement was taken on a broken control. `schema_dump` passed
+  `usecols=range(40)`, which pandas rejects on any table narrower than 40 columns, and the bare
+  `except` turned that into "(not readable as csv)": the control was vacuous on 243 of 250 test
+  tasks, the median dump was 37 characters and 191 of 250 named no column at all. With the cap
+  fixed to trim an already-read frame, median dump is 1404 characters on test and 763 on
+  synthetic, all 296 test files and all 1830 synthetic files read, and no test dump is under 100
+  characters. A whole-split test now requires 95% of tasks to describe every readable table,
+  which fails at 8.8% on the earlier commit.
+- **"L2 is empty on 65% of test references and L3 adds ~16 characters on median"** (ladder audit,
+  A2/A3). Fixed. L2 and L3 are now written in plain language from the verified reference rather
+  than extracted from its AST, and cached per task with the model, the prompt version and a hash
+  of the reference. On the 181 verified test references, 167 hints validate and 14 fall back to
+  the AST. Non-empty content goes from 62.4% to 88.4% for columns, 28.2% to 56.9% for filters and
+  66.9% to 92.3% for the method, at 506 characters added per rung against 114. A hint is only
+  used after its named files exist in `./input` and its named columns in that table's header
+  (sqlite included), after the answer is shown not to be in it by text or by the dataset's own
+  grader, and after L3 is shown to add something beyond L2; one that fails is regenerated up to
+  three times and then the task falls back to the AST.
+
+Findings the later work has *not* addressed are still open and are not listed here: the
+`nrows=50_000` synthetic gold truncation, the 40 turns/timeout share of failures, and the
+8-of-181 L1-pass/L2-fail monotonicity violation.
