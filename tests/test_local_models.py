@@ -11,14 +11,16 @@ only a real socket can prove the request got there.
 """
 
 import json
+import os
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from smol_ladder.or_agent import Endpoint, endpoint
+from smol_ladder.or_agent import SYSTEM, Endpoint, endpoint
 from smol_ladder.upstream import (BASH_TOOL, PROGRAM_SYSTEM, extract_code, localise_paths,
                                   looks_like_a_command, program_prompt, bash_prompt)
 
@@ -200,7 +202,12 @@ def test_the_tools_loop_calls_the_configured_server_with_the_configured_model(mo
         from smol_ladder.or_agent import solve_loop
         log = solve_loop("Q?", lambda c: (seen.append(c), "ok")[1],
                          lambda c: None, "AdithyaSK/smoldataenvs-grpo-2b-v0", 4)
-    assert len(log) == 3
+    # 7 messages: system, user, then three assistant turns with two tool results between them.
+    assert len(log) == 7, log
+    # The returned log is the whole conversation, so it opens with the system and user turns.
+    assert [m["role"] for m in log[:2]] == ["system", "user"], log
+    assert len([m for m in log if m["role"] == "assistant"]) == 3
+    assert len([m for m in log if m["role"] == "tool"]) == 2
     assert seen == ["ls input"]
     body = stub.requests[0]
     assert body["model"] == "AdithyaSK/smoldataenvs-grpo-2b-v0"
@@ -305,6 +312,182 @@ def test_once_in_program_mode_does_not_offer_tools_even_though_the_model_can_cal
 def runner_program_prompt() -> str:
     from smol_ladder.upstream import program_prompt
     return program_prompt("Q?", ["t.csv"])[1]["content"]
+
+
+# ── the transcript, end to end through the real agent script ────────────────────
+#
+# These drive once() against the stub server, so the program executed inside the jail is
+# _agent_script's own body and or_agent.solve_loop is the loop that runs. Nothing here stubs the
+# transcript: the file is written by the loop and read back by once(), which is the only way to
+# show that what lands on disk is the conversation and not a fixture shaped like one.
+
+
+def _stub_env(monkeypatch, stub):
+    monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+    monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+
+def _inputs_outside_tmp(tmp_path, name="t.csv", body="a\n1\n") -> Path:
+    """A task's tables somewhere the trial jail can actually reach them.
+
+    The jail puts a tmpfs over /tmp, and the input directory is bound in by its *resolved* path.
+    So an input dir under /tmp resolves to a path that does not exist inside the sandbox, and
+    `ls input/` fails there while succeeding on every real task -- whose tables live under
+    /var/tmp/smol-ladder/kaggle. pytest's tmp_path is under /tmp, so a transcript test that
+    asserted on real shell output would be measuring the fixture's location rather than the
+    transcript. The base dir is this project's own scratch root, which is where the cache is.
+    """
+    root = Path(os.environ.get("SMOL_LADDER_CACHE", "/var/tmp/smol-ladder")) / "pytest-inputs"
+    root.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(dir=root))
+    (directory / name).write_text(body)
+    return directory
+
+
+def test_the_saved_transcript_is_the_whole_multi_turn_conversation(tmp_path, monkeypatch):
+    """A passing trial must leave a trajectory, not a turn count.
+
+    The claim this pins is the whole reason the transcript is saved at all: a verified trial plus
+    its conversation is an SFT example, and a verified trial without one is a program and an
+    answer. So the file has to carry *every* message in order -- the system turn, the user turn,
+    each assistant message, each tool call, and each tool result -- and not merely the assistant
+    turns the loop happened to log.
+
+    It asserts the shape rather than the sizes: the point is what is present and in what order,
+    and a transcript that grew a fourth role later still has to read as a conversation.
+    """
+    import smol_ladder.run_ladder as runner
+
+    inputs = _inputs_outside_tmp(tmp_path)
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    replies = [
+        assistant("First I will look at the table.",
+                  calls=[("run_shell", {"command": "ls input/"})]),
+        assistant("It has one column, so the sum is the answer.",
+                  calls=[("write_solution", {"code": "print(6*7)"})]),
+        assistant("The solution is written."),
+    ]
+    with Stub(replies) as stub:
+        _stub_env(monkeypatch, stub)
+        result = runner.once(row, "Q? Compute 6*7 from the table.", work, Path(sys.prefix),
+                             "local", 6, inputs_of=lambda r: inputs, rung_label="L1")
+
+    assert result["reward"] == 1.0, (result.get("prediction"),
+                                     result.get("stderr", "")[:300])
+
+    turns = json.loads((work / "transcript.json").read_text())
+    roles = [m["role"] for m in turns]
+    # The opening two are what make it a conversation rather than a bare transcript of replies.
+    assert roles[:2] == ["system", "user"], roles
+    assert turns[0]["content"] == SYSTEM, "the system prompt the agent actually ran with"
+    assert turns[1]["content"] == "Q? Compute 6*7 from the table.", turns[1]["content"]
+
+    # Three model turns, and they alternate assistant/tool in the order they happened.
+    assert len([r for r in roles if r == "assistant"]) == 3
+    assert len([r for r in roles if r == "tool"]) == 2
+    assert roles[2:] == ["assistant", "tool", "assistant", "tool", "assistant"], roles
+
+    # Every tool call is present with its arguments, and every tool result with its output --
+    # the exploration is the training signal, so dropping either half trains on nothing.
+    calls = [c for m in turns for c in (m.get("tool_calls") or [])]
+    assert [c["function"]["name"] for c in calls] == ["run_shell", "write_solution"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "ls input/"}
+    assert json.loads(calls[1]["function"]["arguments"])["code"] == "print(6*7)"
+    outputs = [m["content"] for m in turns if m["role"] == "tool"]
+    # The shell really ran: `ls input` inside the jail, where ./input is the symlink to the
+    # task's tables. A transcript that recorded the call but not what came back would train the
+    # model to invent results, which is the one thing a trajectory must never do.
+    assert "t.csv" in outputs[0], outputs
+    assert outputs[1] == "written /app/solution.py", outputs
+
+    # Every tool result points back at the call that produced it, in order. A result whose
+    # tool_call_id does not line up with the assistant turn above it is a trajectory TRL's
+    # template will silently mis-render.
+    ids = [c["id"] for c in calls]
+    assert [m["tool_call_id"] for m in turns if m["role"] == "tool"] == ids
+
+    # The assistant text survives too, including the closing turn that carries no call.
+    assert turns[2]["content"] == "First I will look at the table."
+    assert turns[4]["content"] == "It has one column, so the sum is the answer."
+    assert turns[-1]["content"] == "The solution is written."
+    # The closing turn is the one with no tool_calls: the loop stops on it, so a transcript that
+    # dropped it would end mid-thought and read as a truncated run.
+    assert "tool_calls" not in turns[-1]
+
+    # And the trajectory describes what actually happened: three model turns, one of them writing
+    # the program that the sealed grading pass then re-ran and graded 1.0. The turn count is
+    # counted off the transcript rather than read from turns.json, which the agent writes into
+    # its scratch and never copies out -- a number that only exists during the trial cannot be
+    # checked afterwards, which is how it stayed wrong for so long.
+    assert (work / "solution.py").read_text() == "print(6*7)"
+    assert len([m for m in turns if m["role"] == "assistant"]) == 3
+
+
+def test_the_saved_transcript_carries_the_prompt_the_trial_was_sent(tmp_path, monkeypatch):
+    """The user turn is the rung's text, verbatim.
+
+    A rung prompt is the thing the ladder varies, so a transcript whose user turn is a paraphrase
+    cannot be matched back to the rung it came from -- and pairing a trajectory with the wrong
+    prompt is how a training set quietly teaches the model a prompt it will never be given.
+    """
+    import smol_ladder.run_ladder as runner
+
+    inputs = _inputs_outside_tmp(tmp_path)
+    work = tmp_path / "trial" / "L2"
+    prompt = "L2 text: the answer uses the mean of col_a where flag == 1."
+    replies = [assistant(calls=[("write_solution", {"code": "print(42)"})]), assistant("done")]
+    with Stub(replies) as stub:
+        _stub_env(monkeypatch, stub)
+        runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+                     "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                    prompt, work, Path(sys.prefix), "m", 4, inputs_of=lambda r: inputs,
+                    rung_label="L2")
+
+    turns = json.loads((work / "transcript.json").read_text())
+    assert turns[1] == {"role": "user", "content": prompt}
+    # and it is the same text the trial saved beside the result, so the two cannot disagree
+    assert (work / "prompt.txt").read_text() == prompt
+
+
+def test_the_bash_protocol_transcript_is_also_a_whole_conversation(tmp_path, monkeypatch):
+    """The bash protocol is the format the SFT arm trains in, so its transcript is the one that
+    most needs to be complete -- including the submission call, which is the turn the format's
+    whole shape is built around."""
+    import smol_ladder.run_ladder as runner
+
+    inputs = _inputs_outside_tmp(tmp_path)
+    work = tmp_path / "trial" / "L1"
+    replies = [
+        assistant(calls=[("bash", {"command": "ls input"})]),
+        assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})]),
+        assistant("The answer is 42."),
+    ]
+    with Stub(replies) as stub:
+        _stub_env(monkeypatch, stub)
+        result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
+                              "answer": "42", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                             runner_bash_prompt(), work, Path(sys.prefix), "sft-2b", 8,
+                             inputs_of=lambda r: inputs, rung_label="L1", agent="bash")
+
+    assert result["reward"] == 1.0
+    turns = json.loads((work / "transcript.json").read_text())
+    # system, user, then the bash turn and its result, then the submitting turn and its result.
+    # The loop stops *on* submission rather than letting the model speak again, so there is no
+    # trailing assistant turn -- which is the contract upstream's own rows follow.
+    assert [m["role"] for m in turns] == ["system", "user", "assistant", "tool",
+                                          "assistant", "tool"], [m["role"] for m in turns]
+    # The submission is a bash call in the transcript, which is exactly how upstream's own rows
+    # end. It is in the transcript, not only in answer.txt.
+    submission = [c for m in turns for c in (m.get("tool_calls") or [])
+                  if "answer.txt" in json.dumps(c)]
+    assert len(submission) == 1, submission
+    # The submitted value is recorded on the turn that made it, so an exporter can build the
+    # final row without re-running the trial -- and without reading answer.txt, which the bash
+    # protocol's own harness calls a side channel.
+    assert turns[-2]["submitted"] == "42", turns[-2]
 
 
 # ── the upstream bash mode, end to end through once() ─────────────────────────

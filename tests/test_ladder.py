@@ -1,6 +1,8 @@
 import ast
 import re
 
+import pytest
+
 from smol_ladder.ladder import (SCHEMA_DUMP_CHARS, SCHEMA_DUMP_MAX_COLS, SCHEMA_DUMP_MAX_FILES,
                                 SCHEMA_DUMP_ROWS, code_facts, inputs_of,
                                 leaks, method_hint, normalise, prompt_for, redact_literals,
@@ -219,6 +221,11 @@ def test_schema_dump_carries_no_cell_value(row):
     assert "3.5" not in schema_dump(row)
 
 
+# Each of the three below reads the tables of all 250 test-split tasks, so they profile the whole
+# split from disk: 187s, 192s and 471s respectively, which is 850s of the suite's 923s. They are
+# the control's guarantee measured on the population rather than on a sample, and they stay in the
+# full suite; `pytest -m "not slow"` is the quick loop (README).
+@pytest.mark.slow
 def test_schema_dump_is_answer_free_on_every_test_task():
     """The whole test split, checked with the dataset's own grader.
 
@@ -263,6 +270,7 @@ def test_every_schema_dump_exemption_is_a_column_name_and_nothing_else():
         assert any(normalise(str(row["answer"])) in normalise(name) for name in names), task_id
 
 
+@pytest.mark.slow
 def test_schema_dump_emits_no_number_of_its_own():
     """Every number in a prompt is a candidate the grader scores against the gold answer.
 
@@ -312,6 +320,7 @@ def test_schema_dump_leaks_only_a_bare_category_in_a_column_name():
         assert not re.search(r"\d", re.sub(r"\b(?:u?int|float)\d+\b", "", line)), line
 
 
+@pytest.mark.slow
 def test_schema_dump_names_a_column_of_every_readable_table_on_ninety_five_percent():
     """The control has to be a control.
 

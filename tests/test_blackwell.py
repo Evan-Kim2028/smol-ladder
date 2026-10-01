@@ -117,6 +117,10 @@ def test_a_task_without_a_reference_says_so(monkeypatch):
     assert l2 != L.prompt_for(row, "test", "L1")
 
 
+# Builds 20 synthetic references and reads all four rung prompts for each, so it walks the
+# synthetic split's own solution programs from disk: 7.6s. Marked slow because it is a
+# split-wide read rather than a unit check, which is what `pytest -m "not slow"` skips.
+@pytest.mark.slow
 def test_synthetic_rungs_are_live():
     """A synthetic task's spec is its reference, so every rung must add something.
 

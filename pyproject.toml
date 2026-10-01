@@ -35,3 +35,16 @@ train = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Only our own tests. Left unset, pytest walks the `data` and `logs` symlinks into the shared
+# results tree and collects 90,632 tests -- scipy's own test suite vendored into a trial by an
+# agent that `pip download`ed it, plus files that are not importable. Every one of them is
+# somebody else's file, and the collection pass alone took 80s.
+testpaths = ["tests"]
+# `slow` marks the tests that sweep a whole split or walk the whole results tree: they are
+# correct and they are the ones the full suite exists for, but they take minutes, so the quick
+# loop is `pytest -m "not slow"` (README). Nothing is marked slow for being fragile or broken;
+# only for being wide.
+markers = [
+  "slow: sweeps a whole split or walks the whole results tree; run with the full suite",
+]
+

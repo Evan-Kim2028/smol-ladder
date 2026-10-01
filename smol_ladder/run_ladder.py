@@ -517,13 +517,17 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
     trained on; the system turn comes from the same module and is not the rung prompt, because a
     rung's extra information has to arrive in the user turn to be a rung at all.
 
-    All three write transcript.json -- the full assistant/tool conversation, one JSON object per
-    turn -- beside the turns.json that holds only the count. Before this, a trial left a program
-    and an answer and threw the conversation away, so the sweeps had no training data in them at
-    all: the 2,178 verified trials under data/runs/ could each become a program-plus-answer and
-    nothing else. Built rather than switched at the call site because the difference between the
-    three is invisible in a one-line %-format, and a test that guesses which body it is running
-    silently stops exercising it.
+    All three write transcript.json -- the whole conversation as the same message dicts that were
+    sent, system and user turns first -- beside the turns.json that holds the model's turn
+    *count*. Before this, a trial left a program and an answer and threw the conversation away, so
+    the sweeps had no training data in them at all: the 2,178 verified trials under data/runs/
+    could each become a program-plus-answer and nothing else. Built rather than switched at the
+    call site because the difference between the three is invisible in a one-line %-format, and a
+    test that guesses which body it is running silently stops exercising it.
+
+    turns.json counts assistant messages, not len(log): the log is the conversation, so its length
+    is messages, and a "turn" everywhere else in this file means one model reply. Counting the
+    messages would report a one-reply trial as three turns.
     """
     head = ("import json,os,sys;"
             "sys.path.insert(0, %r);"
@@ -534,7 +538,8 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
     # folded into it: `dump % args` with no specifier is a TypeError, and one of the three bodies
     # formats separately from the other two purely because of where its arguments sit.
     dump = ("open('transcript.json','w').write(json.dumps(log));"
-            "open('turns.json','w').write(json.dumps(len(log)))")
+            "open('turns.json','w').write(json.dumps("
+            "sum(1 for m in log if m.get('role')=='assistant')))")
     if agent == "tools":
         body = ("log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
                 "lambda c: open('solution.py','w').write(c), %r, %d);" % (model, max_turns))
@@ -544,11 +549,15 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
         # program is written to solution.py so the offline grading pass below runs it sealed, the
         # same way it runs our agent's -- the prediction is what the program printed when re-run,
         # never the model's stdout. The one-turn log is still a transcript: it is the whole
-        # conversation under this protocol, and it is what makes the run trainable.
+        # conversation under this protocol, and it is what makes the run trainable. It is the
+        # caller's own M extended by that one exchange, so it opens with the system and user turns
+        # this protocol was run with -- the same reason solve_loop returns the whole
+        # conversation rather than the replies alone.
         body = ("M=[{'role':'system','content':U.PROGRAM_SYSTEM},"
                 "{'role':'user','content':sys.argv[1]}];"
                 "out=A.program_once(M, %r);"
-                "log=[out];"
+                "M.append({'role':'assistant','content':out['message'].get('content') or ''});"
+                "log=M;"
                 "open('solution.py','w').write(out['code']);" % model)
         return head + body + dump
     if agent == "bash":

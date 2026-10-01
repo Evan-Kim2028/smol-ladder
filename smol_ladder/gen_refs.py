@@ -145,29 +145,44 @@ def promote(task: Path, work: Path, index: int) -> None:
     read_source looks for solutions/<split>/<task_id>/result.json next to solution.py, so that
     is where a reference has to be. The attempt directory stays: it is the record of the run
     that earned it.
+
+    The transcript is promoted with it, and this is the whole reason the reference slot matters
+    twice over. `verified()` reads this directory, so a reference that reached the slot without
+    its conversation would be counted as a reference with no trajectory beside it -- the exact
+    state this file's path is built to avoid. An exporter that walks
+    `data/solutions/<split>/<task_id>/` for training data would then find the program, the answer
+    and no way it was reached, and fall back to inventing the exploration turns.
     """
     result = json.loads((work / "result.json").read_text())
     result["reference_attempt"] = index
     task.mkdir(parents=True, exist_ok=True)
     (task / "result.json").write_text(json.dumps(result, indent=1))
-    solution = work / "solution.py"
-    if solution.exists():
-        (task / "solution.py").write_text(solution.read_text(errors="replace"))
+    for name in ("solution.py", "transcript.json"):
+        if (work / name).exists():
+            (task / name).write_text((work / name).read_text(errors="replace"))
 
 
-def attempt(row: dict, split: str, model: str, inputs_of, max_turns: int, work: Path) -> dict:
-    """One attempt at a reference solution, run and graded (never raises)."""
+def attempt(row: dict, split: str, model: str, inputs_of, max_turns: int, work: Path,
+            save_transcript: bool = True) -> dict:
+    """One attempt at a reference solution, run and graded (never raises).
+
+    `save_transcript` defaults on and is passed through explicitly rather than left to once()'s
+    own default: gen_refs is the path that builds references, so a reference is the artifact an
+    SFT exporter reads, and this call site is the one place that fact has to be visible. It is
+    still the default in once() too, because the ladder sweep wants it as well -- but a caller
+    that reads as if it does not ask for a transcript is exactly the bug this module had.
+    """
     prompt = PROMPT.format(
         question=row["question"], files="\n".join(f"- {f}" for f in row["files"]))
     # once() runs the solver in the jail, then re-runs the written solution offline and grades
     # it. reward == 1.0 therefore means the solution reproduced the gold answer, which is the
     # only case we keep: a reference is something we verified, not something the agent claimed.
     return once(row, prompt, work, Path(sys.prefix), model, max_turns,
-                retry_failed=True, inputs_of=inputs_of)
+                retry_failed=True, inputs_of=inputs_of, save_transcript=save_transcript)
 
 
 def reference(row: dict, split: str, model: str, inputs_of, max_turns: int, attempts: int = 1,
-              max_throttles: int = 3) -> dict:
+              max_throttles: int = 3, save_transcript: bool = True) -> dict:
     """Attempt a reference solution for one task, keeping every attempt.
 
     Returns the result dict (never raises). A task that already has a verified reference is
@@ -189,7 +204,7 @@ def reference(row: dict, split: str, model: str, inputs_of, max_turns: int, atte
     while True:
         work = attempt_dir(task, index)
         started = time.time()
-        result = attempt(row, split, model, inputs_of, max_turns, work)
+        result = attempt(row, split, model, inputs_of, max_turns, work, save_transcript)
         result["reference_seconds"] = round(time.time() - started, 1)
         if throttled(result):
             # Quota, not an answer. Wait it out and run the same attempt index again rather
@@ -219,7 +234,7 @@ def reference(row: dict, split: str, model: str, inputs_of, max_turns: int, atte
 
 
 def run_sweep(rows: list[dict], split: str, model: str, inputs_of, max_turns: int,
-              attempts: int, workers: int = 20) -> list[dict]:
+              attempts: int, workers: int = 20, save_transcript: bool = True) -> list[dict]:
     """Retry every task that lacks a verified reference, and skip the ones that have one.
 
     Skipping is the point: running the budget over all 250 test tasks would spend 250 attempts
@@ -239,7 +254,8 @@ def run_sweep(rows: list[dict], split: str, model: str, inputs_of, max_turns: in
     (DATA / "solutions" / split).mkdir(parents=True, exist_ok=True)
     kept = 0
     with ThreadPoolExecutor(workers) as pool:
-        futures = [pool.submit(reference, row, split, model, inputs_of, max_turns, attempts)
+        futures = [pool.submit(reference, row, split, model, inputs_of, max_turns, attempts,
+                               max_throttles=3, save_transcript=save_transcript)
                    for row in todo]
         for done, f in enumerate(as_completed(futures), 1):
             try:
@@ -283,6 +299,11 @@ def main() -> None:
     ap.add_argument("--attempts", type=int, default=1,
                     help="fresh attempts per task without a verified reference; each one is "
                          "kept in its own directory and none is ever overwritten")
+    ap.add_argument("--no-transcript", dest="transcript", action="store_false",
+                    help="do not keep each attempt's assistant/tool conversation. On by default: "
+                         "this is the path that builds references, and a verified reference whose "
+                         "trajectory was thrown away is a program and an answer (train/traces.py).")
+    ap.set_defaults(transcript=True)
     args = ap.parse_args()
 
     rows, inputs_of = source_for(args.split)
@@ -292,7 +313,7 @@ def main() -> None:
     print(f"{len(rows)} tasks, {len(rows) - skipped} without a verified reference, "
           f"up to {args.attempts} attempt(s) each", flush=True)
     out = run_sweep(rows, args.split, args.model, inputs_of, args.max_turns, args.attempts,
-                    args.workers)
+                    args.workers, save_transcript=args.transcript)
     kept = sum(1 for r in out if r.get("keep"))
     print(f"done: {len(rows)} tasks, {kept} verified references")
 

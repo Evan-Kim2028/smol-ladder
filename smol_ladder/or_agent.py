@@ -239,33 +239,37 @@ def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
     """The model loop, independent of Harbor.
 
     run_shell(command) -> str executes in the task container; write_solution(code) stages
-    solution.py. Returns the per-turn log. Kept free of Harbor types so it can be tested
-    against a stub and reused outside a trial.
+    solution.py. Kept free of Harbor types so it can be tested against a stub and reused outside
+    a trial.
 
-    The log is the only record of *how* the answer was reached, and it is a training set: a
-    verified pass with its conversation is an SFT trajectory, and a verified pass without it is
-    only a program and an answer. Each entry carries the model's message and the tool results that
-    came back, which is exactly the assistant/tool pair structure upstream's dataset stores, so
-    `train.traces` can convert one into the other without guessing.
+    **Returns the whole conversation, in order**, as the same message dicts that were sent:
+    the system turn, the user turn, then each assistant message and each tool result. It used to
+    return only the assistant turns, each wrapped with its own `tool_results`, which is enough to
+    *count* turns and not enough to train on: the file this becomes is an SFT trajectory, and a
+    trajectory that starts at the model's first reply has no question in it and no system prompt
+    to have produced the reply that followed. Both of those are the scaffolding a chat template
+    re-attaches anyway and silently gets wrong -- it has no way to know which prompt the turns
+    answered, or that this run's contract was ours rather than the SFT arm's.
+
+    The wire shape is kept verbatim rather than reshaped into the assistant/tool pairs upstream's
+    dataset stores, because `train.traces` does that conversion and can do it once, from a file
+    whose content is the record of what actually happened.
     """
     ep = ep or endpoint()
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": instruction},
     ]
-    log: list[dict] = []
     for _ in range(max_turns):
         completion = call_model(messages, model, TOOLS, ep)
         message = completion["choices"][0]["message"]
         calls = message.get("tool_calls") or []
-        entry: dict = {"model": model, "message": message}
         messages.append({
             "role": "assistant",
             "content": message.get("content") or "",
             **({"tool_calls": calls} if calls else {}),
         })
         if not calls:
-            log.append(entry)
             break
         results = []
         for call in calls:
@@ -279,12 +283,9 @@ def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
                 output = "written /app/solution.py"
             else:
                 output = run_shell(args.get("command", ""))
-            entry.setdefault("tool_results", []).append(
-                {"name": fn["name"], "output": output})
             results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
         messages.extend(results)
-        log.append(entry)
-    return log
+    return messages
 
 
 def _harbor_base():
@@ -325,21 +326,25 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
     trajectories show the pattern plainly: submit, then one short closing message, nothing more.
 
     Upstream's trajectories run 3-12 turns; 16 is a ceiling that no published row reaches.
+
+    Returns the caller's `messages`, extended in place, so the transcript includes the system and
+    user turns the caller built -- this is the protocol the SFT arm trains in, so its trajectory
+    is the one whose completeness matters most. `messages` is mutated rather than copied because
+    it is the live conversation; a caller that wants the opening turns must not lose them, and
+    the submission is attached to the turn that made it.
     """
     ep = ep or endpoint()
-    log: list[dict] = []
     for _ in range(max_turns):
         completion = call_model(messages, model, BASH_TOOL, ep)
         message = completion["choices"][0]["message"]
         calls = message.get("tool_calls") or []
-        entry: dict = {"model": model, "message": message}
+        turn = len(messages)
         messages.append({
             "role": "assistant",
             "content": message.get("content") or "",
             **({"tool_calls": calls} if calls else {}),
         })
         if not calls:
-            log.append(entry)
             break
         results = []
         for call in calls:
@@ -350,15 +355,15 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
                 args = {}
             command = localise_paths(args.get("command", ""))
             output = run_shell(command)
-            entry.setdefault("tool_results", []).append({"name": fn["name"], "output": output})
             results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
         messages.extend(results)
-        log.append(entry)
         submitted = read_answer()
         if submitted is not None:
-            entry["submitted"] = submitted
+            # On the assistant turn, so an exporter finds the submission without re-running the
+            # trial -- and with the call's own arguments, which is where the value actually is.
+            messages[turn]["submitted"] = submitted
             break
-    return log
+    return messages
 
 
 class OpenRouter:  # replaced below once Harbor is importable
