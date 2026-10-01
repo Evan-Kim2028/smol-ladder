@@ -18,6 +18,12 @@ DELIMITERS = (",", ";", "\t", "|")
 ENCODINGS = ("utf-8", "latin-1")  # latin-1 never raises, so it is always the last resort
 SNIFF_BYTES = 64_000  # enough rows for a stable delimiter guess on a wide table
 
+# The point past which a delimited file is read in full rather than through the nrows-capped
+# profile path. A schema dump needs enough rows for a stable shape, so a cap is right there; but
+# the cap must not be reachable, because a short read in the middle of a file is indistinguishable
+# from a small file and that is the bug this project shipped 38 unpassable synthetic tasks over.
+MAX_READ_BYTES = 8_000_000
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 DATASET = "FineEnvs/SmolDataEnvs"
@@ -42,16 +48,50 @@ def load_split(split: str) -> list[dict]:
     return rows
 
 
-def _delimited_frames(path: Path, nrows: int) -> list[pd.DataFrame]:
-    """The file as a table, guessed delimiter first.
+def detect_separator(path: Path, sniff: int = 64_000) -> str:
+    """How to split a table's fields, decided from the bytes rather than from the suffix.
 
-    A wrong separator still parses, so "it parsed" cannot accept a guess: pandas splits a csv on
-    a semicolon into one long column. A candidate is therefore only accepted when it yields more
-    than one column, and the sniffer's verdict is merely the first candidate to try -- the whole
-    DELIMITERS ladder is behind it, which is what rescues a table the sniffer gets wrong.
-    Single-column files are handled by taking any parse that succeeds, preferring the sniffer's.
+    The suffix is a hint, not evidence: a ".csv" full of semicolons parses into one garbage
+    column, silently, and anything computed over that frame is not an answer to the file's
+    question. Each candidate delimiter is tried and the first that gives more than one column
+    wins, so a mis-suffixed file is read the way a reference implementation would read it.
+    Nothing is returned until one of them splits the file, because a single-column parse is a
+    guess about the data.
     """
-    raw = path.read_bytes()[: SNIFF_BYTES * 64]
+    preferred = "\t" if path.suffix.lower() == ".tsv" else ","
+    for sep in dict.fromkeys([preferred, *DELIMITERS]):
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            if len(pd.read_csv(handle, sep=sep, nrows=sniff).columns) > 1:
+                return sep
+    return preferred
+
+
+def read_shipped(path: Path, on_bad_lines: str = "error") -> pd.DataFrame:
+    """The whole shipped file as one table: every row, pandas' own dtype and NA inference.
+
+    Nothing here may approximate the file, because a gold computed from the result and an agent
+    computing from the file have to describe the same computation. `on_bad_lines="error"` is the
+    default for the same reason: pandas drops the offending row and warns, so a 239k-row table
+    with one ragged row would give a gold over 239,177 rows and a task unpassable for that reason
+    alone. The suffix is a hint, so the separator is sniffed off the bytes.
+    """
+    return pd.read_csv(path, sep=detect_separator(path), on_bad_lines=on_bad_lines)
+
+
+def _delimited_frames(path: Path, nrows: int) -> list[pd.DataFrame]:
+    """The file as a table, guessed delimiter first, capped at `nrows`.
+
+    The cap is what makes this the *profile* reader rather than the gold's: a schema dump wants
+    enough rows for a stable shape, not the file. It reads at most MAX_READ_BYTES, so a table
+    beyond that is not silently short-read in the middle -- it falls to read_shipped and reads
+    the file exactly.
+    """
+    if path.stat().st_size > MAX_READ_BYTES:
+        try:
+            return [read_shipped(path)]
+        except Exception:  # noqa: BLE001 - an unreadable file is named by the caller
+            return []
+    raw = path.read_bytes()[:SNIFF_BYTES * 64]
     for encoding in ENCODINGS:
         try:
             text = raw.decode(encoding)
@@ -133,6 +173,10 @@ def read_tables(path: Path, nrows: int) -> list[pd.DataFrame]:
     One reader for the whole project. schema_dump and synthetic.iter_tables both need "read this
     task file into frames", and each having its own version is how the two drifted: iter_tables
     knew about .tsv and read_csv-with-a-raised-ValueError looked like an unreadable file.
+
+    `nrows` is a profiling cap, not a read limit, and it must not become one: a file too large to
+    read through the capped path falls to read_shipped, which returns every row. Nothing that
+    computes an answer may go through here — the gold path is read_shipped.
     """
     suffix = path.suffix.lower()
     if suffix in {".sqlite", ".db", ".sqlite3"}:

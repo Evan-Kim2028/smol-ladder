@@ -132,10 +132,17 @@ def test_synthetic_rungs_are_live():
 
 
 def test_synthetic_reference_has_no_print_and_omits_the_answer():
-    """The L4 payload must not evaluate to the answer, and must not name it either."""
+    """The L4 payload must not evaluate to the answer, and must not name it either.
+
+    The reference now ends in `print(result)` rather than leaving `result` bound: the same
+    program has to be runnable as a script, because it is what the shipped-file gate grades and
+    what the table's real dtype and NA inference produce. What must not survive into the payload
+    is any statement that emits the answer, which is what strip_output drops and this checks.
+    """
     rows, _ = source_for("synthetic")
     for row in rows[:20]:
         source = L.read_source(row, "synthetic")
-        assert "print(" not in source
+        assert source.endswith("print(result)"), row["task_id"]
         payload = L.redact_literals(L.strip_output(source), str(row["answer"]))
+        assert "print(" not in payload, row["task_id"]
         assert L.normalise(row["answer"]) not in L.normalise(payload), row["task_id"]

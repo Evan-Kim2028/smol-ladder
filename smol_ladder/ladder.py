@@ -355,36 +355,22 @@ def synthetic_reference(row: dict) -> str | None:
 
     A synthetic task's specification *is* its provenance: the answer came from executing these
     ops, not from a model claiming to have found it. That makes it a stronger reference than a
-    model-written solution.py, which was selected for reproducing the gold answer and so
-    carries the model's own idiom — the confound the article warns about when it says a pass
-    must mean the model reasoned rather than recognised its teacher's code.
+    model-written solution.py, which was selected for reproducing the gold answer and so carries
+    the model's own idiom — the confound the article warns about when it says a pass must mean
+    the model reasoned rather than recognised its teacher's code.
+
+    synthetic.reference_script() renders it, from the shipped table, so the rung and the gold
+    come from one implementation of the same ops. This used to build the program inline by
+    interpolating column names and filter values into f-strings, which is what made a numeric
+    filter value (`df[df['Year'] == '2016']`) and a column containing a quote produce a rung
+    that computed the wrong thing and would not parse.
 
     Rendered with no print, so it cannot evaluate to the answer, and the answer literal is
     redacted by the caller exactly as for a model reference.
     """
-    ops = row.get("ops")
-    if not ops:
-        return None
-    lines = ["import pandas as pd", f"df = pd.read_csv('input/{row['files'][0]}')"]
-    chain = ""
-    for op in ops:
-        name, _, arg = op.partition("(")
-        arg = arg.rstrip(")")
-        if name == "filter":
-            column, _, want = arg.partition("==")
-            lines.append(f"sub = df[df['{column}'] == '{want}']")
-            chain = "sub"
-        elif name == "value_counts":
-            lines.append(f"counts = df['{arg}'].value_counts()")
-            chain = "counts"
-        elif name == "argmax":
-            lines.append(f"result = counts.index[0]")
-            chain = "scalar"
-        else:
-            source = "sub" if chain == "sub" else "df"
-            lines.append(f"result = {source}['{arg}'].{name}()")
-            chain = "scalar"
-    return "\n".join(lines)
+    from smol_ladder.synthetic import reference_script
+
+    return reference_script(row) or None
 
 
 def read_source(row: dict, split: str) -> str | None:
