@@ -1,9 +1,26 @@
+import json
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from smol_ladder.run_ladder import _run_jailed
+
+
+def grading_pass_argv(inputs: Path, verify: Path) -> list[str]:
+    """The exact argv once() runs for a trial's offline grading pass.
+
+    Built rather than pattern-matched, because a test that guesses at the command list silently
+    stops exercising the thing it claims to: here that meant skipping the pass, reading stdout
+    that was never written, and passing an assertion about the wrong prediction on the agent's
+    output instead.
+    """
+    return ["nice", "-n", "15", "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
+            "--proc", "/proc", "--unshare-net", "--unshare-pid", "--tmpfs", "/tmp",
+            "--bind", str(verify), "/tmp/work",
+            "--chdir", "/tmp/work", "--die-with-parent",
+            "--setenv", "OMP_NUM_THREADS", "1", "--setenv", "OPENBLAS_NUM_THREADS", "1",
+            sys.executable, "solution.py"]
 
 
 def test_a_hanging_command_actually_terminates(tmp_path):
@@ -30,6 +47,162 @@ def test_a_normal_command_returns_its_output(tmp_path):
                        {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin"}, 60)
     assert proc.returncode == 0
     assert b"hello" in proc.stdout
+
+
+def test_once_runs_end_to_end(tmp_path, monkeypatch):
+    """Exercise once() itself, not a stand-in.
+
+    The scratch change introduced a NameError in once() that 67 tests missed, because every
+    test either stubbed once() out or never called it. The solver runs in a *subprocess*, so it
+    cannot be monkeypatched from here; instead the first jailed call is short-circuited with a
+    stub that stands in for the model loop and writes solution.py into the cwd it was handed,
+    which is the contract the real solver honours.
+    """
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+    scratch_marker = tmp_path / "scratch"
+    seen_cwd: list[str] = []
+
+    def fake_run(cmd, cwd, env, timeout):
+        # Anything that is not the grading pass is the model loop, and only that is stubbed:
+        # the offline pass runs the real bubblewrap so the prediction comes from solution.py.
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            return real_run(cmd, cwd, env, timeout)
+        seen_cwd.append(str(cwd))
+        (Path(cwd) / "solution.py").write_text("print(42)\n")
+        return real_run(["bash", "-c", "echo ok"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(scratch_marker))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    result = runner.once(row, "Q?", work, Path(sys.prefix), "m", 2,
+                         inputs_of=lambda r: inputs, rung_label="L1")
+    assert result["agent_status"] == "exit 0", result.get("stderr", "")[:300]
+    assert (work / "solution.py").exists()
+    assert (work / "solution.py").read_text() == "print(42)\n"
+
+    # the agent worked in scratch and left nothing behind there
+    trial_scratch = scratch_marker / "trials" / "t1" / "L1"
+    assert seen_cwd[0] == str(trial_scratch), f"agent ran in {seen_cwd[0]}"
+    assert not trial_scratch.exists(), "per-trial scratch survived the trial"
+    # The empty trials/<task> parents stay: a few directories cost nothing, and pruning them
+    # per trial is a race with every other trial using the same root. What must not survive is
+    # anything the agent wrote.
+    assert not [p for p in scratch_marker.rglob("*") if p.is_file()], \
+        f"scratch kept the agent's files: {list(scratch_marker.rglob('*'))}"
+
+    # nothing the agent wrote may reach the trial directory, which is a result we keep
+    assert not list(work.glob("*.whl"))
+    assert not list(work.glob("tmp"))
+    # input is a symlink to the shared table cache. The verifier's copy is real and expected:
+    # the offline grading pass cannot bind-mount into /tmp/work, so it gets its own copy.
+    link = work / "input"
+    assert link.is_symlink()
+    assert link.resolve() == inputs.resolve()
+    # nothing beyond the result, the solution, and the verifier's own working copy
+    allowed = {"input", "solution.py", "verify", "result.json", "turns.json"}
+    assert {p.name for p in work.iterdir()} <= allowed, sorted(p.name for p in work.iterdir())
+
+    # the prediction is solution.py's own output when re-run offline, not the agent's stdout
+    assert result["prediction"] == "42", result["prediction"]
+    assert result["reward"] == 1.0
+
+
+def test_once_grades_the_offline_run_and_not_the_agents_stdout(tmp_path, monkeypatch):
+    """The failure that made the end-to-end test fail, pinned on its own.
+
+    once() runs solution.py in a second, sealed bubblewrap -- that is the "like the Harbor
+    verifier" part of its docstring -- and grades what *that* printed. If the prediction were
+    taken from the agent's stdout instead, any trial whose script printed nothing would still be
+    scored on whatever the agent's last shell command echoed, and the two would be
+    indistinguishable in the results.
+    """
+    import smol_ladder.run_ladder as runner
+
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):
+            return real_run(cmd, cwd, env, timeout)
+        # A script that produces the right answer only offline, and an agent whose last words
+        # are the wrong answer. Reading the agent's stdout would record 0 here.
+        (Path(cwd) / "solution.py").write_text("print(6 * 7)\n")
+        return real_run(["bash", "-c", "echo 'I could not solve this'"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    work = tmp_path / "trial" / "L1"
+    row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+           "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    result = runner.once(row, "Q?", work, Path(sys.prefix), "m", 2,
+                         inputs_of=lambda r: inputs)
+
+    assert result["prediction"] == "42", result["prediction"]
+    assert result["reward"] == 1.0
+    assert "could not solve" not in json.dumps(result)
+
+
+def test_each_trial_gets_its_own_home(tmp_path, monkeypatch):
+    """A shared $HOME for the whole sweep is the leak once()'s comment warns about.
+
+    Concurrent agents can read each other's pip cache and ~/.cache, and nothing ever cleans it
+    up. HOME is also the directory once() wipes, so pointing it at a shared root would have the
+    runner deleting another trial's scratch out from under it.
+    """
+    import smol_ladder.run_ladder as runner
+
+    homes: list[str] = []
+    real_run = runner._run_jailed
+
+    def fake_run(cmd, cwd, env, timeout):
+        if cmd == grading_pass_argv(Path(cwd), Path(cwd)):  # HOME there is the verify dir
+            return real_run(cmd, cwd, env, timeout)
+        homes.append(env["HOME"])
+        (Path(cwd) / "solution.py").write_text("print(1)\n")
+        return real_run(["bash", "-c", "true"], cwd, env, timeout)
+
+    monkeypatch.setattr(runner, "_run_jailed", fake_run)
+    monkeypatch.setenv("SMOL_LADDER_SCRATCH", str(tmp_path / "scratch"))
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    base = {"files": ["t.csv"], "answer": "1", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+    for i, (task_id, rung) in enumerate([("t1", "L1"), ("t2", "L1"), ("t1", "L2")]):
+        work = tmp_path / "trial" / task_id / rung
+        runner.once({"task_id": task_id, "question": "Q?", **base}, "Q?", work,
+                    Path(sys.prefix), "m", 2, inputs_of=lambda r: inputs, rung_label=rung)
+
+    assert len(set(homes)) == 3, f"two trials shared a HOME: {homes}"
+    assert all(h.endswith(("t1/L1", "t2/L1", "t1/L2")) for h in homes), homes
+
+
+def test_jail_chdirs_into_scratch_not_the_trial_dir(tmp_path):
+    """The jail's --chdir must be the scratch dir, or pip download -d . writes to the results."""
+    from smol_ladder.run_ladder import jail
+    work = tmp_path / "trial"
+    work.mkdir()
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    scratch = tmp_path / "scratch"
+    args = jail(work, inputs, Path(sys.prefix), scratch)
+    chdir = args[args.index("--chdir") + 1]
+    assert chdir == str(scratch), f"jail chdirs to {chdir}, not scratch"
+    assert str(work) not in args, "the trial directory is still bound writable into the jail"
+    # and the agent still sees its tables as ./input
+    assert (scratch / "input").is_symlink()
 
 
 def test_a_program_can_read_its_input_directory(tmp_path):
@@ -158,7 +331,8 @@ def test_the_control_runs_without_a_reference(monkeypatch, tmp_path):
     ran: list[str] = []
     monkeypatch.setattr(runner, "read_source", lambda row, split: None)
 
-    def fake_once(row, prompt, work, venv, model, max_turns, retry_failed, inputs_of):
+    def fake_once(row, prompt, work, venv, model, max_turns, retry_failed, inputs_of,
+                  rung_label="run"):
         ran.append(work.name)
         return {"reward": 0.0, "agent_status": "exit 0", "prediction": ""}
 
