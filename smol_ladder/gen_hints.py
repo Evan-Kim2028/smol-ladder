@@ -315,9 +315,10 @@ def _leak_hits(row: dict, hint_text: str, split: str) -> list[str]:
 
     Delegated rather than reimplemented so a hint is held to exactly the same standard as the
     AST extraction: normalised substring match first, then every numeric literal put through the
-    dataset's grader. The differential matters because 52/250 test tasks are multiple choice,
-    where the answer is already in the question — blaming the hint for it would reject a
-    perfectly good hint on two out of every five tasks that could have one.
+    dataset's grader. The differential matters because an answer already present in the question
+    is a property of the task, not a leak the hint introduced. This docstring used to justify it
+    with "52/250 test tasks are multiple choice"; that is withdrawn as wrong by two orders of
+    magnitude (docs/LADDER.md) and the differential is kept on its own merits.
     """
     from smol_ladder.ladder import PROMPT, leaks as ladder_leaks
 

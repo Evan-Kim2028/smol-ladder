@@ -1127,8 +1127,10 @@ def main() -> None:
             prompt = prompt_for(row, args.split, rung)
             if args.leak_check and rung != "L4":
                 # Only what a rung ADDS counts. L2-L4 are cumulative, so an answer already in
-                # the question (52/250 tasks are multiple choice, where the answer is one of
-                # the options) would otherwise be blamed on every hint.
+                # the question would otherwise be blamed on every hint. These tasks are NOT
+                # multiple choice -- that claim was 52/250 and is wrong by two orders of
+                # magnitude; re-measuring the split finds 1 strict and at most 4 loose hits
+                # (docs/LADDER.md). `task_inherent` is a property of something else.
                 hits = leaks(row, prompt) if rung == "L1" else [
                     h for h in leaks(row, prompt) if h not in leaks(row, l1)
                 ]

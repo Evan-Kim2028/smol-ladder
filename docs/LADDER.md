@@ -2,36 +2,67 @@
 
 ## What we found first (SmolDataEnvs `test`, 250 tasks, space-bunny-alpha)
 
-**The failures on this benchmark are overwhelmingly an exploration problem, not a missing-
-information problem.** Of the tasks that failed L1, 165/179 = 92% passed once we handed the
-model a schema dump of its own tables — a dump that, by construction, adds no information
-about which computation the question wants.
+**The table this section used to open with is withdrawn, and the headline with it.** It reported
+L1 184/250 = 73.6% and an L1+schema control of 165/179 = 92.2% of L1 failures, and concluded that
+"the failures on this benchmark are overwhelmingly an exploration problem, not a missing-information
+problem."
 
-| rung | pass | note |
-|---|---|---|
-| L1 | 184/250 = 73.6% | the normal prompt |
-| L1+schema (control) | 165/179 = 92.2% | no information added, only cheaper reading |
-| L2 | 9/14 = 64.3% | files/columns/filters, read off the reference |
-| L3 | 2/5 = 40.0% | + the method |
-| L4 | 3/3 = 100% | + the reference program, run-and-grade clean |
+Three reasons, in the numbers audit's words ([`audits/2026-10-01-numbers.md`](audits/2026-10-01-numbers.md)):
 
-The rung denominators shrink because climbing stops at the first pass, so these are not
-comparable to each other as independent pass rates: L4's 3/3 is the three tasks that the
-control and L2 both failed.
+- **No artefact of that run survives.** The results it summarised were deleted in the regrade; the
+  tree is not on disk, so no figure in it can be recomputed from per-trial results.
+- **Its denominator is impossible against its own numerator.** The section gives L1 as 184/250,
+  which leaves 66 L1 failures, and then reports a control denominator of 179. 184 + 179 = 363 of 250
+  tasks. The source of 179 is unknown and we do not guess it.
+- **The figure that survives does not support the conclusion.** On the same split the control
+  rescues 23 of 63 L1 failures = 36.5%, a minority. "Overwhelmingly an exploration problem" rested
+  entirely on the 92% number and goes with it.
 
-This is worth stating plainly because it is the opposite of what the ladder was built to
-show, and it is a result rather than a failure. It also means L2–L4 have almost nothing left
-to measure on this benchmark: of 19 climbed tasks, 15 were rescued by a prompt that carried no
-information, 1 by L2, 3 by L4, and 15 never passed at any rung.
+Withdrawn with it: `L1 184/250`, `L2 9/14`, `L3 2/5`, `L4 3/3`, and the "of 19 climbed tasks"
+summary. The audit's superseded-findings table lists each one against its current replacement.
 
-Two caveats before anyone quotes the numbers:
+### What the surviving legacy tree shows
 
-- The 15 "never" and the 47 "no reference" are different things. A task with no reference
-  could not be given L2–L4, so it was never tested against them; it is not a case of the
-  model needing more information.
-- L3 is *below* L2 (2/5 vs 9/14). With these denominators that is noise, but it is also the
-  predicted direction of a real effect: adding a hint spends context and turns, and a real
-  agent has a 40-turn budget. See the monotonicity note below.
+Recomputed on 2026-10-01 by running the summarise tool over the legacy `data/runs/test` tree
+(`python -m smol_ladder.summarize --split test`). Quoting only what it prints:
+
+| | |
+|---|---|
+| L1 | 76.2% [70.9%, 81.6%], 244/250 trials scored, 6 harness failures |
+| L1+schema (control, not a rung) | 23/63 = 36.5% of L1 failures, 7 harness failures |
+| control with a reference | 20/31 = 64.5% |
+| control without a reference | 3/32 = 9.4% |
+
+First passing rung, a partition over the ladder rungs with the control excluded, one bucket per
+task, summing to 250:
+
+| L1 | L2 | L3 | L4 | never | not climbable (no reference) | not scored |
+|---|---|---|---|---|---|---|
+| 186 | 17 | 3 | 3 | 7 | 28 | 6 |
+
+Reference funnel for this run, as the tool reports it: 250 tasks in the split, 213 with a reference
+in the source, and 181 that are actually measurable at L2–L4 — so every L2–L4 figure below is
+conditional on that 181. The 28 "not climbable" tasks had no reference, so they were never tested
+against an information rung; they are not a case of the model needing more information, and they
+are never booked as "never".
+
+Two caveats that bound all of the above, both of which the tool reports itself:
+
+- **k = 1.** Every rung has a single stored trial per task, so these are one sample per rung, not
+  pass probabilities over a distribution. Four identical L1 runs on this split spanned 71.5–74.8%,
+  and 18.9% of tasks flip between runs, so the first-passing-rung buckets at k=1 are not
+  identifiable findings. The one number the tool flags as robust is that 0 of 244 tasks pass on a
+  fraction within 0.25 of the majority line at L1, so no bucket there is a coin flip.
+- **Climbing.** Rungs were run until the first pass, so the per-rung denominators are not
+  comparable to each other as independent pass rates: L4's tasks are by construction the ones the
+  control and L2 both failed.
+
+### A clean re-measurement is in progress
+
+The section above is the best reading of the legacy tree, not the study's result. Run tag `v2` is
+measuring this again from scratch: every rung on every task (`--no-climb`, no climbing), 2 samples
+per rung, the plain-language hints, and an answer-free schema control. It will replace this section
+when it lands. Until then nothing here should be quoted as a finding about the ladder.
 
 ## What a rung is
 
@@ -152,11 +183,15 @@ effect, even though the information is a function of E. So the honest claim is: 
 is a processing gain, not evidence that the task was underdetermined.** We run it on the
 tasks that fail at L1.
 
-Measured here, that gain is large — 92% of L1 failures — which is the strongest result in this
-study and the one most easily over-read as a bug in the control. The checks that it is not:
-the dump is generated by script from the tables alone, never from the reference solution or
-the gold answer; a column whose name equals the answer is replaced before the dump is built;
-and it is identical across models by construction.
+Measured on the legacy tree, that gain is 23/63 = 36.5% of L1 failures, split by reference status
+as 20/31 with a reference and 3/32 without. That is a minority of failures, not an overwhelming
+share, and it is not the strongest result in this study: it rests on 63 attempts at k=1 on a tree
+built by a ladder version that has since changed, and the per-rung denominators there were produced
+by climbing. It is the number a clean re-measurement has to beat or explain, not a finding. The
+checks that the control is not simply leaking remain worth stating, because they are what makes
+the number interpretable at all: the dump is generated by script from the tables alone, never from
+the reference solution or the gold answer; a column whose name equals the answer is replaced before
+the dump is built; and it is identical across models by construction.
 
 RQ4 then reads: does training lower the first passing rung (information), close the L1 vs
 L1+schema gap (skill), or both?
@@ -177,9 +212,10 @@ Either way it is a finding, and the current numbers do not separate the two.
 ## Two task sources
 
 The ladder needs more tasks than SmolDataEnvs can supply: 250 in `test`, 181 with a reference,
-and — as above — almost all of the failures resolved by a control. So the second source is
-**jupyter-agent** (51,389 rows), which shares no dataset with SmolDataEnvs, so overlap is not
-merely unlikely but impossible. It is also much noisier, and the work is in the filter:
+and — as above — a third of the L1 failures left after the control. So the second source is
+**jupyter-agent** (51,389 rows). It does *not* share no dataset with SmolDataEnvs: that was the
+old claim and it was wrong in both directions, see "The overlap firewall was wrong" below. The pool
+is much noisier, and the work is in the filter:
 
 - `executor_type == "e2b"` only; the `llm` rows have simulated outputs, so their answers are
   fiction. That is 66% of the rows.
@@ -303,9 +339,17 @@ rebuild without the cache reports a *smaller* download cost each time more looku
    - *Text*: normalised substring match, plus every numeric literal in the hint put through the
      dataset's own grader, so the test asks exactly the question the reward will ask. Skipped
      for answers under 4 characters, which match by chance.
-   - *Differential*: a hit only counts if L1 does not already have it. 52/250 test tasks are
-     multiple choice, where the answer is one of the options in the question, so those hits
-     are a property of the task and are reported separately as `task_inherent`.
+   - *Differential*: a hit only counts if L1 does not already have it. The `task_inherent` bucket
+     exists for that case, and the comment on it used to explain it with "52/250 test tasks are
+     multiple choice, where the answer is one of the options in the question". **That is wrong by
+     two orders of magnitude and the claim is withdrawn.** Re-measured on all 250 `test` questions
+     on 2026-10-01 across lettered options, "which of the following", the words *options* and
+     *candidates*, and the `, or ` alternative shape: 1 task by a strict lettered-options detector
+     and 4 by the loosest shape, and all four are open questions that merely enumerate inline
+     categories ("Which wetland category (L, P, or R) has the highest mean circularity?"). The
+     longest question in the split is 211 characters. `task_inherent` is therefore a property of
+     something other than multiple choice — 13 per `ladder_test.log` — and the comment has been
+     corrected to say so rather than left asserting a reason we cannot reproduce.
    - *Execution* (`smol_ladder.ladder.leak_free`): strip every print/logging call and every
      docstring from the reference, then **run** the payload offline and re-grade it. A string
      match cannot see a program that names the answer in a label map, a ternary, or a
@@ -329,15 +373,19 @@ funnel is reported first and repeated in every caption:
 | Stage | test | What it means |
 |---|---|---|
 | tasks in split | 250 | |
+| reference present in the source | 213 | as of 2026-10-01, per the summarise tool |
 | verified reference exists | 181 (72%) | a strong agent could find *an* answer that the grader accepts |
 | L4 excluded by the run-and-grade oracle | 0 | the rung does not evaluate to gold on its own |
 | usable ladder tasks | 181 | L2–L4 measurable; L1 and the control measured on all 250 |
 
 Two consequences, stated up front rather than buried:
 
-- The 69 tasks with no reference are **not** "tasks where the model needs more information".
+- The **69 tasks with no usable reference** (250 − 181; of which the legacy run books 28 as
+  `not climbable` and 6 as `not scored`) are **not** "tasks where the model needs more information".
   They are tasks where no reference could be built, and they get their own row in every table.
-  They are never counted as "never passes" on the ladder.
+  They are never counted as "never passes" on the ladder. An earlier version of this file said 47
+  here and 69 in the line below; the two were never reconciled, 69 is the one that matches
+  `read_source`, and the withdrawn figure is recorded in the audit.
 - "Verified" means *the grader accepted this answer*, not *this is the unique correct
   computation*. On tasks with a loose `rtol` a materially different method also grades 1.0. So
   L4 does not certify correctness; it certifies one accepted path. Construction rule 5 already
