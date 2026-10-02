@@ -68,15 +68,17 @@ vLLM ROCm container (section 8). An adapter trained on one image loads on the ot
 
 ## 2. The plan, costed
 
-**Costed plan: gate only $1.65. Gate + train + L1 eval $8.08. Everything bought $17.53.** The first is
+**Costed plan: gate only $1.65. Gate + train + L1 eval $8.72. Everything bought $18.18.** The first is
 what a NO-GO at the gate costs, the second is the plan, and the third buys every optional stage below.
 It is computed by `python ops/amd/driver.py plan`, which prints the same lines under the table. The
 rows below are session 1's measurements on that hardware until this droplet replaces them: after the
 gate `driver.py project` re-renders the table, and after a destroy or on a new droplet it is the
 session-1 table again.
 
-**Gate only: $1.65. Gate + train + L1 eval: $8.08. The second L1 sample adds $2.33. L2-L4 add $6.99.
-The control adds $0.14.** Each optional stage is a separate purchase made after reading L1:
+**Gate only: $1.65. Gate + train + L1 eval: $8.72. The second L1 sample adds $2.33. L2-L4 add $6.99.
+The control adds $0.14.** The evaluation rows rest on a rate measured under the **old stop policy**
+(`submit`), so they carry **+/-30%**: the plan is $8.03 to $9.42 and everything $14.65 to $21.72
+(`driver.py plan` prints the range). Each optional stage is a separate purchase made after reading L1:
 `eval --stage sample2`, `hints`, `control` (or `rest` for all three).
 
 | stage | hours | $ | basis |
@@ -88,9 +90,9 @@ The control adds $0.14.** Each optional stage is a separate purchase made after 
 | smoke: kill and resume | 0.08 | 0.20 | estimate |
 | gate: serve base + released adapter | 0.12 | 0.30 | estimate: download and merge R, start 2 engines, adapter check |
 | gate: 60 tasks x 2 models | 0.09 | 0.22 | 120 trials at 22/min; the L1 run reuses them |
-| sft A | 0.57 | 1.41 | 9.09M tokens / 5,446 tok/s x 1.15 + 150 s |
-| sft B | 0.22 | 0.55 | 3.12M tokens, same basis |
-| sft AB | 0.76 | 1.86 | 12.21M tokens, same basis |
+| sft A | 0.67 | 1.65 | 9.09M tokens / 4,600 tok/s x 1.15 + 150 s |
+| sft B | 0.26 | 0.64 | 3.12M tokens, same basis |
+| sft AB | 0.89 | 2.19 | 12.21M tokens, same basis |
 | serve: start vLLM | 0.12 | 0.29 | estimate: merge 3 trained adapters (R is already merged), start 5 engines |
 | eval L1 | 0.86 | 2.11 | 5 models x 250 tasks x 1 sample = 1,250 trials - 120 done in the gate = 1,130 at 22/min |
 | eval L1 second sample (incremental) | 0.95 | 2.33 | 1,250 trials at 22/min; **optional** |
@@ -98,11 +100,13 @@ The control adds $0.14.** Each optional stage is a separate purchase made after 
 | eval program control | 0.06 | 0.14 | base under `--agent program`, 0.3x a bash trial; optional |
 | sync back + verify | 0.08 | 0.20 | reserve |
 | destroy + verify | 0.02 | 0.04 | reserve |
-| **TOTAL, every row** | **7.13** | **17.53** | |
+| **TOTAL, every row** | **7.39** | **18.18** | |
 
 What the table rests on, **as measured in session 1 on that hardware** (not yet on this droplet):
 
-- **Training**: 5,446 real tokens per second at per-device batch 4 (effective batch 8). The image
+- **Training**: about 4,600 real tokens per second (**4.6k tok/s**, on the corrected token counts;
+  the 5,446 first quoted divided the same seconds by an overcount) at per-device batch 4 (effective
+  batch 8). The image
   lacks the two fast kernels the gated-delta-net layers want (`causal_conv1d`,
   `flash-linear-attention`), so training runs the slow reference code; section 10, item 4, says
   what installing them would take and why it is not done.
@@ -114,7 +118,10 @@ What the table rests on, **as measured in session 1 on that hardware** (not yet 
 - **Evaluation**: about 47 s per 16-turn bash trial, and **about 22 trials per minute summed over
   five servers at 8 workers each**. One L1 block of five models is therefore 5 x 250 = 1,250
   trials / 22 per minute = **57 minutes**; the gate has already done 2 x 60 of them, so the L1 row
-  is 1,130 trials = 51 minutes. (An earlier plan said 11-12 minutes. That was wrong.)
+  is 1,130 trials = 51 minutes. (An earlier plan said 11-12 minutes. That was wrong.) **This rate was
+  measured under the old stop policy** (`--bash-stop submit`); the evaluation now runs `model`, where
+  only the model ends an episode, so trials are longer, while prefix caching (newly on) shortens
+  them: treat every evaluation row as **+/-30%**.
 - **Bootstrap**: about 12 minutes of billed time including the first-boot wait.
 - **Evaluation is the largest optional cost**, and every lever is a flag: `--limit`, `--samples`,
   `--late-samples`, `--rungs`, `--no-base`, `--no-program-control`. The order is the order a reclaim
@@ -136,8 +143,10 @@ already validated, so a fault in our stack shows up on a model we did not train:
 2. It checks `R` through the served stack: a parsed `bash` tool call comes back (the parser matches),
    and its **temperature-0 output on a fixed training prompt differs from the base's** (the adapter
    is applied; identical output is what the first merge bug looked like).
-3. From the laptop, through the tunnel, the harness runs `--agent bash` at **L1 on the first 60 tasks
-   of the SmolDataEnvs test split, one sample, both models concurrently**, supervised (section 6).
+3. From the laptop, through the tunnel, the harness runs `--agent bash` at **L1 on a fixed 60-task subset
+   of the SmolDataEnvs test split (seeded random, stratified by difficulty tier to the split's
+   proportions: 8 easy, 28 medium, 24 hard; `ops/amd/gate_subset.{txt,json}`, regenerated by
+   `python -m ops.amd.gate subset`), one sample, both models concurrently**, supervised (section 6).
    The run tags are the **L1 tags** (`amd2-base`, `amd2-r`), so the full L1 run finds those 60 trials
    done and does not pay for them again.
 4. The gate servers are **stopped first**, then `gate-decide` reads the results:
@@ -307,7 +316,7 @@ nothing further runs. `driver.py project` re-evaluates the decision with new fla
 | `bootstrap` | both | `wait-ssh` runs **`echo READY_$(whoami)`** and requires that exact line, retrying for up to 10 minutes (each try bounded by a 60 s timeout): the image's first boot holds commands behind "Please wait while we get your droplet ready..." while sshd already answers, so an exit status of `true` proved nothing. Then `clean-stage` (removes the remote stage dir so a re-upload cannot nest), `upload`, then `entrypoint.sh`, one non-interactive command: verify sums, unpack, find the image's python, a venv layered over it with only the pure-Python training deps (never the repo's `train` extra: it pins CUDA torch and bitsandbytes), HF login, private Hub repos created and **asserted private even if they pre-existed**, base model downloaded, watchdog armed (apt runs under a lock timeout with bounded retries). `remote.env` is deleted from the laptop afterwards |
 | `smoke` | both | `smoke.sh`: ROCm/stack checklist (PASS/FAIL each, a critical FAIL stops before the benchmark); `bench.py`: the real trainer at per-device batch 4 for 120 s on a mixed A/B sample; `resume_check.sh`: SIGKILL after the first checkpoint, then the real restart logic; then **the gate** (section 2a): `gate-serve`, `gate-tunnel`, `gate-eval` (supervised), **`stop-gate-server`**, `gate-decide`, and the costed GO/NO-GO, valid for this droplet and hardware only. `driver.py gate` runs the gate steps alone |
 | `train` | droplet | `run_sft.sh` per arm: stop any vLLM, skip if finished (on disk, or **on the Hub: a `final.done` marker next to the adapter, which a fresh droplet honours**), assert at least 90% of GPU memory is free, move aside half-written checkpoints, restore `last-checkpoint/` from the Hub on a fresh droplet, then the trainer with `--resume` and a **checkpoint every `--ckpt-steps` (default 50) steps**. If the trainer dies after running at least two minutes (a GPU "device wedged" reset killed one in session 1), the loop **resumes up to `--train-attempts` (default 3) times**, each after the card has recovered, so a reset costs one checkpoint interval; a run that dies sooner is a bug, not a reset, and is not retried. Final adapter verified and pushed, marker last |
-| `serve` | droplet | `serve.sh --wait --verify --arms A,B,AB --hub R=...:8004`: stop everything, **wait for the GPU to give its memory back**, merge every trained adapter and check each merge report **before any server starts**, then start one `vllm` per model (0.17 of the GPU each, `--enable-auto-tool-choice --tool-call-parser qwen3_coder`, `--default-chat-template-kwargs '{"enable_thinking": false}'`, bound to 127.0.0.1). A server that **dies during startup is restarted once** after waiting for GPU memory again (the base server failed once with "Engine core initialization failed" right after the others were killed). Then every adapter gets the tool-call probe and the temperature-0 comparison; the script fails if any adapter's output is identical to the base's |
+| `serve` | droplet | `serve.sh --wait --verify --arms A,B,AB --hub R=...:8004`: stop everything, **wait for the GPU to give its memory back**, merge every trained adapter and check each merge report **before any server starts**, then start one `vllm` per model, **one at a time, each READY before the next**, each with an equal explicit KV cache (`--kv-cache-memory-bytes`, `AMD_KV_CACHE_GIB`, default 16) and `--enable-prefix-caching` (retried once without it, loudly, if an engine fails naming it), `--enable-auto-tool-choice --tool-call-parser qwen3_coder`, `--default-chat-template-kwargs '{"enable_thinking": false}'`, bound to 127.0.0.1). A server that **dies during startup is restarted once** after waiting for GPU memory again (the base server failed once with "Engine core initialization failed" right after the others were killed). Then every adapter gets the tool-call probe and the temperature-0 comparison; the script fails if any adapter's output is identical to the base's |
 | `eval` | laptop | `uv run python -m smol_ladder.run_ladder` per model, concurrently, **supervised** (section 6), each against its own port; the guards refuse it without a gate GO and a verified serve |
 | `sync` | both | adapters and logs to the private Hub repos (works when no arm has finished), pulled to `logs/amd/` (the remote entries by name, `.../smol-ladder/*`: new scp rejects a bare `.` with "unexpected filename"), then `verify-sync`: adapters readable on the Hub, SHA-256 of the pulled adapters equals the droplet's, every evaluated run tag holds **at least 90%** of its first rung's trials **as clean results** (a harness failure is not a trial; a tag with one result is a dead sweep) |
 | `destroy` | API | DELETE by tag, then verified three ways before the ledger closes: the tag listing is empty, every droplet id the ledger ever recorded answers GET with 404 (one that lost its tag is deleted by id), and the whole account is listed. Anything else found, above all an **untagged GPU droplet**, is reported loudly and written to the ledger, and is never deleted: it is not ours |
@@ -449,8 +458,10 @@ Measured there: vLLM 0.17.1 with `--enable-lora` crashes at cuda-graph warmup fo
 (`IndexError` in `set_lora`), and with `--enforce-eager` fails to load a peft all-linear adapter
 (size mismatch on the fused linear-attention projections). So the only serving mode is merged (merge,
 then serve each model on its own process and port; tool calls and adapter effect verified). The
-3-step LoRA smoke trained fine. Session 1 fitted five 2B servers on the card (0.15-0.2 of it each;
-the script uses 0.17) and measured about 180-200 tokens per second per server with about 7
+3-step LoRA smoke trained fine. Session 1 fitted five 2B servers on the card (0.15-0.2 of it each)
+but their KV caches came out 3 to 35 GiB with a 0% prefix-cache hit rate, because five engines started
+at once sized their caches from what the others had taken; session 2 starts them one at a time with an
+equal explicit KV budget (see section 5, `serve`). Session 1 measured about 180-200 tokens per second per server with about 7
 concurrent requests each, because the five engines share the GPU.
 
 ## 9. Teardown checklist
@@ -473,10 +484,10 @@ Ranked by how likely each is to fail on the real instance; none can be verified 
 2. **Merged serving of the released adapter**: it is downloaded from the Hub in the gate, so a repo
    layout that differs from `adapter_config.json` + `adapter_model.safetensors` fails there, at about
    $0.30 of server time, before any training. The gate is exactly the place for that to fail.
-3. **The training stack installing cleanly** over the image's torch: transformers >= 5.17, trl >= 1.13
-   and peft >= 0.21 resolving against a `torch==2.10.0` constraint, and the `.pth` layering exposing the
+3. **The training stack installing cleanly** over the image's torch: the **pinned** transformers 5.18.0,
+   trl 1.14.1, peft 0.21.2 and datasets 5.0.1 (session 1's `versions.log`; `smoke.sh` asserts them) resolving against a `torch==2.10.0` constraint, and the `.pth` layering exposing the
    image's torch to the venv.
-4. **Training speed: the two fast kernels.** Session 1 measured 5,446 tok/s because the image's
+4. **Training speed: the two fast kernels.** Session 1 measured about 4.6k tok/s because the image's
    container lacks `causal_conv1d` and `flash-linear-attention`, so the gated-delta-net layers run the
    slow reference code. **Not installed, deliberately.** `causal-conv1d` is a CUDA/HIP extension that
    compiles from source at install (many billed minutes, a compiler toolchain the container may not
@@ -546,11 +557,41 @@ Each item is what went wrong, what it cost, and the guard that now exists. A tes
 8. **Serving measurements.** LoRA mode does not work on vLLM 0.17.1 for this model (merged only);
    one vLLM process per model on ports 8000+; five 2B servers fit (0.15-0.2 of the card each); about
    180-200 tok/s per server at about 7 concurrent requests each, because the engines share the GPU;
-   a 16-turn bash trial took about 47 s; training ran at 5,446 tok/s because the container lacks
+   a 16-turn bash trial took about 47 s; training ran at about 4.6k tok/s because the container lacks
    `causal_conv1d` and `flash-linear-attention` (section 10, item 4). All of it is in the costed table.
 9. **Results of an invalid session must not be reused.** A run tag that exists is read back as
    finished. This session's tags are `amd2-*`; session 1's `amd1-*` trees are left alone and never
    read. `verify-sync` counts clean results only.
+
+## 12. Pre-flight review fixes, and the owner's decisions
+
+Findings of the review before this paid session, each with where it is fixed and tested.
+
+| finding | now |
+|---|---|
+| Hub resume never worked (`hub_strategy="every_save"` pushes only the adapter files) | `"checkpoint"` pushes `last-checkpoint/`; `sft_run.py` refuses a pushing config that cannot resume; `tests/test_hub_layout.py` holds the layouts captured from a real Trainer. The restore from the real Hub has still never run |
+| Stale or unfinished adapters served as final | Every Hub repo carries one suffix, `AMD_SESSION` (default `s2`: `smol-ladder-sft-{a,b,ab}-s2`, `smol-ladder-runs-s2`; session 1's repos hold invalid adapters and are never reused). `serve.sh` needs the local `.done` or the Hub's `final.done`. `.done` is written last, after the Hub copy's sha256 was read back (`resume.finalize`). `verify-sync` and `push_artifacts --verify` compare the Hub adapter's sha256 with the local final adapter's |
+| A retrained adapter served as the old merge | `merge_adapter.py --check DIR --adapter A` compares the report's `adapter_sha256`; `serve.sh` passes it |
+| Uneven KV caches, no prefix caching | Sequential engine start, equal `--kv-cache-memory-bytes`, `--enable-prefix-caching` (section 5). Watch each `vllm_<port>.log` for the prefix-cache hit rate on the gate: **0% means it is still off** |
+| Unpinned training stack | transformers 5.18.0, trl 1.14.1, peft 0.21.2, datasets 5.0.1; asserted by `smoke.sh` |
+| Stage dir not checked | `driver.py` refuses an upload unless `repo.txt` is HEAD and `tokens.json` is current: re-run `stage.py` |
+| Gate subset was the first 60 ids (25% easy vs 13%) | seeded, tier-stratified subset, committed and recorded with the gate |
+| Render guard let a bash file with no tool calls through | error under `--protocol bash` |
+| Sandbox ran under Python 3.14 | the recording environment (Python 3.12, pandas 3.0.3, numpy 2.4.6, scikit-learn 1.9.0, no pyarrow), `tools/build_eval_env.sh`; each `result.json` records it (`docs/LOCAL_MODELS.md`) |
+| Five concurrent `uv run` harness processes | the repo's `.venv/bin/python` directly |
+| Data unpack skipped when files existed | always unpacked, after the checksum check |
+| Base and `R` downloaded by name | pinned: Qwen/Qwen3.5-2B at `15852e8c16360a2fea060d615a32b45270f8a8fc`, `AdithyaSK/smoldataenvs-sft-2b-v0` at `19e64721085d859f9f93e85e0400c12097bfbfef` (read from the Hub on 2026-10-02; `AMD_BASE_REVISION`, `AMD_HUB_R_REVISION`) |
+| Bash prompt used `question` where the dataset's `instruction` differs | the bash prompt is the instruction, byte for byte, for all 250 test tasks (tested) |
+| Arm A's L1 includes notebooks it trained on | a second table without those 27 test tasks (`ops/amd/overlap_with_arm_a.json`, how it was derived is in the file) is printed by `smol_ladder.summarize` |
+
+**Owner decisions, not changed, to be read with every result:**
+
+- **A versus R is not a replication of R's recipe.** Arm A trains one full epoch (555 steps at an
+  effective batch of 8); the released adapter `R` was trained for `max_steps=100`. Any difference
+  between them mixes the data, the training length and the stack.
+- **Bash-mode results mean:** the content of `/workdir/answer.txt` after at most 16 turns, graded by
+  the dataset's grader. There is **no sealed offline re-run** of the model's work, as the `tools` and
+  `program` modes have: nothing checks that the answer was computed rather than typed.
 
 ## Sources
 

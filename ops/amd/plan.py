@@ -132,9 +132,15 @@ SERVE_START_S = 420.0        # ESTIMATE: merge A, B, AB (R is already merged) an
 
 # MEASURED in session 1 on that hardware. The training number is real trained tokens per second at
 # per-device batch 4 (effective batch 8) with the reference fallback for the two fast kernels the
-# image lacks; the evaluation number is trials per minute summed over all five servers at 8 workers
-# each (a 16-turn bash trial took about 47 s). 1,250 trials at 22 per minute is about 57 minutes.
-MEASURED_TOKENS_PER_S = 5446.0
+# image lacks: about 4.6k on the corrected token counts (the 5,446 first quoted divided the same
+# seconds by session 1's overcounted tokens). The evaluation number is trials per minute summed over
+# all five servers at 8 workers each (a 16-turn bash trial took about 47 s). 1,250 trials at 22 per
+# minute is about 57 minutes -- but it was measured under the OLD stop policy (`submit`: the episode
+# ends at the first answer), and the evaluation now runs `--bash-stop model` (only the model ends an
+# episode, which makes trials longer), with prefix caching newly on (shorter); so every evaluation
+# row carries EVAL_UNCERTAINTY and the driver prints the range.
+MEASURED_TOKENS_PER_S = 4600.0
+EVAL_UNCERTAINTY = 0.30
 MEASURED_TRIALS_PER_MIN = 22.0
 MEASURED_SEC_PER_TRIAL = 47.0
 PROGRAM_COST_FACTOR = 0.3      # a one-turn trial is far cheaper than a bash trial
@@ -584,7 +590,8 @@ def trials_per_min_for(meas: Measured) -> tuple[float, str]:
                                      "droplet's gate (below session 1's)")
     return MEASURED_TRIALS_PER_MIN, (
         f"{MEASURED_TRIALS_PER_MIN:g} trials/min over all servers, measured in session 1 on this "
-        f"hardware (5 models x 8 workers, about {MEASURED_SEC_PER_TRIAL:g} s per 16-turn trial)")
+        f"hardware (5 models x 8 workers, about {MEASURED_SEC_PER_TRIAL:g} s per 16-turn trial) under "
+        f"the old stop policy: +/-{EVAL_UNCERTAINTY:.0%}")
 
 
 def eval_breakdown(cfg: Config, rate: float) -> dict[str, float]:
@@ -632,7 +639,8 @@ def projection(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
     """Every billed stage, in order, with what each number rests on."""
     tps = meas.tokens_per_s or ASSUMED_TOKENS_PER_S
     tps_basis = ("measured on this droplet" if meas.tokens_per_s else
-                 f"{MEASURED_TOKENS_PER_S:,.0f} tok/s measured in session 1 (MI350X, batch 4)")
+                 f"{MEASURED_TOKENS_PER_S:,.0f} tok/s measured in session 1 (MI350X, batch 4, corrected "
+                 "token counts)")
     rate, rate_basis = trials_per_min_for(meas)
     ev = eval_breakdown(cfg, rate)
     bench = BENCH_CONFIGS * (BENCH_SECONDS + BENCH_LOAD_S)
@@ -705,6 +713,16 @@ def staged_dollars(rows: list[Row], price: float) -> dict[str, float]:
     destroy = sum(r.dollars(price) for r in rows if r.stage == "destroy + verify")
     return {"gate_only": total_dollars(rows[:gate_end + 1], price) + destroy,
             "core": total - sum(add.values()), **add, "all": total}
+
+
+def eval_range(rows: list[Row], price: float) -> dict[str, tuple[float, float]]:
+    """The plan and the everything-bought total with every evaluation row (the gate's included) moved
+    by +/-EVAL_UNCERTAINTY: those rows rest on a rate measured under another stop policy."""
+    st = staged_dollars(rows, price)
+    ev = sum(r.dollars(price) for r in rows if r.stage.startswith(("eval", "gate: 60")))
+    core_ev = sum(r.dollars(price) for r in rows if r.stage == ROW_L1 or r.stage == ROW_GATE_EVAL)
+    return {"core": (st["core"] - core_ev * EVAL_UNCERTAINTY, st["core"] + core_ev * EVAL_UNCERTAINTY),
+            "all": (st["all"] - ev * EVAL_UNCERTAINTY, st["all"] + ev * EVAL_UNCERTAINTY)}
 
 
 def remaining_after(rows: list[Row], first_stage_prefix: str) -> list[Row]:

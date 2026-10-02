@@ -719,3 +719,17 @@ Two facts worth keeping either way:
    step, and a rung that flickers is not a rung.
 8. **Seeds.** PLAN asks for ≥2 seeds for A and B. Nothing here sets one beyond `--seed 42`; a
    second seed is a re-run with a different value and a different `--out`.
+---
+
+## Owner decisions for the AMD session (2026-10-02), recorded so no result is read without them
+
+- **Arm A is a full epoch; the released adapter R is not.** Arm A trains one epoch over 4,439 rows
+  at an effective batch of 8, 555 optimizer steps. The released adapter was trained with
+  `max_steps=100`. "A versus R" therefore differs in data pipeline, training length and software
+  stack at once and is **not a replication of R's recipe**.
+- **What a bash-mode result is.** In `--agent bash` a trial's result is the content of
+  `/workdir/answer.txt` after at most 16 turns, graded by the dataset's grader. There is no sealed
+  offline re-run of the model's work (the `tools` and `program` modes grade a re-run of
+  `solution.py` in a sealed jail), so nothing verifies that the answer was computed.
+- **Hub resume uses `hub_strategy="checkpoint"`** (transformers 5.18 pushes `last-checkpoint/` for
+  that strategy only); see `tests/test_hub_layout.py` for the layouts captured from a real Trainer.

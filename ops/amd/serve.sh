@@ -171,7 +171,7 @@ declare -A PIDS=()
 # KV caches came out at 3 to 35 GiB, because each engine sized its cache from what the others had
 # taken by then. Engines now start ONE AT A TIME with an explicit, equal KV budget
 # (--kv-cache-memory-bytes, which vLLM 0.17 documents as ignoring gpu_memory_utilization):
-# AMD_KV_CACHE_GIB per engine; 0 falls back to equal --gpu-memory-utilization shares.
+# AMD_KV_CACHE_GIB per engine (default 16); 0 falls back to equal --gpu-memory-utilization shares.
 kv_args() {
   if (( AMD_KV_CACHE_GIB > 0 )); then
     printf '%s\n' "--kv-cache-memory-bytes" "$((AMD_KV_CACHE_GIB * 1024 * 1024 * 1024))"

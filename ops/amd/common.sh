@@ -76,11 +76,12 @@ AMD_VLLM_WAIT_S="${AMD_VLLM_WAIT_S:-900}"
 AMD_MAX_MODEL_LEN="${AMD_MAX_MODEL_LEN:-16384}"
 # Five 2B engines share one card (288 GB): each gets the same explicit KV-cache budget, and they
 # start one at a time (serve.sh explains why: session 1's per-engine caches came out 3 to 35 GiB).
-# 24 GiB of KV + about 5 GiB of weights and 10 of graphs/activations is ~40 GB an engine, ~200 GB
-# for five, which leaves ~85 GB of headroom; a 16k-token context is a few hundred MiB of KV for
-# this model, so 24 GiB is far more than the 8 workers per model can use. 0 selects the older
+# Session 1's log: the weights take 8.75 GiB an engine ("Model loading took 8.75 GiB"), and an engine
+# ran fine with as little as 3 GiB of KV. 16 GiB of KV + 8.75 of weights + roughly 8 of graphs and
+# activations is ~33 GiB an engine, ~165 GiB (177 GB) for five on a 288 GB card, ~110 GB of
+# headroom for the compile and cuda-graph memory that sits outside the budget. 0 selects the older
 # equal --gpu-memory-utilization shares (AMD_SERVER_UTIL, 0.17 each: measured 0.15-0.2 works).
-AMD_KV_CACHE_GIB="${AMD_KV_CACHE_GIB:-24}"
+AMD_KV_CACHE_GIB="${AMD_KV_CACHE_GIB:-16}"
 AMD_SERVER_UTIL="${AMD_SERVER_UTIL:-0.17}"
 AMD_PREFIX_ARGS="${AMD_PREFIX_ARGS---enable-prefix-caching}"
 # An engine can fail to start ("Engine core initialization failed", a cuda-graph capture assertion)

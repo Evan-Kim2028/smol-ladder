@@ -284,6 +284,10 @@ def print_table(cfg: P.Config, rows: list[P.Row], spent_session: float = 0.0) ->
         if st[key]:
             print(f"    {label + ':':<32} ${st[key]:.2f} incremental   (eval --stage {key})")
     print(f"    everything bought:               ${st['all']:.2f}")
+    rng = P.eval_range(rows, cfg.price)
+    print(f"  evaluation rows are +/-{P.EVAL_UNCERTAINTY:.0%} (rate measured under the old stop policy): "
+          f"the plan ${rng['core'][0]:.2f} to ${rng['core'][1]:.2f}, everything "
+          f"${rng['all'][0]:.2f} to ${rng['all'][1]:.2f}")
     if st["core"] > cfg.budget:
         print(f"  !! THE PLAN IS OVER THE SESSION BUDGET by ${st['core'] - cfg.budget:.2f}")
     elif total > cfg.budget:

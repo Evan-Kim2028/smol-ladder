@@ -346,7 +346,7 @@ def test_every_row_is_price_times_seconds_and_the_total_is_their_sum():
 def test_an_unmeasured_plan_says_what_each_number_rests_on_and_that_this_droplet_has_not_measured_it(capsys):
     rows = P.projection(cfg(), tokens(), P.Measured())
     sft = next(r for r in rows if r.stage == "sft A")
-    assert not sft.measured and "5,446 tok/s measured in session 1" in sft.basis
+    assert not sft.measured and "4,600 tok/s measured in session 1" in sft.basis
     ev = next(r for r in rows if r.stage == P.ROW_L1)
     assert not ev.measured and "22 trials/min" in ev.basis and "session 1" in ev.basis
     boot = next(r for r in rows if r.stage == "bootstrap")
@@ -367,10 +367,10 @@ def test_training_seconds_come_from_tokens_over_measured_throughput():
 
 def test_the_session_1_training_rate_costs_the_corrected_token_counts():
     rows = {r.stage: r for r in P.projection(cfg(), tokens(), P.Measured())}
-    assert P.MEASURED_TOKENS_PER_S == 5446.0
-    assert rows["sft A"].seconds == pytest.approx(9_085_233 / 5446.0 * P.SAFETY + P.SFT_OVERHEAD_S)
-    assert rows["sft B"].seconds == pytest.approx(3_123_047 / 5446.0 * P.SAFETY + P.SFT_OVERHEAD_S)
-    assert rows["sft AB"].seconds == pytest.approx(12_208_280 / 5446.0 * P.SAFETY + P.SFT_OVERHEAD_S)
+    assert P.MEASURED_TOKENS_PER_S == 4600.0
+    assert rows["sft A"].seconds == pytest.approx(9_085_233 / 4600.0 * P.SAFETY + P.SFT_OVERHEAD_S)
+    assert rows["sft B"].seconds == pytest.approx(3_123_047 / 4600.0 * P.SAFETY + P.SFT_OVERHEAD_S)
+    assert rows["sft AB"].seconds == pytest.approx(12_208_280 / 4600.0 * P.SAFETY + P.SFT_OVERHEAD_S)
 
 
 def test_a_zero_throughput_is_refused_not_divided_by():
@@ -915,7 +915,7 @@ def test_serve_sh_sets_the_tool_call_parser_the_non_thinking_template_loopback_a
     assert argv[argv.index("--tool-call-parser") + 1] == "qwen3_coder"
     assert json.loads(argv[argv.index("--default-chat-template-kwargs") + 1]) == {"enable_thinking": False}
     assert {a for i, a in enumerate(argv) if argv[i - 1] == "--host"} == {"127.0.0.1"}
-    assert argv[argv.index("--kv-cache-memory-bytes") + 1] == str(24 * 1024 ** 3)
+    assert argv[argv.index("--kv-cache-memory-bytes") + 1] == str(16 * 1024 ** 3)
     assert "--gpu-memory-utilization" not in argv and "--enable-prefix-caching" in argv
     assert argv[argv.index("--dtype") + 1] == "bfloat16"
     assert {a for i, a in enumerate(argv) if argv[i - 1] == "--tokenizer"} == {serve_env["env"]["AMD_BASE_MODEL"]}
@@ -4336,17 +4336,17 @@ def test_the_stage_requires_the_new_scripts_in_the_pinned_commit():
 
 def test_the_runbook_states_session_1s_measurements_as_measured_on_that_hardware():
     text = runbook()
-    for needle in ("5,446", "47 s", "22 trials per minute", "57 minutes", "12 minutes",
+    for needle in ("4.6k tok/s", "47 s", "22 trials per minute", "57 minutes", "12 minutes",
                    "9,085,233", "3,123,047", "12,208,280", "measured in session 1"):
         assert needle in text, needle
-    assert P.MEASURED_TOKENS_PER_S == 5446.0 and P.MEASURED_TRIALS_PER_MIN == 22.0
+    assert P.MEASURED_TOKENS_PER_S == 4600.0 and P.MEASURED_TRIALS_PER_MIN == 22.0
     assert round(5 * 250 / P.MEASURED_TRIALS_PER_MIN) == 57
     assert (P.RECOUNTED_TOKENS[8192]["A"][1], P.RECOUNTED_TOKENS[8192]["B"][1]) == (9_085_233, 3_123_047)
 
 
 def test_the_runbook_explains_the_gate_its_verdicts_and_what_accept_gate_may_and_may_not_do():
     text = runbook()
-    for needle in ("2a. The gate", "first 60 tasks", "L1 tags", "GO", "NO-GO", "STOP", "--accept-gate",
+    for needle in ("2a. The gate", "60-task subset", "L1 tags", "GO", "NO-GO", "STOP", "--accept-gate",
                    "paired comparison", "stop-reason histograms", "answer_submitted", "max_turns",
                    "context_exhausted", "cannot override", "stop-gate-server", "refuse without it"):
         assert needle in text, needle
