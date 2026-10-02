@@ -252,6 +252,13 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def scratch_label(rung_label: str, run_tag: str, sample: int) -> str:
+    """One directory name per trial invocation: rung, run tag, sample, pid and a random suffix."""
+    import secrets
+    tag = run_tag or "untagged"
+    return f"{rung_label}.{tag}.s{sample}.p{os.getpid()}.{secrets.token_hex(4)}"
+
+
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
          retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run",
          provenance: dict | None = None, was_run: list | None = None,
@@ -313,11 +320,18 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     # `pip download <package> -d .`, which writes into the *current* directory, so the cwd has
     # to move too.
     trial_scratch = Path(os.environ.get("SMOL_LADDER_SCRATCH", "/var/tmp/smol-ladder/scratch"))
-    trial_scratch = trial_scratch / "trials" / row["task_id"] / rung_label
-    # Cleared on entry so a retry never inherits the previous attempt's files, and again on the
-    # way out: a sweep over hundreds of tasks would otherwise leave every wheel it ever collected.
-    shutil.rmtree(trial_scratch, ignore_errors=True)
-    trial_scratch.mkdir(parents=True, exist_ok=True)
+    # Unique per INVOCATION, not per (task, rung): two models evaluated at once under different
+    # run tags, or a sweep and a retry, run the same task and rung at the same time, and a path
+    # keyed on those two alone had each one's rmtree delete the other's working directory
+    # mid-trial (FileNotFoundError: transcript.json). The run tag and sample are in the name so a
+    # directory left behind by a killed run says whose it was; pid plus a random suffix is what
+    # makes it unique.
+    trial_scratch = trial_scratch / "trials" / row["task_id"] / scratch_label(
+        rung_label, (provenance or {}).get("run_tag", ""), (provenance or {}).get("sample", 0))
+    # Cleaned up on the way out: a sweep over hundreds of tasks would otherwise leave every wheel
+    # it ever collected. No cleanup on entry: the directory is new, and removing a path that is
+    # not ours is exactly the bug above.
+    trial_scratch.mkdir(parents=True, exist_ok=False)
     env = {
         "PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
         # Per trial, not a shared root: with one $HOME for the whole sweep, concurrent agents
@@ -716,7 +730,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
                 runs_root: Path | None = None, samples: int = 1,
                 climb: bool = True, agent: str = "tools",
-                save_transcript: bool = True) -> list[dict]:
+                save_transcript: bool = True, run_tag: str = "") -> list[dict]:
     """Run the ladder for one task: `samples` trials per rung, optionally climbing.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
@@ -754,7 +768,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
             continue
         rung_dir = root / row["task_id"] / rung.replace("+", "_")
         # The scratch label carries the sample so two samples of one rung, which run
-        # concurrently, never share a $HOME -- once() rmtree's it on entry.
+        # concurrently, never share a $HOME or a scratch directory (see scratch_label).
         label = rung
         prompt, src = "", None
         passed = False
@@ -772,7 +786,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 ran: list = []
                 r = once(row, prompt, work, venv, model, max_turns,
                          retry_failed, inputs_of, label,
-                         {"rung": prompt_rung, "sample": k, "hint_source": src}, ran,
+                         {"rung": prompt_rung, "sample": k, "hint_source": src, "run_tag": run_tag}, ran,
                          agent, save_transcript)
                 # Write only what once() actually produced.
                 if ran:
@@ -1027,7 +1041,7 @@ def main() -> None:
             futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
                                    args.max_turns, args.retry_failed, inputs_of,
                                    root, args.samples, args.climb, args.agent,
-                                   args.transcript) for row in rows]
+                                   args.transcript, args.run_tag or "") for row in rows]
             # future -> task_id, so the backstop below can name the task without searching the
             # list it came from.
             by_future = dict(zip(futures, (row["task_id"] for row in rows)))

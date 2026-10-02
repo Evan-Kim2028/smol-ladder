@@ -89,8 +89,9 @@ def test_once_runs_end_to_end(tmp_path, monkeypatch):
     assert (work / "solution.py").read_text() == "print(42)\n"
 
     # the agent worked in scratch and left nothing behind there
-    trial_scratch = scratch_marker / "trials" / "t1" / "L1"
-    assert seen_cwd[0] == str(trial_scratch), f"agent ran in {seen_cwd[0]}"
+    trial_scratch = Path(seen_cwd[0])
+    assert trial_scratch.parent == scratch_marker / "trials" / "t1", f"agent ran in {seen_cwd[0]}"
+    assert trial_scratch.name.startswith("L1."), f"agent ran in {seen_cwd[0]}"
     assert not trial_scratch.exists(), "per-trial scratch survived the trial"
     # The empty trials/<task> parents stay: a few directories cost nothing, and pruning them
     # per trial is a race with every other trial using the same root. What must not survive is
@@ -188,7 +189,8 @@ def test_each_trial_gets_its_own_home(tmp_path, monkeypatch):
                     Path(sys.prefix), "m", 2, inputs_of=lambda r: inputs, rung_label=rung)
 
     assert len(set(homes)) == 3, f"two trials shared a HOME: {homes}"
-    assert all(h.endswith(("t1/L1", "t2/L1", "t1/L2")) for h in homes), homes
+    assert all(Path(h).parent.name in ("t1", "t2") and Path(h).name.startswith(("L1.", "L2."))
+               for h in homes), homes
 
 
 def test_once_keeps_the_transcript(tmp_path, monkeypatch):
