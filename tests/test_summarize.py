@@ -236,7 +236,7 @@ def test_two_ladder_versions_of_the_same_task_are_still_refused():
     measurement, so the comparison is per (task, rung) and a disagreement there is still fatal."""
     runs = {"t1": {"L1": [trial(0.0, hash_="aaa"), trial(0.0, hash_="bbb")]}}
 
-    with pytest.raises(S.MixedPrompts, match="t1 at rung L1"):
+    with pytest.raises(S.MixedPrompts, match=r"rung L1: task t1: 2 different prompts"):
         S.check_prompts(runs)
 
 
@@ -244,7 +244,7 @@ def test_a_resumed_rung_written_by_different_code_is_refused():
     """The case the check exists for: sample 0 from the old ladder text, sample 1 from the new."""
     runs = {"t1": {"L1": [trial(0.0, hash_="old")], "L2": [trial(0.0, hash_="old"),
                                                           trial(0.0, hash_="new")]}}
-    with pytest.raises(S.MixedPrompts, match="t1 at rung L2"):
+    with pytest.raises(S.MixedPrompts, match=r"rung L2: task t1: 2 different prompts"):
         S.check_prompts(runs)
 
 
@@ -254,8 +254,8 @@ def test_allow_mixed_records_which_task_and_rung_were_pooled():
 
     mixed = S.check_prompts(runs, allow_mixed=True)
 
-    assert mixed == {"t1/L1": ["aaa", "bbb"]}, mixed
-    assert "L2" not in mixed["t1/L1"]
+    assert mixed == {"L1": ["aaa", "bbb"]}, mixed
+    assert "L2" not in mixed, "a clean L2 cell must not be reported as mixed"
 
 
 def test_an_unrecorded_hash_still_does_not_match_a_recorded_one():
