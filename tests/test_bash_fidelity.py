@@ -286,3 +286,41 @@ def test_the_template_rebuilds_the_user_turn_of_every_recorded_row():
                     answer_format_of(by_id[r["task_id"]]))[1]["content"]
         == r["messages"][1]["content"] for r in rows)
     assert matched / len(rows) >= 0.90, f"{matched}/{len(rows)}"
+
+
+# ── the question comes from the dataset's instruction, not its `question` column ──────────────
+
+def test_the_bash_question_is_the_one_in_the_tasks_instruction_when_the_columns_disagree(row):
+    # task 0001_250_1250662_qa_3 in the test split: `question` carries an extra "as a decimal
+    # number ... e.g. 9.5" the instruction (what the model was trained on and sees) does not.
+    instruction = bash_prompt("The instruction's question?", row["files"], "")[1]["content"]
+    row = {**row, "question": "The question column's wording?", "instruction": instruction}
+    assert L.prompt_for(row, "test", "L1", agent="bash") == instruction
+    assert L.prompt_for(row, "test", "L1")  # the other modes keep using `question`
+    assert "The question column's wording?" in L.prompt_for(row, "test", "L1")
+
+
+def test_a_row_without_an_instruction_keeps_its_question(row):
+    assert row["question"] in L.prompt_for({k: v for k, v in row.items() if k != "instruction"},
+                                           "test", "L1", agent="bash")
+
+
+def _smol_test_split():
+    import os
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    try:
+        from smol_ladder.tasks import load_split
+        return load_split("test")
+    except Exception:  # noqa: BLE001 - no dataset in the local cache: nothing to check against
+        return None
+
+
+def test_the_bash_prompt_equals_the_datasets_instruction_for_all_250_test_tasks():
+    rows = _smol_test_split()
+    if rows is None:
+        pytest.skip("the SmolDataEnvs test split is not in the local Hub cache")
+    assert len(rows) == 250
+    bad = [r["task_id"] for r in rows
+           if bash_prompt(L.bash_question(r), list(r["files"]), answer_format_of(r))[1]["content"]
+           != r["instruction"]]
+    assert not bad, bad

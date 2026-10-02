@@ -1024,6 +1024,22 @@ def bash_paths(source: str) -> str:
     return _INPUT_PATH.sub("/home/user/input", source)
 
 
+_INSTRUCTION_QUESTION = re.compile(r"\n\nQuestion:\n(.*?)\n\nWork it out", re.S)
+
+
+def bash_question(row: dict) -> str:
+    """The question the SFT rows' user turn carries: the one inside the task's `instruction`.
+
+    The dataset's `question` column is not always the instruction's question (test task
+    0001_250_1250662_qa_3 adds "as a decimal number ... e.g. 9.5 means 9:30 AM", 10 of the 5,000
+    train tasks differ the same way). The instruction is what the model is trained on and what the
+    dataset's own harness shows it, so bash mode uses it; rows without one (jupyter-agent,
+    synthetic) keep `question`.
+    """
+    found = _INSTRUCTION_QUESTION.search(row.get("instruction") or "")
+    return found.group(1) if found else row["question"]
+
+
 def prompt_for(row: dict, split: str, rung: str, agent: str = "tools") -> str:
     """The user turn for a rung.
 
@@ -1046,7 +1062,7 @@ def prompt_for(row: dict, split: str, rung: str, agent: str = "tools") -> str:
     file_list = (list(row.get("files") or []) or input_files(row, split)) if bash \
         else input_files(row, split)
     if bash:
-        base = bash_prompt(row["question"], file_list, answer_format_of(row))[1]["content"]
+        base = bash_prompt(bash_question(row), file_list, answer_format_of(row))[1]["content"]
     else:
         base = PROMPT.format(question=row["question"],
                              files="\n".join(f"- {f}" for f in file_list))
