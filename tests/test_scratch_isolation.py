@@ -33,11 +33,13 @@ def test_concurrent_trials_of_one_task_and_rung_do_not_interfere(tmp_path, monke
         who = cmd[-1]
         cwd = Path(cwd)
         cwds.append(cwd)
-        (cwd / "transcript.json").write_text(json.dumps([{"who": who}]))
-        (cwd / "answer.txt").write_text(who)
+        # the bash protocol's artifacts are written to its /workdir, a directory of the scratch
+        workdir = cwd / "workdir"
+        (workdir / "transcript.json").write_text(json.dumps([{"who": who}]))
+        (workdir / "answer.txt").write_text(who)
         both_in_flight.wait()            # both trials now hold their scratch at the same time
-        assert (cwd / "transcript.json").exists(), "another trial deleted this trial's scratch"
-        assert json.loads((cwd / "transcript.json").read_text()) == [{"who": who}]
+        assert (workdir / "transcript.json").exists(), "another trial deleted this trial's scratch"
+        assert json.loads((workdir / "transcript.json").read_text()) == [{"who": who}]
 
         class P:
             returncode, stdout, stderr = 0, b"", b""

@@ -77,29 +77,48 @@ BASH_SYSTEM = (
     "short and concise. Do NOT end your turn without submitting."
 )
 
-BASH_USER = """You are a data-analysis agent working in a sandbox. Use your code-execution tool to
-inspect the files and compute the answer.
-
-Files (in /home/user/input, no subfolders):
-{files}
-
-Installed: pandas, numpy, matplotlib, seaborn, scipy, scikit-learn, statsmodels, tabulate,
-sqlite3, plotly (pip install more if needed).
-
-Question:
-{question}
-
-Work it out step by step — inspect the data first (head, shape, dtypes), then compute.
-
-{answer_format}
-Answer with a single clean value: a bare number (no commas or units, e.g. 95293), a short label,
-yes/no, or a comma-separated list. Keep decimal precision. If there's no applicable answer,
-write: Not Applicable
-
-Write only that value to /workdir/answer.txt (e.g. `echo -n "<value>" > /workdir/answer.txt`),
-then stop."""
+# The user turn of every one of the 4,673 SmolDataEnvs-sft trajectories, reconstructed rather than
+# copied: grouping the rows by their user message with the three variable parts (file list,
+# question, answer-format line) cut out leaves exactly ONE skeleton, so this is the template and
+# the rows are its instances. It is NOT hard-wrapped: an earlier copy of this constant wrapped its
+# lines at ~100 characters and carried an extra blank line when the answer-format line was empty,
+# and a model trained on the unwrapped text and prompted with the wrapped one is being asked a
+# different question. `{answer_format}` is either "" or the per-task line plus its blank line --
+# when it is empty the data has ONE blank line between "compute." and "Answer with", not two.
+BASH_USER = (
+    "You are a data-analysis agent working in a sandbox. Use your code-execution tool to inspect "
+    "the files and compute the answer.\n\n"
+    "Files (in /home/user/input, no subfolders):\n{files}\n\n"
+    "Installed: pandas, numpy, matplotlib, seaborn, scipy, scikit-learn, statsmodels, tabulate, "
+    "sqlite3, plotly (pip install more if needed).\n\n"
+    "Question:\n{question}\n\n"
+    "Work it out step by step \u2014 inspect the data first (head, shape, dtypes), then compute.\n\n"
+    "{answer_format}"
+    "Answer with a single clean value: a bare number (no commas or units, e.g. 95293), a short "
+    "label, yes/no, or a comma-separated list. Keep decimal precision. If there's no applicable "
+    "answer, write: Not Applicable\n\n"
+    "Write only that value to /workdir/answer.txt (e.g. `echo -n \"<value>\" > "
+    "/workdir/answer.txt`), then stop."
+)
 
 DEFAULT_ANSWER_FORMAT = ""
+
+# The per-task line sits between "compute." and "Answer with a single clean value". SmolDataEnvs
+# rows carry it only inside their `instruction` column, so it is read back out of there.
+_ANSWER_FORMAT = re.compile(r"\n\nWork it out step by step[^\n]*\n\n(.*?)Answer with a single clean value",
+                            re.S)
+
+
+def answer_format_of(row: dict) -> str:
+    """The task's own answer-format line ("Express the value as a percentage ..."), or "".
+
+    ~8.5% of SmolDataEnvs-sft rows have one. It is part of the question, not the protocol, so it
+    comes from the task row (`instruction`) and rows without one -- every jupyter-agent and
+    synthetic task -- get the empty string, which the template renders exactly as the data does.
+    """
+    m = _ANSWER_FORMAT.search(row.get("instruction") or "")
+    return m.group(1).strip() if m else DEFAULT_ANSWER_FORMAT
+
 
 BASH_TOOL = [
     {
@@ -125,20 +144,30 @@ BASH_TOOL = [
 
 ANSWER_FILE = "answer.txt"
 
+# Where the SFT trajectories' commands run, as the rows themselves show it: the tables at
+# /home/user/input, the answer at /workdir/answer.txt, the shell's home /home/user (its `ls -la`
+# in 3 rows), and a `/workdir` that is the only other directory the prompt names. The working
+# directory is not recorded -- every one of the 17,099 commands uses absolute paths, or `cd`s first
+# (6,174 of them to /home/user/input) -- so /workdir is a choice, not a measurement.
+INPUT_DIR = "/home/user/input"
+WORKDIR = "/workdir"
+HOME_DIR = "/home/user"
+
 
 def bash_prompt(question: str, files: list[str], answer_format: str = "") -> list[dict]:
     """The prompt each SmolDataEnvs-sft trajectory carries in its `user` turn.
 
     `answer_format` is the per-task line ("Answer as: <value>, <name> ...") that some rows have
-    between the question and the generic format sentence. It is part of the question, not of the
-    protocol, so the caller supplies it per row; pass "" for the rows that have none.
+    between the question and the generic format sentence (`answer_format_of(row)`). It is part of
+    the question, not of the protocol; pass "" for the rows that have none. `files` is rendered as
+    `- name` lines, one per file, in the order given.
     """
     listing = "\n".join(f"- {f}" for f in files)
     return [
         {"role": "system", "content": BASH_SYSTEM},
         {"role": "user", "content": BASH_USER.format(
             question=question, files=listing,
-            answer_format=(answer_format + "\n") if answer_format else DEFAULT_ANSWER_FORMAT)},
+            answer_format=(answer_format + "\n\n") if answer_format else DEFAULT_ANSWER_FORMAT)},
     ]
 
 
@@ -182,19 +211,3 @@ _COMMAND_SHAPED = re.compile(
 def looks_like_a_command(answer: str) -> bool:
     """True when the 'answer' is really the line that would produce it."""
     return bool(answer) and bool(_COMMAND_SHAPED.search(answer.strip()))
-
-
-# ── making their sandbox paths mean something in ours ─────────────────────────
-
-# Their program runs with the tables as the working directory, so `pd.read_csv('a.csv')` is
-# idiomatic. Ours runs one directory up, next to ./input, and writes its submission to the trial
-# directory rather than /workdir. Rewriting the two absolute roots is the whole port: without it
-# every one of their programs raises FileNotFoundError and we would be measuring our sandbox.
-_PATH_MAP = (("/home/user/input", "input"), ("/workdir", "."))
-
-
-def localise_paths(text: str) -> str:
-    """Rewrite upstream's sandbox roots to ours. Applied to programs and to bash commands."""
-    for old, new in _PATH_MAP:
-        text = text.replace(old, new)
-    return text

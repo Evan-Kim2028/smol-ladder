@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from smol_ladder.upstream import BASH_SYSTEM, BASH_TOOL, BASH_USER
+from smol_ladder.upstream import BASH_TOOL, bash_prompt
 
 HELD_OUT_SPLITS = ("test", "eval")
 
@@ -130,11 +130,7 @@ def bash_row(question: str, files: list[str], turns: list[dict], answer_format: 
     file (see `export_sft.py`), keyed by position, which keeps the training rows byte-identical in
     shape to upstream's.
     """
-    listing = "\n".join(f"- {f}" for f in files)
-    user = BASH_USER.format(
-        question=question, files=listing,
-        answer_format=(answer_format + "\n") if answer_format else "")
-    messages = [{"role": "system", "content": BASH_SYSTEM}, {"role": "user", "content": user}]
+    messages = bash_prompt(question, files, answer_format)  # the rows' own template, one builder
     for turn in turns:
         assistant = {"role": "assistant", "content": turn.get("content") or ""}
         if turn.get("tool_calls"):

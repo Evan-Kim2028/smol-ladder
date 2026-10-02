@@ -21,8 +21,9 @@ from pathlib import Path
 import pytest
 
 from smol_ladder.or_agent import SYSTEM, Endpoint, endpoint
-from smol_ladder.upstream import (BASH_TOOL, PROGRAM_SYSTEM, extract_code, localise_paths,
-                                  looks_like_a_command, program_prompt, bash_prompt)
+from smol_ladder.or_agent import CommandResult
+from smol_ladder.upstream import (BASH_TOOL, PROGRAM_SYSTEM, extract_code, looks_like_a_command,
+                                  program_prompt, bash_prompt)
 
 
 class Stub:
@@ -151,12 +152,12 @@ def test_the_command_guard_matches_upstreams_rule():
     assert not looks_like_a_command("42")
 
 
-def test_paths_are_localised_because_our_jail_is_not_their_sandbox():
-    code = "df = pd.read_csv('/home/user/input/Iris.csv')\nprint(len(df))"
-    out = localise_paths(code)
-    assert "input/Iris.csv" in out
-    assert "/home/user" not in out
-    assert "answer.txt" in localise_paths("echo -n 7 > /workdir/answer.txt")
+def test_the_model_s_paths_are_not_rewritten_the_sandbox_provides_them():
+    """The sandbox is built to fit the rows' commands (`run_ladder.jail_bash`); nothing rewrites
+    the commands to fit the sandbox, and the old rewriter is gone."""
+    import smol_ladder.upstream as upstream
+    assert not hasattr(upstream, "localise_paths")
+    assert (upstream.INPUT_DIR, upstream.WORKDIR) == ("/home/user/input", "/workdir")
 
 
 # ── endpoint resolution ───────────────────────────────────────────────────────
@@ -469,7 +470,7 @@ def test_the_bash_protocol_transcript_is_also_a_whole_conversation(tmp_path, mon
     inputs = _inputs_outside_tmp(tmp_path)
     work = tmp_path / "trial" / "L1"
     replies = [
-        assistant(calls=[("bash", {"command": "ls input"})]),
+        assistant(calls=[("bash", {"command": "ls /home/user/input"})]),
         assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})]),
         assistant("The answer is 42."),
     ]
@@ -511,7 +512,7 @@ def test_once_in_bash_mode_grades_the_answer_file(tmp_path, monkeypatch):
     row = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
            "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
     replies = [
-        assistant(calls=[("bash", {"command": "ls input"})]),
+        assistant(calls=[("bash", {"command": "ls /home/user/input"})]),
         assistant(calls=[("bash", {"command": "python3 -c \"print(6*7)\""})]),
         assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})]),
         assistant("The answer is 42."),
@@ -530,8 +531,11 @@ def test_once_in_bash_mode_grades_the_answer_file(tmp_path, monkeypatch):
     assert (work / "answer.txt").read_text() == "42"
     # the bash tool schema is the one from SmolDataEnvs-sft, verbatim
     assert [t["function"]["name"] for t in stub.requests[0]["tools"]] == ["bash"]
-    # and the sandbox saw a localised command, not an absolute /workdir path
-    assert "answer.txt" in json.dumps(stub.requests[1:])
+    # the commands ran as typed, at the paths the SFT rows use: the listing of /home/user/input
+    # came back (a file name, not a Traceback and not a host path), and so did python's output
+    tool_results = [m["content"] for m in stub.requests[-1]["messages"] if m["role"] == "tool"]
+    assert tool_results[0] == "t.csv\n", tool_results
+    assert tool_results[1] == "42\n", tool_results
     assert not (work / "solution.py").exists()
 
 
@@ -743,7 +747,8 @@ def _endpoint_for(monkeypatch, stub, ctx=None):
     return endpoint()
 
 
-def _run_bash_loop(monkeypatch, replies, ctx=None, shell=lambda c: "ok", answer=lambda: None,
+def _run_bash_loop(monkeypatch, replies, ctx=None, shell=lambda c: CommandResult("ok", 0),
+                   answer=lambda: None,
                    max_turns=16, models=None):
     from smol_ladder.or_agent import Episode, bash_loop, context_length
     with flaky_stub(replies) as stub:
@@ -767,7 +772,7 @@ def test_a_tool_output_is_cut_the_way_upstreams_rows_are():
 
 def test_a_huge_tool_output_is_truncated_before_it_joins_the_conversation(monkeypatch):
     replies = [assistant(calls=[("bash", {"command": "cat big.csv"})]), assistant("done")]
-    messages, episode, _ = _run_bash_loop(monkeypatch, replies, shell=lambda c: "x" * 50_000)
+    messages, episode, _ = _run_bash_loop(monkeypatch, replies, shell=lambda c: CommandResult("x" * 50_000, 0))
     tool = [m for m in messages if m["role"] == "tool"][0]
     assert len(tool["content"]) == 8016 and tool["content"].endswith("[truncated]")
     assert episode.truncated_outputs == 1
@@ -847,7 +852,8 @@ def test_a_transport_failure_still_raises_and_is_marked_error(monkeypatch):
         ep = _endpoint_for(monkeypatch, stub)
         episode = Episode()
         with pytest.raises(ClientError):
-            bash_loop([{"role": "user", "content": "q"}], lambda c: "", lambda: None, "m", 4,
+            bash_loop([{"role": "user", "content": "q"}], lambda c: CommandResult("", 0), lambda: None,
+                      "m", 4,
                       ep, episode)
     assert episode.stop_reason == "error"
 

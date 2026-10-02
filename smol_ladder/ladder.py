@@ -28,6 +28,7 @@ import pandas as pd
 from smol_ladder.grade import grade, last_line
 from smol_ladder.sandbox import run_script
 from smol_ladder.tasks import DATA, input_dir, load_split, read_tables
+from smol_ladder.upstream import answer_format_of, bash_prompt
 
 RUNGS = ("L1", "L2", "L3", "L4")
 
@@ -1010,9 +1011,45 @@ def l3_method(row: dict, split: str) -> str:
     return method_hint(read_source(row, split) or "")
 
 
-def prompt_for(row: dict, split: str, rung: str) -> str:
-    files = "\n".join(f"- {f}" for f in input_files(row, split))
-    base = PROMPT.format(question=row["question"], files=files)
+BASH_HINT_HEADER = ("\n\nA verified reference program for this question is below. It is one correct\n"
+                    "approach, not the only one. It reads its tables from the same files, listed "
+                    "here under /home/user/input. Do not copy its output as the answer file: "
+                    "compute the value, then write only that value to /workdir/answer.txt.")
+
+_INPUT_PATH = re.compile(r"(?<![\w/.-])(?:\./)?input(?=/|['\"])")
+
+
+def bash_paths(source: str) -> str:
+    """A reference program's `./input/x.csv` / `input/x.csv` spelled as the bash sandbox has it."""
+    return _INPUT_PATH.sub("/home/user/input", source)
+
+
+def prompt_for(row: dict, split: str, rung: str, agent: str = "tools") -> str:
+    """The user turn for a rung.
+
+    `agent="bash"` is the SFT protocol's conversation: the base text is the training user template
+    (`upstream.bash_prompt`, byte-identical to the SmolDataEnvs-sft rows) with this task's
+    question, its own file list and its own answer-format line, and
+    every rung's block is APPENDED to it -- so L1's text is a prefix of every higher rung there
+    too. The blocks themselves are the generic ones, except that the reference program is shown
+    with `/home/user/input` paths and a header that points at /workdir/answer.txt rather than at a
+    solution.py the bash protocol never writes.
+    """
+    bash = agent == "bash"
+    # The SFT rows list the task's own `files` (the tables its notebook used) and the container held
+    # the whole directory: in all 178 rows that `ls` the input directory after a shorter listing,
+    # `ls` showed every file. Listing the directory instead matches only 74% of the rows' user
+    # turns; the task's files match 96% (the rest differ in the dataset revision). So bash mode
+    # lists `files`, and falls back to the directory when a row has none. The other modes keep
+    # listing the directory, so a prompt never misdescribes what `ls ./input` shows (see
+    # `input_files`); the cost is that L1 in bash mode names the task's tables, as in training.
+    file_list = (list(row.get("files") or []) or input_files(row, split)) if bash \
+        else input_files(row, split)
+    if bash:
+        base = bash_prompt(row["question"], file_list, answer_format_of(row))[1]["content"]
+    else:
+        base = PROMPT.format(question=row["question"],
+                             files="\n".join(f"- {f}" for f in file_list))
     if rung == "L1":
         return base
     if rung == "L1+schema":
@@ -1038,12 +1075,13 @@ def prompt_for(row: dict, split: str, rung: str) -> str:
         # "the lowest rung that passes" stops meaning "the least information that sufficed".
         # Dropping L3's block here made L4 a sibling of L3 rather than a superset, which is
         # the whole ordering claim the ladder rests on.
+        code = redact_literals(strip_output(source), str(row["answer"]))
         return (base
                 + "\n\nNotes on the intended computation:\n\n"
                 + f"{l2_block_text}\n"
                 + f"Method: {l3_method(row, split)}"
-                + HINT_HEADER + "\n```python\n"
-                + redact_literals(strip_output(source), str(row["answer"])) + "\n```")
+                + (BASH_HINT_HEADER if bash else HINT_HEADER) + "\n```python\n"
+                + (bash_paths(code) if bash else code) + "\n```")
     raise ValueError(rung)
 
 

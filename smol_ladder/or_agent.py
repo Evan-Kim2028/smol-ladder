@@ -21,9 +21,10 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
-from smol_ladder.upstream import BASH_TOOL, extract_code, is_program, localise_paths
+from smol_ladder.upstream import BASH_TOOL, extract_code, is_program
 
 MODEL = "stealth/space-bunny-alpha"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -218,6 +219,31 @@ def call_model(messages: list[dict], model: str, tools: list[dict] | None,
     raise RuntimeError(f"{ep.base_url} gave no completion after 5 attempts: {last}")
 
 
+def _kill_and_drain(proc) -> None:
+    """Kill a timed-out command's whole process group and reap it, without waiting on its pipes."""
+    import signal
+    import subprocess
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            proc.wait(timeout=5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    # Close our ends before draining: a command that backgrounds a job leaves a
+    # grandchild holding the write end, and communicate() would block on it forever.
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    proc.wait(timeout=5)
+
+
 def run_command(command: str, timeout: int = 150, cwd: str | None = None,
                 limit: int | None = 20_000) -> str:
     """Run a shell command for the agent, never raising.
@@ -231,33 +257,13 @@ def run_command(command: str, timeout: int = 150, cwd: str | None = None,
 
     So: own process group, real deadline, kill the group, then drain whatever was written.
     """
-    import os
-    import signal
     import subprocess
     proc = subprocess.Popen(["bash", "-c", command], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, cwd=cwd, start_new_session=True)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(os.getpgid(proc.pid), sig)
-            except (ProcessLookupError, PermissionError):
-                break
-            try:
-                proc.wait(timeout=5)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        # Close our ends before draining: a command that backgrounds a job leaves a
-        # grandchild holding the write end, and communicate() would block on it forever.
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        proc.wait(timeout=5)
+        _kill_and_drain(proc)
         return f"[timed out after {timeout}s]"
     text = out.decode("utf-8", "replace") + \
         ("\n--- stderr ---\n" + err.decode("utf-8", "replace") if err else "")
@@ -295,6 +301,94 @@ def truncate_output(text: str, limit: int = TOOL_OUTPUT_MAX_CHARS) -> tuple[str,
     if len(text) <= limit:
         return text, False
     return text[:limit] + TRUNCATION_MARKER, True
+
+
+# ── the bash tool's results, in the format the SFT rows carry ───────────────────
+# Derived from the 17,099 tool results in data/train/sft_upstream, not guessed:
+#   * the result is the command's stdout and stderr as ONE stream, in the order they were written
+#     (a traceback arrives where it happened, there is no "--- stderr ---" divider);
+#   * a command that printed nothing returns "(empty output, rc=N)" -- 1,952 results, with
+#     rc 0 (1,943), 1 (4), 2 (3) and 137 (2, an OOM kill). A non-empty result carries NO exit
+#     status at all, whatever the command returned: a Python traceback is just its text;
+#   * a command that outran the deadline returns one fixed line, after 180 seconds;
+#   * the output is cut to its first 8,000 characters plus a marker (see TOOL_OUTPUT_MAX_CHARS).
+# Output is not stripped: 12,065 of 17,099 end in a newline, and the chat template trims it at
+# render time exactly as it did for the training text.
+BASH_TIMEOUT = 180
+EMPTY_OUTPUT = "(empty output, rc={rc})"
+TIMEOUT_RESULT = "[shell_exec] error: RuntimeError: Command timed out after {seconds} seconds"
+
+# What a command sees of this process's environment. Everything else -- the API key above all --
+# stays out of the model's reach: the jail shares the network and this process's environment, and
+# a tool that can `env` can read the key.
+SANDBOX_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "OMP_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                    "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS", "MKL_DYNAMIC",
+                    "LOKY_MAX_CPU_COUNT", "JOBLIB_START_METHOD", "PIP_DISABLE_PIP_VERSION_CHECK",
+                    "PIP_NO_INPUT", "PYTHONPATH", "PYTHONUNBUFFERED")
+
+
+# The one result the rows carry that no shell produces. 1,833 of the rows' submissions are
+# `printf %s <value> > /workdir/answer.txt` (the other 1,902 are the prompt's `echo -n`), and every
+# one of them -- and nothing else in 17,099 results -- is answered "Wrote N bytes to
+# /workdir/answer.txt", N being the byte length of the value written; `echo -n` gets
+# "(empty output, rc=0)". The source of the rows evidently had a write-the-answer action that was
+# exported as that printf, and its receipt came with it. A model trained on the rows expects the
+# receipt, so the tool returns it: for a command that is exactly that printf and succeeded.
+_PRINTF_SUBMIT = re.compile(r"\Aprintf %s (.*) > /workdir/answer\.txt\Z", re.S)
+ANSWER_RECEIPT = "Wrote {n} bytes to /workdir/answer.txt"
+
+
+@dataclass
+class CommandResult:
+    """One `bash -c` call: the merged output, the exit status, and whether it was killed."""
+    output: str
+    rc: int
+    timed_out: bool = False
+
+
+def sandbox_env(env: dict | None = None) -> dict:
+    """The allowlisted environment for the model's commands."""
+    env = os.environ if env is None else env
+    return {k: env[k] for k in SANDBOX_ENV_KEYS if k in env}
+
+
+def run_bash(command: str, cwd: str | None = None, env: dict | None = None,
+             timeout: int = BASH_TIMEOUT, answer_path: str = "/workdir/answer.txt") -> CommandResult:
+    """Run one command as upstream's tool describes it: a fresh `bash -c`, stdout+stderr merged.
+
+    Own process group and a real deadline, for the reasons `run_command` gives (a command whose
+    children keep the pipe open must not hang the trial). A signal death is reported the way a
+    shell reports it, 128+N: the data shows rc=137 for a killed python, not -9. A `printf %s ... >
+    /workdir/answer.txt` submission is answered with the receipt the rows carry (see
+    ANSWER_RECEIPT).
+    """
+    import subprocess
+    proc = subprocess.Popen(["bash", "-c", command], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, cwd=cwd, env=sandbox_env(env),
+                            start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_and_drain(proc)
+        return CommandResult("", -1, timed_out=True)
+    rc = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
+    text = out.decode("utf-8", "replace")
+    if rc == 0 and not text and _PRINTF_SUBMIT.match(command.strip()):
+        try:
+            text = ANSWER_RECEIPT.format(n=os.path.getsize(answer_path))
+        except OSError:
+            pass
+    return CommandResult(text, rc)
+
+
+def format_tool_result(result: CommandResult, timeout: int = BASH_TIMEOUT) -> tuple[str, bool]:
+    """The tool message's `content`, and whether it was truncated. See the block comment above."""
+    if result.timed_out:
+        return TIMEOUT_RESULT.format(seconds=timeout), False
+    if not result.output.strip():
+        return EMPTY_OUTPUT.format(rc=result.rc), False
+    return truncate_output(result.output)
 
 
 def context_length(ep: Endpoint, model: str, env: dict | None = None) -> int | None:
@@ -491,10 +585,37 @@ def program_once(messages: list[dict], model: str, ep: Endpoint | None = None,
             "ran": is_program(extract_code(message.get("content") or ""))}
 
 
+def _wire_call(call: dict) -> dict:
+    """A tool call reduced to the keys the training rows carry (id, type, function.name/arguments)."""
+    fn = call.get("function") or {}
+    return {"id": call.get("id", ""), "type": "function",
+            "function": {"name": fn.get("name", "bash"), "arguments": fn.get("arguments") or "{}"}}
+
+
+STOP_POLICIES = ("submit", "model")
+# The rows show a text-only assistant turn followed by another assistant turn in 511 of 4,673
+# trajectories (always exactly one such turn before the next tool call): the loop that made them
+# did not end on a tool-free reply. One is allowed; a second in a row ends the episode.
+MAX_TEXT_ONLY_RUN = 1
+
+
 def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
               max_turns: int = 16, ep: Endpoint | None = None,
-              episode: Episode | None = None) -> list[dict]:
+              episode: Episode | None = None, stop: str = "submit") -> list[dict]:
     """The SFT protocol: one `bash` tool, and the loop ends when the answer is submitted.
+
+    `stop` is the end-of-episode policy, and the two policies are different measurements:
+
+    - "submit" (default, what this harness has always done): the episode ends the moment answer.txt
+      exists, and on any reply without a tool call. Cheap, and immune to a model that keeps
+      working after it has answered.
+    - "model": the loop upstream's rows were made by, as far as they show it. 391 of the 4,673 rows
+      keep calling tools after the first write to answer.txt (and 194 write it more than once,
+      the later value being the graded one), and 511 contain a tool-free turn mid-run that the
+      loop did not treat as the end. So only the model ends the episode: a reply without a tool
+      call ends it once an answer exists (every row ends that way, with its closing message), or
+      when it is the second in a row; `max_turns` bounds the rest. `submitted` records the latest
+      content of answer.txt on the turn that wrote it.
 
     Stopping on submission is upstream's "then stop" made executable. Without it a 2B model that
     has answered correctly keeps calling bash, sometimes overwriting its own answer, and the
@@ -503,8 +624,16 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
 
     Upstream's trajectories run 3-12 turns; 16 is a ceiling that no published row reaches.
 
-    Tool output is cut to TOOL_OUTPUT_MAX_CHARS the way upstream's rows are, each request's
-    max_tokens is 1024 clamped to the room left in the context, and an exhausted context ends the
+    `run_shell(command)` returns a `CommandResult` (merged output, exit status, timed-out flag)
+    and the loop turns it into the tool message exactly as the SFT rows carry it
+    (`format_tool_result`: "(empty output, rc=N)", the fixed timeout line, an 8,000-character head
+    cut). The commands are NOT rewritten: the model is trained on /home/user/input and
+    /workdir/answer.txt, so the sandbox provides those paths (`run_ladder.jail_bash`) instead of
+    this loop translating them.
+
+    Request: temperature 0, `tool_choice` auto, `tools` = upstream's single `bash` schema,
+    `chat_template_kwargs` {"enable_thinking": false} (the endpoint's default), and `max_tokens`
+    1024 (eval_pass1's cap) clamped to the room left in the context. An exhausted context ends the
     episode (stop_reason "context_exhausted", graded on whatever answer.txt holds) rather than
     crashing it. `episode` is filled in with stop_reason, turns and token/truncation counts.
 
@@ -516,7 +645,10 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
     """
     ep = ep or endpoint()
     episode = episode or Episode(context_length(ep, model))
+    if stop not in STOP_POLICIES:
+        raise ValueError(f"stop must be one of {STOP_POLICIES}, not {stop!r}")
     episode.stop_reason = "error"  # replaced on every clean exit; stays if a call raises
+    answered, text_only_run, last_submit = False, 0, None
     for _ in range(max_turns):
         completion = complete_within_context(messages, model, BASH_TOOL, ep, episode,
                                              BASH_MAX_TOKENS)
@@ -525,7 +657,7 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
             break
         episode.turns += 1
         message = completion["choices"][0]["message"]
-        calls = message.get("tool_calls") or []
+        calls = [_wire_call(c) for c in message.get("tool_calls") or []]
         turn = len(messages)
         messages.append({
             "role": "assistant",
@@ -533,8 +665,12 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
             **({"tool_calls": calls} if calls else {}),
         })
         if not calls:
-            episode.stop_reason = "model_stopped"
-            break
+            text_only_run += 1
+            if stop == "submit" or answered or text_only_run > MAX_TEXT_ONLY_RUN:
+                episode.stop_reason = "model_stopped"
+                break
+            continue
+        text_only_run = 0
         results = []
         for call in calls:
             fn = call["function"]
@@ -542,18 +678,24 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            command = localise_paths(args.get("command", ""))
-            output, cut = truncate_output(run_shell(command))
+            output, cut = format_tool_result(run_shell(args.get("command", "")))
             episode.truncated_outputs += cut
-            results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+            results.append({"role": "tool", "tool_call_id": call["id"], "content": output,
+                            "name": "bash"})
         messages.extend(results)
         submitted = read_answer()
         if submitted is not None:
-            messages[turn]["submitted"] = submitted
-            episode.stop_reason = "answer_submitted"
-            break
+            answered, last_submit = True, (turn, submitted)
+            if stop == "submit":
+                episode.stop_reason = "answer_submitted"
+                break
     else:
         episode.stop_reason = "max_turns"
+    if last_submit is not None:
+        # Annotated once the loop is over, never mid-run: with stop="model" the conversation goes
+        # back to the server after the submission, and a key the training rows do not have must
+        # not ride along in the request.
+        messages[last_submit[0]]["submitted"] = last_submit[1]
     return messages
 
 

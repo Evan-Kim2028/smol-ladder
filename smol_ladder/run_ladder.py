@@ -42,6 +42,9 @@ from pathlib import Path
 from smol_ladder.grade import grade
 from smol_ladder.ladder import hint_source, ladder_fingerprint, prompt_for, read_source
 from smol_ladder.tasks import DATA, input_dir, load_split
+from smol_ladder.upstream import HOME_DIR as U_HOME
+from smol_ladder.upstream import INPUT_DIR as U_INPUT
+from smol_ladder.upstream import WORKDIR as U_WORKDIR
 from smol_ladder.upstream import looks_like_a_command
 
 JAIL_RO = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"]
@@ -190,6 +193,109 @@ def jail(work: Path, inputs: Path, venv: Path, scratch: Path | None = None) -> l
     return args
 
 
+# Where the bash protocol's sandbox keeps what is not the model's: the package the loop imports.
+# Neither is a path the SFT rows mention, and /srv does not exist on the host root, so the model
+# does not stumble over it.
+BASH_PKG_ROOT = "/srv/smol"
+BASH_EXTRA_SITE = "/srv/pysite"
+MAX_ENTRY_BINDS = 4096
+WHOLE_DIR_ABOVE = 64
+
+
+def input_binds(inputs: Path, dest: str) -> list[str]:
+    """bwrap arguments that show `inputs` read-only at `dest`, as plain files.
+
+    A task's directory is not always plain files: the jupyter-agent tables are symlinks into the
+    kagglehub cache and every directory carries a `.complete` marker. Binding it as-is would put
+    host paths in the output of `ls -l` and the marker in `ls -a`. So the entries are bound one by
+    one, resolved, onto a tmpfs that is then remounted read-only; a directory with many entries
+    and nothing to hide is bound whole instead (a mount per file does not scale to image sets).
+    """
+    entries = sorted(p for p in inputs.iterdir() if not p.name.startswith("."))
+    if len(entries) > WHOLE_DIR_ABOVE and not any(p.is_symlink() for p in entries):
+        return ["--ro-bind", str(inputs.resolve()), dest]
+    args = ["--tmpfs", dest]
+    for entry in entries[:MAX_ENTRY_BINDS]:
+        args += ["--ro-bind", str(entry.resolve()), f"{dest}/{entry.name}"]
+    return args + ["--remount-ro", dest]
+
+
+def jail_bash(inputs: Path, workdir: Path, home: Path,
+              etc: Path) -> tuple[list[str], str, dict, str]:
+    """The bash protocol's sandbox: the SFT rows' own filesystem, not ours with the paths renamed.
+
+    Returns (bwrap argv, the python to run inside it, environment overrides, the directory that
+    holds the `smol_ladder` package inside the jail).
+
+    The rows' commands say `/home/user/input` and `/workdir/answer.txt` literally, and their
+    outputs contain whatever the training container printed. Rewriting the model's commands to fit
+    our layout (what `localise_paths` did) both changed what it typed and left our paths in what it
+    read back. So the sandbox is built to fit the commands:
+
+    - the task's tables read-only at /home/user/input (see `input_binds`), a writable per-trial
+      /home/user as $HOME, a writable per-trial /workdir (the answer lands there and `once()` reads
+      it after the jail exits, the same offline grading as before), cwd /workdir;
+    - the root is a tmpfs holding only /usr, /etc and the loader links, so no host path exists to
+      be leaked by a traceback or a listing, and /etc/passwd names the account `user`;
+    - the interpreter is the one `tools` mode uses (this process's venv), but mounted where a
+      container would have it: its base prefix at /usr/local and its site-packages inside that,
+      so `python3` is /usr/local/bin/python3 and a traceback says
+      /usr/local/lib/python3.14/site-packages/pandas/... instead of a home directory.
+
+    The network is open (the loop talks to the model through it), exactly as in `jail()`.
+    """
+    package = Path(__file__).resolve().parent
+    args = ["bwrap", "--tmpfs", "/"]
+    for d in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc"):
+        path = Path(d)
+        if path.is_symlink():
+            args += ["--symlink", os.readlink(d), d]
+        elif path.is_dir():
+            args += ["--ro-bind", d, d]
+    if Path("/run/systemd/resolve").is_dir():  # /etc/resolv.conf points here on systemd hosts
+        args += ["--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve"]
+    uid, gid = os.getuid(), os.getgid()
+    (etc / "passwd").write_text(f"root:x:0:0:root:/root:/bin/bash\nuser:x:{uid}:{gid}:user:"
+                                f"{U_HOME}:/bin/bash\n")
+    (etc / "group").write_text(f"root:x:0:\nuser:x:{gid}:\n")
+    args += ["--ro-bind", str(etc / "passwd"), "/etc/passwd",
+             "--ro-bind", str(etc / "group"), "/etc/group"]
+    args += ["--dev", "/dev", "--proc", "/proc", "--unshare-pid", "--tmpfs", "/tmp"]
+    # PYTHONUNBUFFERED: the rows show a traceback AFTER the output printed before it. A pipe makes
+    # Python buffer stdout until exit, which puts the traceback first; unbuffered keeps the order.
+    env: dict = {"HOME": U_HOME, "TMPDIR": "/tmp", "PYTHONUNBUFFERED": "1"}
+    base = Path(sys.base_prefix).resolve()
+    if not str(base).startswith("/usr"):
+        ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        sites = list(dict.fromkeys(Path(p).resolve() for p in sys.path
+                                   if p.endswith("site-packages") and Path(p).is_dir()))
+        # The one that holds the data stack is the one that appears as .../site-packages in
+        # tracebacks (under `uv run --with X` there are two: X's overlay and the project's).
+        sites.sort(key=lambda site: not (site / "pandas").is_dir())
+        args += ["--ro-bind", str(base), "/usr/local"]
+        extra = []
+        for i, site in enumerate(sites):
+            if i == 0:
+                args += ["--ro-bind", str(site), f"/usr/local/lib/{ver}/site-packages"]
+            else:
+                args += ["--ro-bind", str(site), f"{BASH_EXTRA_SITE}/{i}"]
+                extra.append(f"{BASH_EXTRA_SITE}/{i}")
+        env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+        if extra:
+            env["PYTHONPATH"] = ":".join(extra)
+        python, pkg_root = "/usr/local/bin/python3", BASH_PKG_ROOT
+        args += ["--ro-bind", str(package), f"{BASH_PKG_ROOT}/smol_ladder"]
+    else:  # a system interpreter: the venv is what holds the data stack, at its own path
+        venv = Path(sys.prefix).resolve()
+        args += ["--ro-bind", str(venv), str(venv), "--ro-bind", str(package), str(package)]
+        env["PATH"] = f"{venv}/bin:/usr/bin:/bin"
+        python, pkg_root = sys.executable, str(package.parent)
+    args += ["--bind", str(home), U_HOME, "--bind", str(workdir), U_WORKDIR]
+    args += input_binds(inputs, U_INPUT)
+    args += ["--chdir", U_WORKDIR, "--die-with-parent"]
+    return args, python, env, pkg_root
+
+
 def _run_jailed(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.CompletedProcess:
     """Run a jailed command with a real deadline.
 
@@ -262,7 +368,7 @@ def scratch_label(rung_label: str, run_tag: str, sample: int) -> str:
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
          retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run",
          provenance: dict | None = None, was_run: list | None = None,
-         agent: str = "tools", save_transcript: bool = True) -> dict:
+         agent: str = "tools", save_transcript: bool = True, bash_stop: str = "submit") -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
@@ -288,7 +394,10 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
 
     - "tools"  ours. run_shell + write_solution, a persistent ./solution.py, re-run offline.
     - "program" upstream's GRPO/eval protocol. One turn, no tools, one fenced program.
-    - "bash"   upstream's SFT protocol. One `bash` tool, submit by writing answer.txt.
+    - "bash"   upstream's SFT protocol. One `bash` tool, submit by writing answer.txt. Run in the
+               rows' own filesystem (`jail_bash`: /home/user/input, /workdir) with the rows' own
+               conversation (`ladder.prompt_for(..., "bash")`, `or_agent.format_tool_result`);
+               `bash_stop` picks the end-of-episode policy (`or_agent.bash_loop`).
 
     Both upstream protocols run in the same jail and are graded by the same offline pass and the
     same grader, so a local 2B model's number and our solver's number are comparable on the
@@ -369,13 +478,25 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     key_env = env["SMOL_LADDER_API_KEY_ENV"]
     if key_env != "OPENROUTER_API_KEY":
         env[key_env] = os.environ.get(key_env, "")
-    script = _agent_script(agent, model, max_turns)
+    if agent == "bash":
+        # The SFT protocol's own filesystem (see jail_bash): the agent's writable /workdir and
+        # $HOME are directories of the per-trial scratch, and everything it produces is read from
+        # /workdir after the jail exits.
+        outdir = trial_scratch / "workdir"
+        home, etc = trial_scratch / "home", trial_scratch / "etc"
+        for d in (outdir, home, etc):
+            d.mkdir()
+        jail_args, python, overrides, pkg_root = jail_bash(inputs, outdir, home, etc)
+        env.update(overrides)
+        script = _agent_script(agent, model, max_turns, pkg_root, bash_stop)
+        command = jail_args + [python, "-c", script, prompt]
+    else:
+        outdir = trial_scratch
+        script = _agent_script(agent, model, max_turns)
+        command = jail(work, inputs, venv, trial_scratch) + [sys.executable, "-c", script, prompt]
     t0 = time.time()
     try:
-        proc = _run_jailed(
-            jail(work, inputs, venv, trial_scratch)
-            + [sys.executable, "-c", script, prompt],
-            trial_scratch, env, timeout=AGENT_TIMEOUT)
+        proc = _run_jailed(command, trial_scratch, env, timeout=AGENT_TIMEOUT)
         agent_status = f"exit {proc.returncode}"
         stderr = proc.stderr.decode("utf-8", "replace")[-2000:] \
             if isinstance(proc.stderr, bytes) else (proc.stderr or "")[-2000:]
@@ -386,19 +507,19 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     # The agent wrote solution.py into scratch; that is the one artifact we keep. Its stdout
     # is deliberately not the prediction: the agent's last command prints whatever it pleased,
     # so the number graded is whatever solution.py itself printed when re-run offline below.
-    produced = trial_scratch / "solution.py"
+    produced = outdir / "solution.py"
     if produced.exists():
         shutil.copy(produced, work / "solution.py")
     # The bash protocol's artifact is a submitted answer rather than a program, so there is
     # nothing to re-run offline: the value the model chose IS the prediction. Kept on disk
     # because it is the only evidence of what the run produced.
-    submitted = trial_scratch / "answer.txt"
+    submitted = outdir / "answer.txt"
     if submitted.exists():
         shutil.copy(submitted, work / "answer.txt")
     # The conversation, if the protocol wrote one. Copied before the rmtree below, and only from a
     # file that parsed: a half-written transcript from a killed trial would otherwise be read back
     # as a complete (and very short) trajectory, which is worse than none at all.
-    transcript = trial_scratch / "transcript.json"
+    transcript = outdir / "transcript.json"
     if save_transcript and transcript.exists():
         try:
             turns = json.loads(transcript.read_text())
@@ -408,7 +529,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
             (work / "transcript.json").write_text(json.dumps(turns))
     episode = {}
     try:
-        episode = json.loads((trial_scratch / "episode.json").read_text())
+        episode = json.loads((outdir / "episode.json").read_text())
     except (OSError, ValueError):
         pass
     shutil.rmtree(trial_scratch, ignore_errors=True)
@@ -438,6 +559,7 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
     if "hint_source" in (provenance or {}):
         result["hint_source"] = provenance["hint_source"]
     if agent == "bash":
+        result["bash_stop"] = bash_stop
         if (work / "answer.txt").exists():
             raw = (work / "answer.txt").read_text().strip()
             if looks_like_a_command(raw):
@@ -584,7 +706,8 @@ def sample_dir(rung_dir: Path, k: int) -> Path:
     return rung_dir if k == 0 else rung_dir / f"s{k}"
 
 
-def _agent_script(agent: str, model: str, max_turns: int) -> str:
+def _agent_script(agent: str, model: str, max_turns: int, pkg_root: str | None = None,
+                  bash_stop: str = "submit") -> str:
     """The program that runs *inside* the jail, one per protocol.
 
     argv[1] is the user turn of the conversation, which for the upstream protocols is built by
@@ -608,7 +731,7 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
             "sys.path.insert(0, %r);"
             "import smol_ladder.or_agent as A;"
             "import smol_ladder.upstream as U;"
-            % str(Path(__file__).resolve().parent.parent))
+            % (pkg_root or str(Path(__file__).resolve().parent.parent)))
     # No format placeholders of its own, so it is concatenated after the %-formatting rather than
     # folded into it: `dump % args` with no specifier is a TypeError, and one of the three bodies
     # formats separately from the other two purely because of where its arguments sit.
@@ -638,15 +761,18 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
             "E.turns=1; E.stop_reason='single_turn'\n"
             "open('solution.py','w').write(out['code'])" % model)
     if agent == "bash":
-        # Output is not tail-clipped by run_command here (limit=None): bash_loop applies upstream's
-        # head cut itself, and clipping twice would leave a cut that is neither.
+        # The conversation starts exactly as the SFT rows do: their system turn, then the user turn
+        # the caller built (`ladder.prompt_for(..., agent="bash")`). Commands run as upstream's
+        # tool describes -- a fresh `bash -c` in /workdir, stdout and stderr merged -- and
+        # bash_loop turns each result into the tool message the rows carry; nothing is rewritten.
         return wrap(
             "M=[{'role':'system','content':U.BASH_SYSTEM},"
             "{'role':'user','content':sys.argv[1]}]",
             "E.context_length=A.context_length(A.endpoint(), %r)\n"
-            "A.bash_loop(M, lambda c: A.run_command(c, limit=None),"
-            "lambda: (open('answer.txt').read() if os.path.exists('answer.txt') else None),"
-            "%r, %d, episode=E)" % (model, model, max_turns))
+            "A.bash_loop(M, lambda c: A.run_bash(c, cwd=U.WORKDIR),"
+            "lambda: (open(U.WORKDIR+'/answer.txt').read() "
+            "if os.path.exists(U.WORKDIR+'/answer.txt') else None),"
+            "%r, %d, episode=E, stop=%r)" % (model, model, max_turns, bash_stop))
     raise ValueError(f"unknown agent protocol {agent!r}")
 
 
@@ -730,7 +856,8 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 max_turns: int, retry_failed: bool = False, inputs_of=input_dir,
                 runs_root: Path | None = None, samples: int = 1,
                 climb: bool = True, agent: str = "tools",
-                save_transcript: bool = True, run_tag: str = "") -> list[dict]:
+                save_transcript: bool = True, run_tag: str = "",
+                bash_stop: str = "submit") -> list[dict]:
     """Run the ladder for one task: `samples` trials per rung, optionally climbing.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
@@ -781,13 +908,14 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                     # Resolved inside the guard and reused across this rung's samples, so the
                     # rung's text and the record of where that text came from cannot disagree:
                     # both read the same cached hint.
-                    prompt = prompt_for(row, split, prompt_rung)
+                    # the bash protocol has its own user turn; the other modes' call is unchanged
+                    prompt = prompt_for(row, split, prompt_rung, *(["bash"] if agent == "bash" else []))
                     src = hint_source(row, split, prompt_rung)
                 ran: list = []
                 r = once(row, prompt, work, venv, model, max_turns,
                          retry_failed, inputs_of, label,
                          {"rung": prompt_rung, "sample": k, "hint_source": src, "run_tag": run_tag}, ran,
-                         agent, save_transcript)
+                         agent, save_transcript, **({"bash_stop": bash_stop} if agent == "bash" else {}))
                 # Write only what once() actually produced.
                 if ran:
                     r["rung"] = prompt_rung
@@ -813,7 +941,8 @@ def _stamp() -> str:
 # restamp the provenance of the trials already on disk; `launches` keeps one entry per launch.
 _LAUNCH_KEYS = ("git_commit", "git_dirty", "command_line", "start_time", "model", "agent",
                 "rungs", "samples", "climb", "workers", "max_turns", "limit", "split",
-                "run_tag", "tasks_planned", "tasks_skipped_no_inputs", "skipped_for_inputs_file")
+                "run_tag", "tasks_planned", "tasks_skipped_no_inputs", "skipped_for_inputs_file",
+                "bash_stop")
 # What a launch reports when it ends, so these are not part of the run's lasting shape.
 _COUNT_KEYS = ("tasks", "trials", "skipped", "trials_scored", "passes")
 
@@ -946,6 +1075,9 @@ def main() -> None:
                          "worse.")
     ap.add_argument("--rungs", default="L1", help="comma-separated, e.g. L1,L1+schema,L2,L3,L4")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--task-ids", default=None,
+                    help="comma-separated task ids (or a file with one per line) to run instead "
+                         "of the whole split; applied before --limit")
     ap.add_argument("--workers", type=int, default=20)
     ap.add_argument("--model", default="stealth/space-bunny-alpha")
     ap.add_argument("--agent", default="tools", choices=["tools", "program", "bash"],
@@ -954,6 +1086,11 @@ def main() -> None:
                          "agent; 'tools' is ours. A released 2B model must be run under its own "
                          "protocol or the number is about the protocol, not the model.")
     ap.add_argument("--max-turns", type=int, default=40)
+    ap.add_argument("--bash-stop", choices=["submit", "model"], default="submit",
+                    help="--agent bash only. 'submit' ends the episode when answer.txt exists or the "
+                         "model replies without a tool call (this harness's behaviour so far); "
+                         "'model' lets only the model end it, as the SFT rows show (see "
+                         "or_agent.bash_loop)")
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run trials whose agent crashed; a clean pass is never re-rolled")
     ap.add_argument("--samples", type=int, default=1,
@@ -982,6 +1119,14 @@ def main() -> None:
         ap.error("--samples must be at least 1")
 
     rows, inputs_of = source_for(args.split)
+    if args.task_ids:
+        wanted = Path(args.task_ids)
+        ids = (wanted.read_text().split() if wanted.is_file()
+               else [t for t in args.task_ids.split(",") if t])
+        known = {r["task_id"] for r in rows}
+        if missing := [t for t in ids if t not in known]:
+            ap.error(f"task ids not in split {args.split}: {missing[:5]}")
+        rows = [r for r in rows if r["task_id"] in set(ids)]
     rows = rows[: args.limit]
     # A task whose tables are not already cached is skipped, not fetched. The Kaggle cache holds
     # 7,018 of the 7,518 v3 tasks; the rest span 144 uncached datasets and the endpoint was
@@ -1016,6 +1161,7 @@ def main() -> None:
     run_record = (root.parent / "RUN.json") if args.run_tag else None
     header = {
         "run_tag": args.run_tag, "split": args.split, "model": args.model, "agent": args.agent,
+        **({"bash_stop": args.bash_stop} if args.agent == "bash" else {}),
         "rungs": rungs, "samples": args.samples, "climb": bool(args.climb),
         "workers": args.workers, "max_turns": args.max_turns, "limit": args.limit,
         "tasks_planned": len(rows),
@@ -1041,7 +1187,8 @@ def main() -> None:
             futures = [pool.submit(task_trials, row, args.split, rungs, venv, args.model,
                                    args.max_turns, args.retry_failed, inputs_of,
                                    root, args.samples, args.climb, args.agent,
-                                   args.transcript, args.run_tag or "") for row in rows]
+                                   args.transcript, args.run_tag or "", args.bash_stop)
+                       for row in rows]
             # future -> task_id, so the backstop below can name the task without searching the
             # list it came from.
             by_future = dict(zip(futures, (row["task_id"] for row in rows)))
