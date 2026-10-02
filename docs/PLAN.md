@@ -146,7 +146,7 @@ Every outcome is reportable. "Hints do not help RL" is a result, not a failure.
 | SmolDataEnvs `train` | 5,000 tasks | on disk, graded by `grader.py` | RL tasks + reward | nothing for RL; SFT needs traces we do not have |
 | SmolDataEnvs-sft | 4,677 verified trajectories | **usable for SFT today**; the export keeps **4,673** and drops 4 | SFT traces | nothing — but it is `bash`-protocol; conversion needed if arms must share one tool format |
 | SmolDataEnvs `test` / `eval` | 250 / 144 | held out, never trained on | in-distribution eval | nothing; **as of 2026-10-01, verified from disk: `test` 213/250 and `eval` 118/144 have a verified reference**, so L2–L4 are measurable on those only. In run v2 the 213 referenced tasks were all measured at every rung (`--no-climb`); 154 of them already pass L1 in both samples |
-| jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** (both re-measured from `data/jtasks_v3.jsonl` and `smol_ladder.pool` on 2026-10-01) | built and tagged; references being generated | RL tasks + reward; eval — the `ja3` transcript sweep over the 3,880 ladder-grade tasks whose tables are cached is **in progress** and has no result yet | verified references (855 in `data/solutions/jupyter-agent` as of 2026-10-01, all on the v1 pool); 337 ladder-grade tasks are skipped for uncached datasets |
+| jupyter-agent pool (v3) | 7,518 tasks, **4,217 ladder-grade** (both re-measured from `data/jtasks_v3.jsonl` and `smol_ladder.pool` on 2026-10-01) | built and tagged; references being generated | RL tasks + reward; eval — the `ja3` transcript sweep over the 3,880 ladder-grade tasks whose tables are cached has yielded **2,029 exported SFT traces** (arm B) and continues | verified references (855 in `data/solutions/jupyter-agent` as of 2026-10-01, all on the v1 pool); 337 ladder-grade tasks are skipped for uncached datasets |
 | Plain-language hints (L2/L3) | 167/181 `test` refs validate | written, validated, cached; **measured on v2: 20 tasks fall back to the AST per rung** | RL curriculum; measurement | the AST arm is 20 tasks, far too few to read a difference off (L3 85.0% AST vs 96.3% hint — not a finding at that size); needs generating on jupyter-agent refs |
 | Synthetic tasks | **6,956** | **gold repaired and gated; unmeasured** | RL tasks (unlimited supply) | the shipped-file gate now refuses any task whose reference does not grade 1.0 against the file the agent is shipped, and the id cache is committed so a regeneration cannot renumber the corpus. But only **275** of the 6,956 have ever been run, so there is no curve: run a full `--no-climb` grid over the corpus before quoting any synthetic number |
 
@@ -193,17 +193,18 @@ many rows it refused and why. Full reasoning and the measured rows: `docs/TRAINI
 
 | # | step | depends on |
 |---|---|---|
-| 1 | **SFT (LoRA) on SmolDataEnvs-sft** — the first training run | a serving/training stack, nothing else. The 4,677 trajectories are `bash`-protocol (`messages` + `tools`, answer in `/workdir/answer.txt`, 3–12 turns; upstream's config used `max_length=8192`) |
+| 1 | **SFT (LoRA) on SmolDataEnvs-sft** = arm A — the first training run | a serving/training stack on AMD, nothing else. The 4,673 exported rows are `bash`-protocol (`messages` + `tools`, answer in `/workdir/answer.txt`, 3–12 turns; upstream's config used `max_length=8192`) |
 | 2 | Converter: the two trace formats → one tool format + chat template | (1), which defines the format. Without it, arm-vs-arm differences are format, not data |
-| 3 | SFT on our own verified traces | (2) for the format, plus our own trace collection — **and our trace collection is [non-blocking] for step 1** |
-| 4 | GRPO (LoRA) on SmolDataEnvs `train` | (1) as its starting point, and a non-degenerate reward. `num_generations=8` at the ~28% pass rate is the problem this project exists to solve |
-| 5 | Hint-curriculum GRPO | verified references + validated L2/L3 hints for the *training* tasks. Hints exist for `test` refs today, not for `train` |
+| 3 | SFT on our own traces = arm B, then A+B | (2) for the format, plus our trace collection — **the collection is done** (2,029 exported ja3 traces) but the runs are **[non-blocking] for step 1** |
+| 4 | GRPO (LoRA) on SmolDataEnvs `train` = arm C | the best SFT arm as its starting point, and a non-degenerate reward. `num_generations=8` at the ~28% pass rate is the problem this project exists to solve |
+| 5 | Hint-curriculum GRPO = arm D | verified references + validated L2/L3 hints for the *training* tasks. Hints exist for `test` refs today, not for `train` |
 | 6 | Ladder measurement of every arm, before and after | each arm existing. Cheap relative to training, so it can run on the baseline as soon as (1) lands |
 
 **Reference generation** is needed for 5 and 6 but **[non-blocking]** for the first training run. Run it
 early anyway: it is the long pole for the ladder and it is what validates a task's gold.
 
-- [ ] 1. SFT (LoRA) on SmolDataEnvs-sft, 4,673 exported traces (4,677 minus 4 leaked questions) — first training run
+- [ ] 1. SFT (LoRA) on SmolDataEnvs-sft, **arm A**, 4,673 exported traces (4,677 minus 4 leaked
+      questions) — first training run
 - [ ] 2. Converter: upstream `bash` traces and our traces → one tool format + chat template
 - [ ] 3. Reference solutions for the training split (`gen_refs` / `gen_solutions`), verified offline
 - [ ] 4. Plain-language L2/L3 hints for the training split (`gen_hints`), validated and cached
@@ -215,28 +216,81 @@ early anyway: it is the long pole for the ladder and it is what validates a task
       whose grading pass failed under load, and report the curve on one task set, the paired
       control effect, rerun consistency, the hint-source split and the ceiling — `docs/LADDER.md`,
       "Run v2"
-- [ ] 6. Our own verified SFT traces in the converted format. **The exporter is written and tested;
-      the data is not.** Transcripts are saved from now on, and the existing tree cannot yield
-      them, so this needs the `ja3` sweep (or `gen_refs` on `train`) before it can be checked off.
-- [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the step-1 model
-- [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises
+- [x] 6. Our own verified SFT traces in the converted format — **the exporter is written and tested,
+      and the data now exists**: `data/train/ja3_sft.jsonl` holds **2,029 traces from 2,109 verified
+      trials** (`data/train/ja3_sft.manifest.json`; 0 rows dropped by the widest-key firewall). This
+      item was open only because the old tree could not yield conversations; the `ja3` sweep is what
+      closed it. The training run itself is item 6b below
+- [ ] 6b. Train **arm B** on those 2,029 traces, then **arm A+B** on 4,673 + 2,029, in that order
+- [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the best SFT arm — arm C
+- [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises — arm D
 - [ ] 9. jupyter-agent references at scale (the 4,217 ladder-grade tasks in `jtasks_v3`).
       **In progress**: the `ja3` transcript sweep over the 3,880 ladder-grade tasks whose tables
-      are cached is running as of 2026-10-01; it has no result yet and none is claimed here
+      are cached produced the 2,029 traces above; reference generation at pool scale continues
 - [ ] 10. Ladder measurement of every arm, before and after, same tasks and protocol
 - [ ] 11. Open decisions below, then the write-up
 
+**Gates before the first instance is created.** Three things must be true before a MI300X droplet
+exists, because each one is cheaper to check here than at $2.59/h:
+
+1. [x] **Arm B's export exists.** Done: 2,029 traces, 2,109 verified trials, 0 firewall drops, scrub
+   enforced — `data/train/ja3_sft.manifest.json`. Arm B is not a plan any more.
+2. [ ] **The AMD runbook and the `ops/amd` scripts are reviewed and dry-run — in progress.** Note
+   that `ops/` does not exist in the tree yet, so this gate is on the runbook's own creation as much
+   as on the scripts. A dry run must cover create, a real training step, and **destroy**.
+3. [ ] **The GRPO loop has had a real local smoke run on the 0.8B model — in progress.** Until a GRPO
+   step has actually executed end to end, arm C's budget line is a guess and its results would be
+   uninterpretable.
+
+## Immediate next steps
+
+1. Finish the export and the hints: close out the ja3 sweep and `gen_hints` for the training split.
+2. Review the AMD runbook and the `ops/amd` scripts, and dry-run them (gate 2).
+3. ROCm smoke test on a short-lived MI300X instance — vLLM + TRL + one training step — then
+   **DESTROY it**, pass or fail.
+4. Train SFT **A**, then **B**, then **A+B** on the instance.
+5. Ladder-evaluate the base model and each of the three adapters on `test`, same tasks, same protocol.
+6. GRPO smoke on the 0.8B locally (gate 3), then **C** and **D** on the remaining credit.
+
 ## Training arms
+
+The SFT arms are **A, then B, then A+B** — the owner's decision of 2026-10-01 — and the two GRPO arms
+follow from whichever SFT arm wins. A is run first because it is the one that can be run today and it
+replicates a known target; B is the interesting comparison; A+B is the practical best.
 
 | Arm | Model | Training | Notes |
 |---|---|---|---|
 | 0 | Qwen3.5-2B | none | the control; base model, no instruction tuning for either protocol |
 | R-SFT | `smoldataenvs-sft-2b-v0` | theirs | a **93 MB LoRA adapter** (r=16, α=32) on the base, not a model |
 | R-GRPO | `smoldataenvs-grpo-2b-v0` | theirs | shipped in **fp32, 8.85 GB**; must be cast to bf16 (4.43 GB) |
-| A | Qwen3.5-2B | SFT (LoRA) on SmolDataEnvs-sft, ~4.7K traces | the baseline we can run today |
-| B | Qwen3.5-2B | SFT on our verified traces | **had no data at all until this branch**: every sweep before 2026-10-01 saved no transcript, so arm B now exists because `run_ladder` and `gen_refs` keep the conversation by default |
-| C | best of A/B | + GRPO (LoRA) on SmolDataEnvs `train` | |
+| A | Qwen3.5-2B | SFT (LoRA) on SmolDataEnvs-sft, **4,673** exported rows | the replication of upstream, and the first run. The export drops the 4 questions that appear verbatim in `test`; the table-level firewall stays an opt-in flag and the contamination is reported either way |
+| B | Qwen3.5-2B | SFT on **our** exported ja3 trajectories, **2,029** traces | **had no data at all until this branch**: every sweep before 2026-10-01 saved no transcript, so arm B exists because `run_ladder` and `gen_refs` keep the conversation by default. The export is done; the counts and stats are in "Arm B's data" below |
+| A+B | Qwen3.5-2B | SFT on A's 4,673 rows plus B's 2,029 | the pooled arm; A+B − A is the read on whether our traces add anything on top of theirs |
+| C | best of A / B / A+B | + GRPO (LoRA) on SmolDataEnvs `train` | plain GRPO, no curriculum |
 | D | C | + hint-curriculum GRPO (L2/L3 withdrawn as pass rate rises) | **promoted from stretch goal**; the ~28% pass rate makes all-zero groups the binding constraint |
+
+**Arm B's data, as of 2026-10-01** (`data/train/ja3_sft.manifest.json`): **2,029 rows**, each
+`messages` + `tools` (the SmolDataEnvs-sft format, one tool named `bash`) and nothing else, from
+**2,109 verified trials**; 983 of those trials had the gold answer below the leak floor. The firewall
+ran at its **widest key, `kaggle_table`** (170 tables; also `bucket_prefix` 170, `question` 393,
+`task_id` 394) and **dropped 0 rows** — the pool is ja3, not SmolDataEnvs. Tokens under the
+Qwen3.5-0.8B chat template with `enable_thinking=False`: min 1,249, **median 2,364**, p90 6,956, max
+54,648, **7.93% over 8,192**; turns min 4, **median 7**, p90 11, max 41. The path/identity scrub fails
+the export if a local absolute path, the local username, a hostname or an API key survives. Op family:
+count 823, agg 400, string 239, filter 195, stat_test 144, other 67, ml_fit 66, argmax 48, groupby 35,
+lookup 12.
+
+A second export, `data/train/ja3_fallback.jsonl`, holds **682 single-turn contract rows** built from
+the 855 v1 verified references in `data/solutions/jupyter-agent` (173 dropped as not in the v3 pool).
+Its own manifest says they are **not traces** — no conversation exists for those trials, so there is no
+exploration in them. They can pad an arm but they cannot stand in for B.
+
+**How to read A vs B, stated plainly.** B is **smaller** (2,029 vs 4,673), it comes from **a different
+solver**, and it shares most of its tables with the SmolDataEnvs `train` split, so the two arms differ
+in size, in teacher and in table coverage at once — A beating B is not by itself evidence that their
+data is worse. The clean version is a **size-matched subsample of A**, an optional later run rather
+than one of the three committed arms. A dataset comparison report (`docs/DATASET_COMPARISON.md`) is
+**in progress** and is not linked here until it exists on disk.
 
 Controls that still decide whether the numbers mean anything:
 
@@ -282,8 +336,8 @@ Controls that still decide whether the numbers mean anything:
 | Resource | Amount | Use for |
 |---|---|---|
 | Laptop RTX 4050 Laptop GPU | 6 GB VRAM (5.3 GB free), 94 GB RAM, **no inference stack installed** | pipeline dev, grader tests, harness sanity checks on 5–20 tasks. Base bf16 weights are 4.55 GB, leaving ~1.0 GB for KV at `--gpu-memory-utilization 0.92`; `--max-model-len 4096`, or 8192 if it fits |
-| Kaggle | 2× T4 16 GB, 30 h/week | the first SFT, and every multi-arm × five-rung sweep. The **fallback** if the AMD credit is not taken |
-| AMD Developer Cloud (MI300X 192 GB, $1.99/h) | $100 ≈ 50 h, **expires 30 days after applying** | arms A–D, intended; the credit is to be applied **only once SFT and GRPO run back to back**, so the window is not spent on an SFT with nowhere to put its RL arm. Whether it has been applied is **unknown** |
+| AMD Developer Cloud (MI300X 192 GB, **$2.59/h**) | **$100.00** of promotional credit, **expires 2026-10-18**, so ≈**38 GPU-hours** at the verified rate | arms A–D. The credit is live and unused, so it is not "applied once SFT and GRPO run back to back" any more — it is spent **AMD first**, while it lasts |
+| Kaggle | 2× T4 16 GB, 30 h/week | the **fallback** if the ROCm smoke test fails, and the home of everything that must happen after 2026-10-18. Credentials are **not yet on this machine**, so it is not a same-day path |
 
 Corrections from `docs/LOCAL_MODELS.md`: the SFT release is a **LoRA adapter** (93 MB, r=16 on
 `all-linear` — it must be served with the base model and the adapter loaded), and the GRPO release is
@@ -291,43 +345,103 @@ Corrections from `docs/LOCAL_MODELS.md`: the SFT release is a **LoRA adapter** (
 (4.43 GB) first. The released models only evaluate meaningfully under each one's own protocol, and
 that doc's throughput figures are bandwidth arithmetic rather than measurements (±2×).
 
-**Arms A/B/C/D are intended for the AMD Developer Cloud credit** (MI300X 192 GB, $1.99/h, $100 ≈
-50 h, expiring 30 days after applying). Kaggle (2× T4, 30 h/week) is the fallback and stays the
-path for the first SFT, which is small enough to run there. The owner's position on the credit is
-to apply it **only once SFT and GRPO can run back to back** — the credit is a 30-day clock, and
-burning it on an SFT that then has nowhere to put its GRPO arm wastes the window on the wrong
-arm. So the sequence is: land SFT on Kaggle, confirm the GRPO script runs end to end, *then*
-apply the credit and run arms A–D on it.
+**The verified compute facts, 2026-10-01.** The AMD Developer Cloud credit is **administered through
+the DigitalOcean API** — instances are created and destroyed against that API — and the token lives
+in the git-ignored `.env` as `AMD_CLOUD_API_TOKEN` (aliased `DIGITALOCEAN_ACCESS_TOKEN`). It is never
+committed. Two facts here are *not* from the API, and are labelled as such rather than dressed up as
+measurements:
+
+- **$100.00 available, expiring 2026-10-18** is read off the **owner's portal**, because the API does
+  not expose credits at all. If this number has moved, only the portal knows.
+- **MI300X 192 GB is $2.59/h**, per the [Droplet pricing
+  docs](https://docs.digitalocean.com/products/droplets/details/pricing/) *and* this account's own
+  GPU size listing via the API. The earlier **$1.99/h** in this document was wrong; **$100 at $2.59/h
+  is ≈38 GPU-hours, not ≈50.** The working deadline is therefore **2026-10-17**, one day before
+  expiry, with a **hard spend cap of $90** — the $10 headroom is what stops a runaway loop from
+  turning a credit run into a real invoice.
+
+Three billing rules decide how the run must be operated, all from the provider's own terms:
+
+- **Invoices land on the first of the month for the previous month's usage**
+  ([invoices](https://docs.digitalocean.com/platform/billing/invoices/)). October's GPU time is
+  therefore invoiced on **2026-11-01**, *after* the credit expires on 2026-10-18. There is no early
+  warning that the cap was blown.
+- **The credit applies to the whole billing cycle it expires in.** The
+  [promotional-credit terms](https://www.digitalocean.com/legal/promotional-credit-discount-terms) say
+  redeemed credits "will be applied to offset eligible fees and charges incurred during the entire
+  billing cycle in which it expires", and charges **above** the credit are billed to the payment
+  method. So spending inside the cycle is what the credit pays for, and the cap is the only thing
+  standing between the run and a real card charge.
+- **A powered-off GPU droplet still bills, so teardown means DESTROY.** Not powering it down, not
+  leaving it idle overnight, not "just pausing for the weekend" — the machine keeps charging until
+  the API call destroys it. GPU droplets bill **per second with a 60-second minimum**
+  ([pricing](https://docs.digitalocean.com/products/droplets/details/pricing/)), so a
+  smoke-test-and-destroy costs about a minute, not an hour.
+
+Spend is tracked from **instance uptime**, not from a timer someone remembers: the harness records
+the create and destroy timestamps, and $2.59 × those hours is the number that matters.
+
+**Budget.** These are *estimates*, to be replaced by measured numbers after the first hour on the
+instance — an hour of real 2B SFT throughput moves every row below.
+
+| Item | Estimate | Note |
+|---|---|---|
+| ROCm smoke test (vLLM + TRL + a training step) | 1 h | per-second billing with a 60 s minimum, so a throwaway instance is cheap |
+| SFT A, then B, then A+B | 3–6 h total | all three share the one 192 GB card |
+| Ladder evaluation: base + three adapters on `test` | 4–8 h | `--no-climb`, k samples |
+| GRPO C (plain) | 8–10 h | |
+| GRPO D (hint curriculum) | 8–10 h | |
+| Margin | 3–5 h | |
+| **Total** | **≈27–38 h** | the top of that range is the whole credit; the bottom leaves real slack |
+
+**If the budget runs short, the cut order is GRPO before SFT/eval.** Drop D first, then C, and keep
+A/B/A+B plus their ladder evaluation — an SFT arm that was measured on the ladder is a result; an
+unmeasured GRPO run is nothing. Nothing runs past $90.
+
+**Kaggle's role.** 2× T4 16 GB, 30 h/week, credentials not yet on this machine. It is the fallback if
+ROCm fails the smoke test — if the MI300X cannot do a training step in the first hour, do not burn
+the credit discovering why — and after 2026-10-18 it carries the second seeds, the size-matched
+subsample of A, the eval-split ladder evaluation, and any overflow.
 
 Gotchas: Kaggle needs a **T4** (vLLM does not support P100), fp16 only (watch for NaN loss spikes with
 Qwen — LoRA and a lower LR), no FlashAttention 2, a 12 h session cap, and the disk is wiped between
 sessions, so checkpoint to the Hub and write results to `data/runs/`. Internet must be enabled (phone
-verification). On AMD, smoke-test vLLM + TRL in the first hour, do not use QLoRA (bitsandbytes on ROCm
-is less mature and memory is not the bottleneck), and do not apply the credit until the GRPO script
-already runs on laptop/Kaggle. Use WSL2 if on Windows.
+verification). On AMD, smoke-test vLLM + TRL in the first hour and **destroy the instance whether
+the test passes or fails** — a failed smoke test on a live droplet is $2.59 per hour of pure lesson.
+Do not use QLoRA (bitsandbytes on ROCm is less mature and memory is not the bottleneck). Use WSL2 if
+on Windows.
 
 Secrets, from `.env` (git-ignored, never committed): `HF_TOKEN`, `KAGGLE_USERNAME`/`KAGGLE_KEY` (or
-`~/.kaggle/kaggle.json`), `OPENROUTER_API_KEY`, and optionally `WANDB_API_KEY`. On Kaggle add them as
-notebook **Secrets**, never inline.
+`~/.kaggle/kaggle.json`), `OPENROUTER_API_KEY`, `AMD_CLOUD_API_TOKEN` /
+`DIGITALOCEAN_ACCESS_TOKEN` for the AMD credit's DigitalOcean management API, and optionally
+`WANDB_API_KEY`. On Kaggle add them as notebook **Secrets**, never inline.
 
 ## Open decisions for the owner
 
 1. Which protocol is the project protocol — upstream's one-turn `program`, the `bash` agent, or our
    `tools` loop? This decides the converter, the held-out discipline and every cross-arm table.
-2. Does the first run go on the laptop or straight to Kaggle? The laptop has no inference stack and
-   6 GB; a 2B LoRA SFT is small enough that Kaggle is likely the cheaper path to a first run.
+2. **Resolved 2026-10-01: the SFT arms are A, then B, then A+B**, and GRPO arms C (plain) and
+   (hint curriculum) start from whichever SFT arm wins. A is first because it runs today and
+   replicates a known target; A+B is last because pooling is only interesting once each half is
+   measured.
 3. **Resolved for now: the firewall stays at `task_id,question` (4,673 rows kept, 4 dropped) and the
    table-level check stays an opt-in flag.** Revisit if the ladder's L1-vs-L2 comparison becomes the
    primary result rather than arm A's replication; it must not be changed silently either way.
-4. **Resolved for now: arms A–D target the AMD credit, applied only once SFT and GRPO run back to
-   back, with Kaggle as the fallback** for the first SFT. The credit's 30-day clock is the reason
-   for the ordering, not the hardware.
+4. **Resolved 2026-10-01: AMD first, Kaggle as fallback and for everything after the credit.**
+   The credit is already applied and expires **2026-10-18**, so there is no longer a question of
+   *when* to spend it — the earlier "apply it only once SFT and GRPO run back to back" ordering was
+   written for a 30-day clock that does not exist. What replaces it is the **$90 hard cap**, the
+   **2026-10-17** working deadline, and **DESTROY** as the only teardown. The first GPU hour goes to
+   a ROCm smoke test; if it fails, the credit goes back to waiting and Kaggle takes over.
 5. Do we hold the 74%-table-overlap contamination and report it, or partition the 471 Kaggle datasets
    for a clean held-out set (which shrinks `test`)?
 6. Synthetic: the gold is repaired and gated, so the split is kept as unlimited RL task supply —
    but it has never been run beyond 275 of 6,956 tasks. Run it, or drop it?
-7. Do we do our own trace collection at all, or is arm B's question ("is our data better than
-   SmolDataEnvs-sft?") answered by a smaller, higher-precision set built only from verified traces?
+7. **Resolved 2026-10-01: we do our own trace collection, and it is arm B** — 2,029 exported ja3
+   trajectories exist, so the question is answered by running B rather than by debating it. The
+   "smaller, higher-precision set built only from verified traces" is already what B is; what
+   remains open is whether A vs B needs the **size-matched subsample of A** to be read fairly, which
+   is an optional later run, and the dataset comparison is being written up separately.
 
 ## Risks
 
