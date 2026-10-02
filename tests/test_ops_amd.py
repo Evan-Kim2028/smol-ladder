@@ -3267,3 +3267,274 @@ def test_the_gate_reads_sample_zero_of_l1_for_a_task_subset_only(tmp_path):
     (root / "x" / "test" / "t3" / "L1").mkdir(parents=True)
     (root / "x" / "test" / "t3" / "L1" / "result.json").write_text("{not json")
     assert G.is_clean(G.read_results(root, "x", "test")["t3"]) is False
+
+
+# ═══ supervising the evaluation ══════════════════════════════════════════════════════════
+
+from ops.amd import supervise as SUP  # noqa: E402
+
+
+class FakeHandle:
+    def __init__(self, sim, i):
+        self.sim, self.i, self.code = sim, i, None
+
+    def poll(self):
+        return self.code
+
+    def stop(self, grace=0):
+        if self.code is None:
+            self.code = -15
+            self.sim.stopped.append(self.i)
+
+
+class Sim:
+    """Drives a Supervisor with no process, socket or sleep: a fake wall clock whose sleeps run a
+    per-tick script that writes result files (with mtimes from that clock) and ends handles."""
+
+    def __init__(self, tmp_path, n=2, expected=20, script=(), **over):
+        self.root = tmp_path / "runs"
+        self.clock = Clock(1_000_000.0)
+        self.script = list(script)
+        self.stopped, self.launches, self.restart_calls, self.logs, self.probes = [], [], [], [], []
+        self.health = {}
+        self.restart_ok = True
+        self.n_written = {}
+        self.targets = [SUP.Target(f"m{i}", f"tag{i}", "test", "L1", 8000 + i, expected) for i in range(n)]
+        kw = dict(name="eval-L1", targets=self.targets, results_root=self.root, launch=self.launch,
+                  restart_servers=self.restart, log=self.logs.append, accrued=lambda: 1.5,
+                  probe=self.probe, clock=self.clock, sleep=self.sleep, tick_s=60.0, stall_s=300.0)
+        kw.update(over)
+        self.sup = SUP.Supervisor(**kw)
+
+    def launch(self, retry):
+        self.launches.append(retry)
+        return [FakeHandle(self, i) for i in range(len(self.targets))]
+
+    def restart(self):
+        self.restart_calls.append(self.clock.t)
+        return self.restart_ok
+
+    def probe(self, port, model):
+        self.probes.append((port, model))
+        return self.health.get(port, True)
+
+    def write(self, i, failed=False, n=1):
+        t = self.targets[i]
+        for _ in range(n):
+            k = self.n_written.setdefault(i, 0)
+            self.n_written[i] = k + 1
+            d = self.root / t.tag / "test" / f"task{k}" / "L1"
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / "result.json"
+            f.write_text(json.dumps({"agent_status": "timeout" if failed else "exit 0"}))
+            os.utime(f, (self.clock.t, self.clock.t))
+
+    def finish(self, code=0):
+        for h in self.sup.handles:
+            h.code = code
+
+    def sleep(self, s):
+        self.clock.sleep(s)
+        if self.script:
+            step = self.script.pop(0)
+            if step:
+                step(self)
+
+    def run(self):
+        return self.sup.run()
+
+
+def ok_tick(sim):
+    sim.write(0)
+    sim.write(1)
+
+
+def test_a_healthy_run_finishes_clean_and_logs_a_progress_line_every_minute(tmp_path):
+    sim = Sim(tmp_path, script=[ok_tick, ok_tick, ok_tick, lambda s: s.finish(0)])
+    out = sim.run()
+    assert out.code == 0 and out.restarts == 0 and sim.launches == [False] and sim.restart_calls == []
+    assert len(sim.logs) == 4                                  # one per tick
+    line = sim.logs[2]
+    assert "eval-L1" in line and "m0 3/20" in line and "m1 3/20" in line
+    assert "trials/min" in line and "ETA" in line and "accrued $1.50" in line
+    assert sim.sup.final_rate == pytest.approx(6 / 4.0)       # 6 results in 4 minutes
+
+
+def test_no_new_result_for_five_minutes_stops_the_harnesses_restarts_the_servers_once_and_resumes(tmp_path):
+    script = [ok_tick] + [None] * 5 + [ok_tick, ok_tick, lambda s: s.finish(0)]
+    sim = Sim(tmp_path, script=script)
+    out = sim.run()
+    assert out.code == 0 and out.restarts == 1
+    assert sim.launches == [False, True]                       # the second launch is --retry-failed
+    assert sorted(sim.stopped) == [0, 1] and len(sim.restart_calls) == 1
+    assert any("STALL: no new result.json for 5.0 min" in ln for ln in sim.logs)
+    assert any("restarting the servers (recovery 1 of 1)" in ln for ln in sim.logs)
+
+
+def test_the_second_stall_stops_the_stage_with_a_nonzero_exit_and_a_clear_message(tmp_path):
+    sim = Sim(tmp_path, script=[None] * 30)
+    out = sim.run()
+    assert out.code == SUP.EXIT_STALLED != 0 and out.restarts == 1
+    assert "STOPPED after 1 recovery attempt(s)" in out.message and "STILL BILLING" in out.message
+    assert "STALL" in out.message and "vllm_*.log" in out.message
+    assert len(sim.restart_calls) == 1 and sim.launches == [False, True]
+    # bounded: first stall at 5 min, restart, second stall 5 min after it: about 10 ticks, not hours
+    assert sim.clock.t - 1_000_000.0 <= 11 * 60
+
+
+def test_a_stalled_run_burns_at_most_two_detection_windows(tmp_path):
+    sim = Sim(tmp_path, script=[None] * 100)
+    sim.run()
+    assert sim.clock.t - 1_000_000.0 == pytest.approx(10 * 60.0)
+
+
+def test_a_failed_server_restart_stops_the_stage_too(tmp_path):
+    sim = Sim(tmp_path, script=[None] * 10)
+    sim.restart_ok = False
+    out = sim.run()
+    assert out.code == SUP.EXIT_STALLED and "server restart failed" in out.message and sim.launches == [False]
+
+
+def test_a_high_share_of_harness_failures_among_the_last_results_is_a_trigger_even_while_results_arrive(tmp_path):
+    def fail_tick(sim):
+        sim.write(0, failed=True, n=2)
+        sim.write(1)
+    sim = Sim(tmp_path, script=[fail_tick] * 6, window=10, error_share=0.5)
+    out = sim.run()
+    assert out.code == SUP.EXIT_STALLED
+    assert any("m0: " in ln and "harness failures (threshold 50%)" in ln for ln in sim.logs)
+    assert not any("m1: " in ln and "harness failures" in ln for ln in sim.logs)
+
+
+def test_only_results_written_since_the_restart_count_toward_the_error_share(tmp_path):
+    def burst(sim):
+        sim.write(0, failed=True, n=6)
+        sim.write(1)
+    sim = Sim(tmp_path, script=[burst, ok_tick, ok_tick, ok_tick, lambda s: s.finish(0)])
+    out = sim.run()
+    # the six failures trigger the first recovery; after it, the old failures must not trigger again
+    assert out.code == 0 and out.restarts == 1
+
+
+def test_a_few_failures_below_the_threshold_do_not_trigger(tmp_path):
+    def tick(sim):
+        sim.write(0, failed=True)
+        sim.write(0, n=3)
+        sim.write(1)
+    sim = Sim(tmp_path, script=[tick, tick, tick, lambda s: s.finish(0)])
+    assert sim.run().code == 0
+
+
+def test_two_failed_health_probes_in_a_row_stop_and_restart(tmp_path):
+    def bad(sim):
+        sim.health[8001] = False
+        ok_tick(sim)
+    sim = Sim(tmp_path, script=[bad, ok_tick, ok_tick, lambda s: (s.health.update({8001: True}), ok_tick(s)),
+                                ok_tick, lambda s: s.finish(0)])
+    out = sim.run()
+    assert out.code == 0 and out.restarts == 1
+    assert any("health probe failed 2 times in a row: m1 (:8001)" in ln for ln in sim.logs)
+    assert (8000, "m0") in sim.probes and (8001, "m1") in sim.probes     # every port, every tick
+
+
+def test_a_single_failed_health_probe_is_forgiven_when_the_next_one_answers(tmp_path):
+    def blip(sim):
+        sim.health[8000] = False
+        ok_tick(sim)
+
+    def recover(sim):
+        sim.health[8000] = True
+        ok_tick(sim)
+    sim = Sim(tmp_path, script=[blip, recover, blip, recover, lambda s: s.finish(0)])
+    out = sim.run()
+    assert out.code == 0 and out.restarts == 0
+
+
+def test_a_harness_process_that_exits_nonzero_is_a_trigger(tmp_path):
+    sim = Sim(tmp_path, script=[ok_tick, lambda s: s.finish(2)] + [None] * 3 + [lambda s: s.finish(0)])
+    out = sim.run()
+    assert out.restarts == 1 and out.code == 0
+    assert any("exited with status [2, 2]" in ln for ln in sim.logs)
+
+
+def test_a_sweep_that_finished_with_mostly_failures_is_not_called_clean(tmp_path):
+    def burst_and_finish(sim):
+        sim.write(0, failed=True, n=8)
+        sim.write(1, n=8)
+        sim.finish(0)
+    sim = Sim(tmp_path, script=[burst_and_finish, ok_tick, ok_tick, lambda s: s.finish(0)])
+    out = sim.run()
+    assert out.code == 0 and out.restarts == 1     # not accepted as finished: retried, then clean
+    assert sim.launches == [False, True]
+
+
+def test_an_exception_mid_run_still_stops_every_harness_process(tmp_path):
+    def boom(sim):
+        raise KeyboardInterrupt
+    sim = Sim(tmp_path, script=[ok_tick, boom])
+    with pytest.raises(KeyboardInterrupt):
+        sim.run()
+    assert sorted(sim.stopped) == [0, 1]
+
+
+def test_the_supervisor_stops_by_process_group_of_its_own_child_never_by_name():
+    src = Path(SUP.__file__).read_text()
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith(("#", '"""')))
+    assert "pkill" not in code and "pgrep" not in code and "killall" not in code
+    assert "start_new_session=True" in code and "os.killpg(pgid" in code and "os.getpgrp()" in code
+
+
+def test_stopping_a_proc_kills_its_whole_tree_and_leaves_the_parent_alive(tmp_path):
+    pidfile = tmp_path / "grandchild.pid"
+    proc = SUP.Proc(["bash", "-c", f"sleep 300 & echo $! > {pidfile}; wait"], dict(os.environ))
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        subprocess.run(["sleep", "0.05"])
+    grandchild = int(pidfile.read_text())
+    assert os.getpgid(proc.pid) == proc.pid != os.getpgrp()      # its own group: ours is untouched
+    proc.stop(grace=5)
+    assert proc.poll() is not None
+    for _ in range(100):
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        subprocess.run(["sleep", "0.05"])
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild, 0)
+    os.kill(os.getpid(), 0)                                       # and so is this process
+
+
+def test_the_health_probe_needs_a_real_completion_and_times_out_on_a_hung_engine():
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        mode = "ok"
+
+        def do_POST(self):
+            if H.mode == "hang":
+                subprocess.run(["sleep", "2"])
+            body = json.dumps({"choices": [{"message": {"content": "x"}}]} if H.mode != "empty" else {}).encode()
+            self.send_response(200 if H.mode != "500" else 500)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        assert SUP.probe_http(port, "m", timeout=1.0) is True
+        H.mode = "empty"
+        assert SUP.probe_http(port, "m", timeout=1.0) is False
+        H.mode = "500"
+        assert SUP.probe_http(port, "m", timeout=1.0) is False
+        H.mode = "hang"
+        assert SUP.probe_http(port, "m", timeout=0.3) is False
+    finally:
+        srv.shutdown()
+    assert SUP.probe_http(port, "m", timeout=0.3) is False        # nothing listening any more
