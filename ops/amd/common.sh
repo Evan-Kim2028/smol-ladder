@@ -1,94 +1,86 @@
 #!/usr/bin/env bash
-# Shared environment for every script in ops/amd/. Sourced, never executed.
-#
-# Everything here is a default that the owner can override from the environment or from .env on
-# the instance, because the numbers that matter (the price, the credit, the cap) are the ones most
-# likely to be wrong, and a hard-coded price is how a runbook quietly spends money it does not have.
+# Shared settings for every script that runs ON THE DROPLET. Sourced, never executed.
+# Everything is an overridable default; none of it is read on the laptop (the laptop's numbers
+# live in plan.py, and a test keeps the two in step).
 
 set -euo pipefail
 
-# The commit the instance checks out. Pinned rather than "main": the laptop's results and the
-# instance's results must be produced by the same code, and an unpinned branch is a run whose
-# provenance cannot be reconstructed after the branch moves.
-AMD_COMMIT="${AMD_COMMIT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")/../.." rev-parse HEAD)}"
+# ── paths ────────────────────────────────────────────────────────────────────────
+AMD_REMOTE_ROOT="${AMD_REMOTE_ROOT:-/opt/smol-ladder}"
+AMD_REMOTE_LOG="${AMD_REMOTE_LOG:-/var/log/smol-ladder}"
+AMD_STAGE_DIR="${AMD_STAGE_DIR:-/var/tmp/smol-ladder-stage}"
+AMD_DATA_ROOT="${AMD_DATA_ROOT:-$AMD_REMOTE_ROOT/data}"
+AMD_VENV="${AMD_VENV:-$AMD_REMOTE_ROOT/.venv}"
 
-# Price per GPU-hour. $2.59 is DigitalOcean's published MI300X rate
-# (https://docs.digitalocean.com/products/amd/details/pricing/). $1.99 came from a third-party blog
-# and could not be confirmed against AMD or DigitalOcean; it is kept only so the owner can override
-# it if their console shows something else. Everything is computed from this one variable.
-AMD_PRICE_PER_GPU_HOUR="${AMD_PRICE_PER_GPU_HOUR:-2.59}"
-
-# Hard budget. The credit is $100, so the cap is set below it: the run must stop with credit left,
-# not with a card charge. The watchdog enforces it by wall clock, not by reading a balance, because
-# the only balance API is the console and the instance has no idea what it has spent.
-AMD_BUDGET_USD="${AMD_BUDGET_USD:-80}"
-AMD_WALLCLOCK_LIMIT_MIN="${AMD_WALLCLOCK_LIMIT_MIN:-$(python3 -c "print(int(float('$AMD_BUDGET_USD')/float('$AMD_PRICE_PER_GPU_HOUR')*60))")}"
-
-# Dead-man switch: no ssh connection and no running job for this long -> power off, then destroy.
-AMD_IDLE_LIMIT_MIN="${AMD_IDLE_LIMIT_MIN:-45}"
-
-# The arms. Keys are the arm names used in run tags, Hub repo suffixes and run directories.
-AMD_ARMS_DEFAULT="${AMD_ARMS_DEFAULT:-A B AB}"
+# ── models, data, training ───────────────────────────────────────────────────────
 AMD_BASE_MODEL="${AMD_BASE_MODEL:-Qwen/Qwen3.5-2B}"
-AMD_SPLIT="${AMD_SPLIT:-test}"
-AMD_RUN_TAG_PREFIX="${AMD_RUN_TAG_PREFIX:-amd1}"
+AMD_MAX_LENGTH="${AMD_MAX_LENGTH:-8192}"
+AMD_SEED="${AMD_SEED:-42}"
+AMD_LORA_R="${AMD_LORA_R:-16}"
+# Effective batch is held at upstream's 8 sequences per optimizer step so arm A stays comparable
+# to the published recipe; the smoke picks how that 8 is split into batch x accumulation.
+AMD_EFFECTIVE_BATCH="${AMD_EFFECTIVE_BATCH:-8}"
+# train/sft_lora.py saves every max(50, max_steps // 2) steps and, with no --max-steps, every
+# 100: at 8 sequences a step that is a checkpoint every few minutes, each pushed to the Hub by
+# hub_strategy="every_save". It has no flag for this; the bound is stated in the runbook.
 
-# The HF repos the arms push to. Must be private and must exist (or be creatable) before a run:
-# the Hub is the only copy of an adapter that survives a destroyed instance.
+# ── the Hub: the only copy of anything that outlives the droplet ─────────────────
 AMD_HUB_NAMESPACE="${AMD_HUB_NAMESPACE:-}"
 AMD_HUB_ADAPTER_A="${AMD_HUB_ADAPTER_A:-smol-ladder-sft-a}"
 AMD_HUB_ADAPTER_B="${AMD_HUB_ADAPTER_B:-smol-ladder-sft-b}"
 AMD_HUB_ADAPTER_AB="${AMD_HUB_ADAPTER_AB:-smol-ladder-sft-ab}"
 AMD_HUB_ARTIFACTS="${AMD_HUB_ARTIFACTS:-smol-ladder-runs}"
 
-# On-instance paths.
-AMD_REMOTE_ROOT="${AMD_REMOTE_ROOT:-/opt/smol-ladder}"
-AMD_REMOTE_LOG="${AMD_REMOTE_LOG:-/var/log/smol-ladder}"
+# ── serving ──────────────────────────────────────────────────────────────────────
+AMD_VLLM_PORT="${AMD_VLLM_PORT:-8000}"
+AMD_VLLM_WAIT_S="${AMD_VLLM_WAIT_S:-900}"
+AMD_MAX_MODEL_LEN="${AMD_MAX_MODEL_LEN:-16384}"
+# One server for four models: the base is 4.6 GB and an adapter is ~90 MB, so the rest of the
+# card is KV cache, which is what makes four concurrent sweeps fast.
+AMD_GPU_UTIL="${AMD_GPU_UTIL:-0.85}"
+# qwen3_coder is what the vLLM Qwen3.5 recipe names. If the smoke probe reports raw <tool_call> text,
+# switch the parser here (for example `hermes`) without editing the script.
+AMD_TOOL_PARSER="${AMD_TOOL_PARSER:-qwen3_coder}"
 
 amd_log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-
 amd_die() { amd_log "FATAL: $*"; exit 1; }
 
-# Load .env from the repo root if present. It is git-ignored and holds HF_TOKEN and, in API mode,
-# AMD_CLOUD_API_TOKEN. It must never be committed and never printed.
+# Load the secrets file the stage step wrote (HF_TOKEN, AMD_HUB_NAMESPACE). Never printed.
 amd_load_env() {
-  local env_file="${1:-/opt/smol-ladder/.env}"
+  local env_file="${1:-$AMD_REMOTE_ROOT/.env}"
   if [[ -f "$env_file" ]]; then
     set -a
-    # shellcheck disable=SC1090  # path is a runtime argument, not a literal
+    # shellcheck disable=SC1090  # runtime path, not a literal
     source "$env_file"
     set +a
   fi
 }
 
-# Arm -> its exported dataset directory, on the instance. `data` is a symlink on the laptop that
-# points at the shared results tree; on the instance it is a real directory that sync_back filled.
-amd_data_dir() {
-  case "$1" in
-    A)  printf '%s\n' "${AMD_DATA_ROOT:-/opt/smol-ladder/data}/train/sft_upstream" ;;
-    B)  printf '%s\n' "${AMD_DATA_ROOT:-/opt/smol-ladder/data}/train/sft_ab" ;;
-    AB) printf '%s\n' "${AMD_DATA_ROOT:-/opt/smol-ladder/data}/train/sft_ab" ;;
-    *)  amd_die "unknown arm '$1' (want one of: A, B, AB)" ;;
-  esac
+# The python that owns torch and vLLM (the image's). Recorded by the entrypoint.
+amd_syspy() {
+  if [[ -f "$AMD_REMOTE_ROOT/.syspy" ]]; then cat "$AMD_REMOTE_ROOT/.syspy"; else command -v python3; fi
 }
+
+amd_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+amd_arm_dir() { printf '%s/runs/sft_%s\n' "$AMD_REMOTE_ROOT" "$(amd_lower "$1")"; }
 
 amd_arm_hub_repo() {
-  local ns="$AMD_HUB_NAMESPACE"
+  local ns="${AMD_HUB_NAMESPACE:?AMD_HUB_NAMESPACE is not set (remote.env)}"
   case "$1" in
-    A)  printf '%s\n' "${ns:+$ns/}$AMD_HUB_ADAPTER_A" ;;
-    B)  printf '%s\n' "${ns:+$ns/}$AMD_HUB_ADAPTER_B" ;;
-    AB) printf '%s\n' "${ns:+$ns/}$AMD_HUB_ADAPTER_AB" ;;
-    *)  amd_die "unknown arm '$1'" ;;
+    A)  printf '%s/%s\n' "$ns" "$AMD_HUB_ADAPTER_A" ;;
+    B)  printf '%s/%s\n' "$ns" "$AMD_HUB_ADAPTER_B" ;;
+    AB) printf '%s/%s\n' "$ns" "$AMD_HUB_ADAPTER_AB" ;;
+    *)  amd_die "unknown arm '$1' (want A, B or AB)" ;;
   esac
 }
 
-amd_run_tag() { printf '%s-%s\n' "$AMD_RUN_TAG_PREFIX" "$1"; }
-
-amd_eval_model_name() { printf 'amd-%s-2b\n' "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
-
-# Does the arm need its dataset exported before training, or is it already on disk?
-amd_needs_export() {
-  local arm="$1" data
-  data="$(amd_data_dir "$arm")"
-  [[ -f "$data/train.jsonl" ]]
+# The name the server exposes each model under; plan.py's served_name() must agree.
+amd_served_name() {
+  case "$1" in
+    base) printf 'amd-base-2b\n' ;;
+    probe) printf 'amd-probe-2b\n' ;;
+    A|B|AB) printf 'amd-%s-2b\n' "$(amd_lower "$1")" ;;
+    *) amd_die "unknown model '$1'" ;;
+  esac
 }

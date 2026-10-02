@@ -1,70 +1,86 @@
-"""Push the droplet's run artifacts to a private Hugging Face dataset repo.
+"""Push the droplet's logs and measurements to the private Hub dataset repo, and verify adapters.
 
-    python -m ops.amd.push_artifacts --repo <ns>/smol-ladder-runs --run-tag-prefix amd1
+    python ops/amd/push_artifacts.py --repo ns/smol-ladder-runs --log-dir /var/log/smol-ladder
+    python ops/amd/push_artifacts.py --verify ns/smol-ladder-sft-a ns/smol-ladder-sft-b
 
-Why this exists rather than a shell loop: an interrupted upload is the common case (the watchdog
-is racing the droplet's shutdown), so every upload is skipped when the remote already has the file
-at the same size. That makes it safe to re-run and cheap to re-run, which is the only property that
-matters when it is called from a teardown path.
+Runs on the teardown path, possibly while racing a shutdown, so it is written to be re-runnable: a
+file the Hub already has at the same size is skipped. Adapters and checkpoints do not go through
+here: the trainer pushes those to each arm's own private model repo (hub_strategy="every_save")
+and run_sft.sh pushes the final adapter, so this only carries what the trainer does not: logs,
+the smoke's measurements, the checksum list.
+
+`--verify` is the check that matters before a destroy: each named model repo must list both
+adapter files. A push that returned success but wrote nothing readable is invisible until the
+adapter is needed, which is on a droplet that no longer exists.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-ARTIFACT_GLOBS = ("runs/sft_*/**/*", "logs/*")
+LOG_SUFFIXES = (".log", ".json", ".tsv", ".trips", ".artifacts")
 
 
-def wanted(root: Path, run_tag_prefix: str) -> list[Path]:
-    """Adapter files, logs and the results tree for the tags this driver owns.
-
-    Checkpoints are included deliberately. `--resume` needs the newest one to be complete, and a
-    half-copied checkpoint is a resume that fails on load.
-    """
-    files: set[Path] = set()
-    for pattern in ARTIFACT_GLOBS:
-        for path in root.glob(pattern):
-            if path.is_file() and path.stat().st_size:
-                files.add(path)
-    if run_tag_prefix:
-        for path in (root / "data" / "runs").glob(f"{run_tag_prefix}*/**/*"):
-            if path.is_file() and path.stat().st_size:
-                files.add(path)
-    return sorted(files)
+def wanted(log_dir: Path) -> list[Path]:
+    return sorted(p for p in log_dir.rglob("*")
+                  if p.is_file() and p.stat().st_size and "adapters" not in p.parts
+                  and (p.suffix in LOG_SUFFIXES or p.name.startswith("SHA256SUMS")))
 
 
-def remote_name(path: Path, root: Path) -> str:
-    return str(path.relative_to(root))
+def already_there(api, repo: str, name: str, size: int) -> bool:
+    try:
+        info = api.get_paths_info(repo, [name], repo_type="dataset")
+    except Exception:  # noqa: BLE001 - "unknown" means upload
+        return False
+    return any(getattr(i, "size", None) == size for i in info)
 
 
-def main() -> None:
+def push(api, repo: str, log_dir: Path) -> int:
+    api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+    n = 0
+    for path in wanted(log_dir):
+        name = str(path.relative_to(log_dir))
+        if already_there(api, repo, name, path.stat().st_size):
+            continue
+        api.upload_file(path_or_fileobj=str(path), path_in_repo=f"droplet-logs/{name}",
+                        repo_id=repo, repo_type="dataset")
+        n += 1
+    return n
+
+
+def verify(api, repos: list[str]) -> list[str]:
+    """Repos that do NOT list both adapter files."""
+    bad = []
+    for repo in repos:
+        try:
+            files = set(api.list_repo_files(repo))
+        except Exception:  # noqa: BLE001
+            files = set()
+        if not {"adapter_config.json", "adapter_model.safetensors"} <= files:
+            bad.append(repo)
+    return bad
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", required=True, help="private dataset repo, e.g. myns/smol-ladder-runs")
-    ap.add_argument("--root", type=Path, default=Path("/opt/smol-ladder"))
-    ap.add_argument("--run-tag-prefix", default="")
-    ap.add_argument("--dry-run", action="store_true", help="list what would be uploaded, upload nothing")
+    ap.add_argument("--repo", help="private dataset repo for logs")
+    ap.add_argument("--log-dir", type=Path, default=Path("/var/log/smol-ladder"))
+    ap.add_argument("--verify", nargs="*", default=[], help="model repos that must hold an adapter")
     args = ap.parse_args()
-
-    if not args.repo.count("/") == 1:
-        raise SystemExit(f"--repo must be <namespace>/<name>, got {args.repo!r}")
-
     from huggingface_hub import HfApi
-
     api = HfApi()
-    api.create_repo(args.repo, repo_type="dataset", private=True, exist_ok=True)
-    files = wanted(args.root, args.run_tag_prefix)
-    if not files:
-        print("nothing to upload")
-        return
-    if args.dry_run:
-        for path in files:
-            print(f"{path.stat().st_size:>12}  {remote_name(path, args.root)}")
-        return
-    api.upload_folder(args.repo, str(args.root), repo_type="dataset",
-                      path_in_repo="", allow_patterns=[remote_name(p, args.root) for p in files])
+    if args.repo:
+        print(f"uploaded {push(api, args.repo, args.log_dir)} log files to {args.repo}")
+    if args.verify:
+        bad = verify(api, args.verify)
+        for repo in args.verify:
+            print(f"  {'FAIL' if repo in bad else 'PASS'}  adapter readable on the Hub: {repo}")
+        return 1 if bad else 0
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,136 +1,107 @@
 #!/usr/bin/env bash
-# One SFT arm on the droplet. Resumable: re-running after a kill picks up the newest checkpoint.
+# shellcheck source-path=SCRIPTDIR
+# One SFT arm on the droplet. Resumable, checkpoint-pushing, and a no-op if the arm is finished.
 #
-#   run_sft.sh --arm A|B|AB [--max-steps N] [--resume] [--inside-rocm] [--smoke]
+#   run_sft.sh --arm A|B|AB [--max-length 8192] [--batch-size N --grad-accum M] [--max-steps N]
 #
-# Arms:
-#   A   upstream's SmolDataEnvs-sft, through the firewall (data/train/sft_upstream)
-#   B   our exported ja3 trajectories (data/train/ja3_sft.jsonl)
-#   AB  the union, exported first if it is not already on disk
+#   A   upstream's SmolDataEnvs-sft export     data/train/sft_upstream  (train.jsonl + val.jsonl)
+#   B   our exported ja3 traces                 data/train/ja3_sft.jsonl
+#   AB  the union, built here from the two staged sets (A's val set is kept for eval-loss)
 #
-# No QLoRA. MI300X has 192 GB, so 4-bit weights buy nothing and bitsandbytes on ROCm is a
-# preview-alpha backend. bf16 LoRA is the plan's instruction and the reason for it.
+# What makes a spot reclaim cost minutes:
+#   * train/sft_lora.py writes a checkpoint every 100 steps (it has no flag for the cadence) and
+#     hub_strategy="every_save" pushes the newest to the private Hub repo as `last-checkpoint/`;
+#   * on start, `ops.amd.resume status` (a) skips a finished arm, (b) moves any half-written
+#     checkpoint aside, and (c) on a fresh droplet restores `last-checkpoint/` from the Hub;
+#   * the trainer is then run with --resume, which picks the newest complete checkpoint.
+# The Hub repos were created PRIVATE by the entrypoint. The trainer would otherwise create a missing
+# repo with the account default, and arm B is our own traces.
+#
+# No QLoRA: the card has 288 GB, 4-bit buys nothing, and bitsandbytes on ROCm is alpha. bf16 LoRA is
+# what upstream's recipe used. Batch size comes from the smoke's benchmark; the effective batch
+# stays at 8 so the arm remains comparable to upstream's batch-1 x accum-8 recipe.
 
 set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+amd_load_env "$AMD_REMOTE_ROOT/.env"
 
-ARM=""
-MAX_STEPS="${AMD_MAX_STEPS:-0}"
-RESUME=1
-INSIDE_ROCM=0
-SEED="${AMD_SEED:-42}"
-MAX_LENGTH="${AMD_MAX_LENGTH:-8192}"
-
+ARM=""; MAX_STEPS=0; BATCH=""; ACCUM=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arm)         ARM="$2"; shift 2 ;;
+    --max-length)  AMD_MAX_LENGTH="$2"; shift 2 ;;
+    --batch-size)  BATCH="$2"; shift 2 ;;
+    --grad-accum)  ACCUM="$2"; shift 2 ;;
     --max-steps)   MAX_STEPS="$2"; shift 2 ;;
-    --resume)      RESUME=1; shift ;;
-    --no-resume)   RESUME=0; shift ;;
-    --inside-rocm) INSIDE_ROCM=1; shift ;;
-    # A smoke run is a step-limited run; the flag exists only so the plan reads as what it does.
-    --smoke)       MAX_STEPS="${AMD_SMOKE_STEPS:-20}"; shift ;;
-    --seed)        SEED="$2"; shift 2 ;;
-    --max-length)  MAX_LENGTH="$2"; shift 2 ;;
     *) amd_die "unknown argument '$1'" ;;
   esac
 done
-[[ -n "$ARM" ]] || amd_die "--arm is required (A, B or AB)"
+[[ "$ARM" == "A" || "$ARM" == "B" || "$ARM" == "AB" ]] || amd_die "--arm must be A, B or AB"
 
-# Inside the ROCm container the whole path and python move in, and only once.
-if (( INSIDE_ROCM )); then
-  INNER=(--arm "$ARM" --max-steps "$MAX_STEPS" --seed "$SEED" --max-length "$MAX_LENGTH")
-  (( RESUME )) && INNER+=(--resume)
-  exec docker exec \
-    -e HF_TOKEN="${HF_TOKEN:-}" \
-    -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
-    -e PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-1}" \
-    -w "$AMD_REMOTE_ROOT" \
-    "${AMD_ROCM_CONTAINER:-smol-rocm}" \
-    "$AMD_REMOTE_ROOT/ops/amd/run_sft.sh" "${INNER[@]}"
-fi
-
-amd_load_env
 cd "$AMD_REMOTE_ROOT"
-DATA="$(amd_data_dir "$ARM")"
-[[ -f "$DATA/train.jsonl" || -f "$DATA/ja3_sft.jsonl" ]] || amd_die "no training rows at $DATA"
-OUT="$AMD_REMOTE_ROOT/runs/sft_$(printf '%s' "$ARM" | tr '[:upper:]' '[:lower:]')"
-LOG="$AMD_REMOTE_LOG/sft_$(printf '%s' "$ARM" | tr '[:upper:]' '[:lower:]').log"
+PY="$AMD_VENV/bin/python"
+OUT="$(amd_arm_dir "$ARM")"
+LOG="$AMD_REMOTE_LOG/sft_$(amd_lower "$ARM").log"
 HUB_REPO="$(amd_arm_hub_repo "$ARM")"
-mkdir -p "$AMD_REMOTE_LOG" "$OUT"
+MEAS="$AMD_REMOTE_LOG/measurements.json"
+mkdir -p "$OUT" "$AMD_REMOTE_LOG"
 
-# The `sft_ab` export is a derived dataset, so it is built here rather than synced: it is a
-# concatenation of two files that are already on the instance and it must be rebuilt whenever
-# either changes. The same 5% deterministic split and the same seed, or the two arms would not be
-# comparable on the same rows.
-if [[ "$ARM" == "AB" && ! -f "$DATA/train.jsonl" ]]; then
-  amd_log "building the A+B export at $DATA"
-  mkdir -p "$DATA"
-  python3 - <<'PY' "$DATA/train.jsonl" "$DATA/val.jsonl"
-import json, sys
-out_train, out_val = sys.argv[1], sys.argv[2]
-base = f"{'/opt/smol-ladder/data'}/train"
-train_rows, val_rows = [], []
-for name in ("sft_upstream/train.jsonl", "sft_upstream/val.jsonl"):
-    with open(f"{base}/{name}") as fh:
-        (train_rows if name.endswith('train.jsonl') else val_rows).extend(json.loads(l) for l in fh if l.strip())
-for name, bucket in ((("ja3_sft.jsonl"), train_rows),):
-    with open(f"{base}/{name}") as fh:
-        bucket.extend(json.loads(l) for l in fh if l.strip())
-for path, rows in ((out_train, train_rows), (out_val, val_rows)):
-    with open(path, "w") as fh:
-        for row in rows:
-            fh.write(json.dumps(row) + "\n")
-print(f"A+B: {len(train_rows)} train, {len(val_rows)} val")
-PY
+# ── is there anything to do, and from where? ─────────────────────────────────────
+STATUS="$("$PY" -m ops.amd.resume status --out "$OUT" --repo "$HUB_REPO")"
+STATE="$(printf '%s' "$STATUS" | jq -r .state)"
+amd_log "arm $ARM: $STATUS"
+if [[ "$STATE" == "done" ]]; then amd_log "arm $ARM already finished; nothing to do"; exit 0; fi
+
+# ── data ─────────────────────────────────────────────────────────────────────────
+case "$ARM" in
+  A)  DATA="$AMD_DATA_ROOT/train/sft_upstream" ;;
+  B)  DATA="$AMD_DATA_ROOT/train/ja3_sft.jsonl" ;;
+  AB) DATA="$AMD_DATA_ROOT/train/sft_ab"
+      mkdir -p "$DATA"
+      cat "$AMD_DATA_ROOT/train/sft_upstream/train.jsonl" "$AMD_DATA_ROOT/train/ja3_sft.jsonl" > "$DATA/train.jsonl"
+      cp "$AMD_DATA_ROOT/train/sft_upstream/val.jsonl" "$DATA/val.jsonl" ;;
+esac
+[[ -e "$DATA" ]] || amd_die "no data at $DATA; run entrypoint.sh first"
+
+# ── batch size: the smoke's choice unless given ──────────────────────────────────
+if [[ -z "$BATCH" && -f "$MEAS" ]]; then
+  BATCH="$(jq -r '.best.per_device_batch_size // empty' "$MEAS")"
+  ACCUM="$(jq -r '.best.grad_accum // empty' "$MEAS")"
 fi
+BATCH="${BATCH:-4}"
+ACCUM="${ACCUM:-$(( AMD_EFFECTIVE_BATCH / BATCH ))}"
+(( ACCUM >= 1 )) || ACCUM=1
 
-# Without a namespace there is no repo id to push to, and the Hub is the only copy of an adapter
-# that outlives the droplet. Say so rather than training for hours and finding out at the end.
-if [[ -n "$AMD_HUB_NAMESPACE" ]]; then
-  # hub_model_id turns on TRL's push_to_hub with hub_strategy="every_save", so a checkpoint is on
-  # the Hub at every save rather than only at the end. That is what makes a killed run resumable
-  # on a *fresh* droplet, where the local disk is gone.
-  CMD_HUB=(--hub-model-id "$HUB_REPO")
-else
-  amd_log "WARNING: AMD_HUB_NAMESPACE is unset, so this adapter cannot be pushed to the Hub."
-  amd_log "         Set it to a private namespace, or accept that the result dies with the droplet."
-  CMD_HUB=()
-fi
-
-CMD=("$AMD_REMOTE_ROOT/.venv/bin/python" -m train.sft_lora
-     --data "$DATA"
-     --model "$AMD_BASE_MODEL"
-     --out "$OUT"
-     --protocol bash
-     --max-length "$MAX_LENGTH"
-     --seed "$SEED"
-     --precision bf16 "${CMD_HUB[@]}")
+CMD=("$PY" -m train.sft_lora --data "$DATA" --model "$AMD_BASE_MODEL" --out "$OUT"
+     --protocol bash --max-length "$AMD_MAX_LENGTH" --seed "$AMD_SEED" --precision bf16
+     --batch-size "$BATCH" --grad-accum "$ACCUM" --hub-model-id "$HUB_REPO" --resume)
 (( MAX_STEPS > 0 )) && CMD+=(--max-steps "$MAX_STEPS")
-(( RESUME )) && CMD+=(--resume)
 
-amd_log "arm=$ARM steps=$MAX_STEPS resume=$RESUME"
-amd_log "${CMD[*]}"
-
-# teed, because a killed run's log is the only record of how far it got.
+amd_log "arm=$ARM state=$STATE batch=$BATCH accum=$ACCUM max_length=$AMD_MAX_LENGTH hub=$HUB_REPO"
+amd_log "  ${CMD[*]}"
 set +e
-"${CMD[@]}" 2>&1 | tee -a "$LOG"
-STATUS=${PIPESTATUS[0]}
+PYTHONUNBUFFERED=1 "${CMD[@]}" 2>&1 | tee -a "$LOG"
+STATUS_CODE=${PIPESTATUS[0]}
 set -e
-
-if (( STATUS != 0 )); then
-  amd_log "training exited $STATUS; log at $LOG"
-  exit "$STATUS"
+if (( STATUS_CODE != 0 )); then
+  amd_log "training exited $STATUS_CODE. Checkpoints on disk and on the Hub are intact; re-run this command to resume."
+  exit "$STATUS_CODE"
 fi
 
-# Push the finished adapter to a private repo, then rsync it back beside the log so a droplet
-# death before the Hub push is recoverable from the laptop copy.
-if [[ -n "$AMD_HUB_NAMESPACE" ]]; then
-  amd_log "pushing the adapter to $HUB_REPO"
-  "$AMD_REMOTE_ROOT/.venv/bin/python" -m huggingface_hub.commands.huggingface_cli \
-    upload "$HUB_REPO" "$OUT" --repo-type model --private \
-    || amd_log "WARNING: adapter upload failed; the rsync copy is the only remaining copy"
-fi
+# ── finish: prove the adapter is whole, mark it, push it ─────────────────────────
+"$PY" - "$OUT" "$HUB_REPO" <<'PYFIN'
+import sys
+from pathlib import Path
+from huggingface_hub import HfApi
+from ops.amd.resume import ADAPTER, DONE, safetensors_ok
 
-amd_log "done. adapter at $OUT, log at $LOG"
+out, repo = Path(sys.argv[1]), sys.argv[2]
+assert (out / "adapter_config.json").exists() and safetensors_ok(out / ADAPTER), "adapter missing or truncated"
+(out / DONE).write_text("done\n")
+api = HfApi()
+api.upload_file(path_or_fileobj=str(out / ADAPTER), path_in_repo=ADAPTER, repo_id=repo)
+api.upload_file(path_or_fileobj=str(out / "adapter_config.json"), path_in_repo="adapter_config.json", repo_id=repo)
+print("final adapter pushed to", repo)
+PYFIN
+amd_log "arm $ARM done: adapter at $OUT, log $LOG"
