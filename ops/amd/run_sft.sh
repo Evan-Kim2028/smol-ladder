@@ -8,6 +8,7 @@
 #   A   upstream's SmolDataEnvs-sft export     data/train/sft_upstream  (train.jsonl + val.jsonl)
 #   B   our exported ja3 traces                 data/train/ja3_sft_v2.jsonl
 #   B3  the same traces, rewritten leaner       data/train/ja3_sft_v3.jsonl  (copied over by hand)
+#   B4  the teacher re-run in the shell harness data/train/ja4_sft.jsonl     (copied over by hand)
 #   AB  the union, built here from the two staged sets (A's val set is kept for eval-loss)
 #
 # What makes a spot reclaim, or a GPU reset, cost minutes:
@@ -46,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     *) amd_die "unknown argument '$1'" ;;
   esac
 done
-[[ "$ARM" == "A" || "$ARM" == "B" || "$ARM" == "AB" || "$ARM" == "B3" ]] || amd_die "--arm must be A, B, AB or B3"
+[[ "$ARM" == "A" || "$ARM" == "B" || "$ARM" == "AB" || "$ARM" == "B3" || "$ARM" == "B4" ]] || amd_die "--arm must be A, B, AB, B3 or B4"
 [[ "$SAVE_STEPS" =~ ^[0-9]+$ && "$SAVE_STEPS" -ge 1 ]] || amd_die "--save-steps must be a positive integer"
 [[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ && "$MAX_ATTEMPTS" -ge 1 ]] || amd_die "--max-attempts must be a positive integer"
 
@@ -72,7 +73,8 @@ amd_assert_gpu_free
 case "$ARM" in
   A)  DATA="$AMD_DATA_ROOT/train/sft_upstream" ;;
   B)  DATA="$AMD_DATA_ROOT/train/ja3_sft_v2.jsonl" ;;
-  B3) DATA="$AMD_DATA_ROOT/train/ja3_sft_v3.jsonl" ;;   # B rewritten leaner (train/export_ja3_v3.py)
+  B3) DATA="$AMD_DATA_ROOT/train/ja3_sft_v3.jsonl" ;;
+  B4) DATA="$AMD_DATA_ROOT/train/ja4_sft.jsonl" ;;      # the teacher's native shell trajectories (train/export_ja4.py)   # B rewritten leaner (train/export_ja3_v3.py)
   AB) DATA="$AMD_DATA_ROOT/train/sft_ab"
       mkdir -p "$DATA"
       cat "$AMD_DATA_ROOT/train/sft_upstream/train.jsonl" "$AMD_DATA_ROOT/train/ja3_sft_v2.jsonl" > "$DATA/train.jsonl"
