@@ -4581,3 +4581,24 @@ def test_verify_sync_compares_the_hub_adapter_with_the_local_final_adapter(tmp_p
     assert driver.verify_sync(c, hub_files=good, hub_sha256=lambda repo, name: stage.sha256_file(f), **kw) is True
     assert driver.verify_sync(c, hub_files=good, hub_sha256=lambda repo, name: "2" * 64, **kw) is False
     assert driver.verify_sync(c, hub_files=lambda r: files[:2], hub_sha256=lambda repo, name: stage.sha256_file(f), **kw) is False
+
+
+# ═══ M4: the training stack is pinned to what session 1 verified ═══
+
+def test_the_training_stack_is_pinned_to_the_versions_session_1_recorded():
+    versions = (REPO_ROOT / "logs/amd/droplet-logs/versions.log")
+    sh = subprocess.run(["bash", "-c", f'source "{OPS}/common.sh"; echo $AMD_PIN_TRANSFORMERS $AMD_PIN_TRL '
+                                       f'$AMD_PIN_PEFT $AMD_PIN_DATASETS'], capture_output=True, text=True).stdout.split()
+    assert sh == ["5.18.0", "1.14.1", "0.21.2", "5.0.1"]
+    if versions.exists():                    # the log is local data, not in the commit
+        line = versions.read_text().splitlines()[0]
+        assert "transformers 5.18.0" in line and "peft 0.21.2" in line and "trl 1.14.1" in line
+
+
+def test_setup_installs_exact_versions_and_the_smoke_asserts_them():
+    setup = (OPS / "container_setup.sh").read_text()
+    assert "transformers>=" not in setup and "trl>=" not in setup and "peft>=" not in setup
+    assert '"transformers==$AMD_PIN_TRANSFORMERS"' in setup and '"datasets==$AMD_PIN_DATASETS"' in setup
+    smoke = (OPS / "smoke.sh").read_text()
+    assert "EXACTLY the verified versions" in smoke and "assert have == want" in smoke
+    assert "datasets>=4.0" not in setup

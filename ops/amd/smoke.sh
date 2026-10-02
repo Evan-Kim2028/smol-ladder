@@ -61,6 +61,11 @@ a = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
 got, want = (a @ a).float(), a.float() @ a.float()
 assert ((got - want).norm() / want.norm()).item() < 1e-2'
 check "transformers/peft/trl/accelerate/datasets import" "$PY" -c 'import transformers, peft, trl, accelerate, datasets'
+check "training stack is EXACTLY the verified versions (transformers $AMD_PIN_TRANSFORMERS, trl $AMD_PIN_TRL, peft $AMD_PIN_PEFT, datasets $AMD_PIN_DATASETS)" "$PY" -c "
+import datasets, peft, transformers, trl
+have = dict(transformers=transformers.__version__, trl=trl.__version__, peft=peft.__version__, datasets=datasets.__version__)
+want = dict(transformers='$AMD_PIN_TRANSFORMERS', trl='$AMD_PIN_TRL', peft='$AMD_PIN_PEFT', datasets='$AMD_PIN_DATASETS')
+assert have == want, (have, want)"
 check "vllm >= 0.16.2 on the image python (Qwen3.5 support)" "$SYSPY" -c '
 import vllm
 from packaging.version import Version

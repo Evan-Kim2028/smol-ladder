@@ -25,6 +25,13 @@ AMD_STOP_CONTAINERS="${AMD_STOP_CONTAINERS:-rocm}"
 AMD_BASE_MODEL="${AMD_BASE_MODEL:-Qwen/Qwen3.5-2B}"
 AMD_MAX_LENGTH="${AMD_MAX_LENGTH:-8192}"
 AMD_SEED="${AMD_SEED:-42}"
+# The training stack, EXACTLY as session 1 ran it (logs/amd/droplet-logs/versions.log; datasets from the
+# training venv the numbers were checked in). Unpinned `>=` would have let a fresh droplet pick
+# up whatever is newest, unverified. container_setup.sh installs these and smoke.sh asserts them.
+AMD_PIN_TRANSFORMERS="${AMD_PIN_TRANSFORMERS:-5.18.0}"
+AMD_PIN_TRL="${AMD_PIN_TRL:-1.14.1}"
+AMD_PIN_PEFT="${AMD_PIN_PEFT:-0.21.2}"
+AMD_PIN_DATASETS="${AMD_PIN_DATASETS:-5.0.1}"
 AMD_LORA_R="${AMD_LORA_R:-16}"
 # Effective batch is held at upstream's 8 sequences per optimizer step so arm A stays comparable
 # to the published recipe; the smoke picks how that 8 is split into batch x accumulation.

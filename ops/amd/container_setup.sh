@@ -57,10 +57,17 @@ for n in ("torch", "torchvision", "torchaudio", "triton", "vllm"):
     try: print(f"{n}=={m.version(n)}")
     except m.PackageNotFoundError: pass
 PYC
-if ! "$VENV/bin/python" -c 'import trl, peft, transformers, accelerate, datasets; assert int(transformers.__version__.split(".")[0]) >= 5' >/dev/null 2>&1; then
-  log "installing the training stack (image packages pinned by $LOGDIR/constraints.txt)"
+if ! "$VENV/bin/python" - "$AMD_PIN_TRANSFORMERS" "$AMD_PIN_TRL" "$AMD_PIN_PEFT" "$AMD_PIN_DATASETS" >/dev/null 2>&1 <<'PYPIN'
+import sys, accelerate, datasets, peft, transformers, trl
+want = dict(zip(("transformers", "trl", "peft", "datasets"), sys.argv[1:]))
+have = dict(transformers=transformers.__version__, trl=trl.__version__, peft=peft.__version__, datasets=datasets.__version__)
+sys.exit(0 if have == want else 1)
+PYPIN
+then
+  log "installing the pinned training stack (image packages pinned by $LOGDIR/constraints.txt)"
   "$VENV/bin/python" -m pip install -q -c "$LOGDIR/constraints.txt" \
-    "transformers>=5.17" "trl>=1.13" "peft>=0.21" "accelerate>=1.0" "datasets>=4.0" huggingface_hub \
+    "transformers==$AMD_PIN_TRANSFORMERS" "trl==$AMD_PIN_TRL" "peft==$AMD_PIN_PEFT" \
+    "datasets==$AMD_PIN_DATASETS" "accelerate>=1.0" huggingface_hub \
     || die "pip could not install the training stack without replacing the image's torch"
 fi
 "$VENV/bin/python" - <<'PYV' | tee -a "$LOGDIR/versions.log"
