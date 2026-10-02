@@ -36,9 +36,9 @@ CRITICAL_FAILS=0
 
 pass() { printf 'PASS\t%s\n' "$1" >> "$CHECKS"; printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 fail() { printf 'FAIL\t%s\n' "$1" >> "$CHECKS"; printf '  \033[31mFAIL\033[0m  %s\n' "$1"; CRITICAL_FAILS=$((CRITICAL_FAILS + 1)); }
-check() { # check "name" cmd...  : PASS if the command succeeds
-  local name="$1"; shift
-  if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi
+check() { # check "name" cmd...  : PASS if the command succeeds, else FAIL plus its last two lines
+  local name="$1" out; shift
+  if out="$("$@" 2>&1)"; then pass "$name"; else fail "$name"; printf '          %s\n' "$(printf '%s' "$out" | tail -2)"; fi
 }
 
 amd_log "=== A. ROCm checklist ==="

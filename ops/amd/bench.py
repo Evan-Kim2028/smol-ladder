@@ -29,6 +29,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -64,8 +65,13 @@ def choose_best(configs: list[dict]) -> dict | None:
 
 
 def run_config(cmd: list[str], seconds: float, mean_tokens: float, bs: int, accum: int,
-               env: dict | None = None) -> dict:
-    """Run one configuration for about `seconds` after its first step, then stop it."""
+               env: dict | None = None, hard_timeout: float | None = None) -> dict:
+    """Run one configuration for about `seconds` after its first step, then stop it.
+
+    `hard_timeout` (default: the window plus 15 minutes for model load) kills a run that hangs
+    before or between steps: a benchmark that waits forever on a stuck process is a billed hang.
+    """
+    hard = hard_timeout if hard_timeout is not None else seconds + 900.0
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1", **(env or {})),
                             start_new_session=True)
@@ -73,6 +79,18 @@ def run_config(cmd: list[str], seconds: float, mean_tokens: float, bs: int, accu
     tail: list[str] = []
     first = None
     oom = False
+    timed_out = threading.Event()
+
+    def kill_hung() -> None:
+        timed_out.set()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    timer = threading.Timer(hard, kill_hung)
+    timer.daemon = True
+    timer.start()
     assert proc.stdout is not None
     for line in proc.stdout:
         now = time.monotonic()
@@ -84,6 +102,7 @@ def run_config(cmd: list[str], seconds: float, mean_tokens: float, bs: int, accu
             first = first or now
         if first is not None and now - first >= seconds:
             break
+    timer.cancel()
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -94,7 +113,7 @@ def run_config(cmd: list[str], seconds: float, mean_tokens: float, bs: int, accu
         os.killpg(proc.pid, signal.SIGKILL)
     sps = steps_per_second(stamps)
     result = {"per_device_batch_size": bs, "grad_accum": accum, "steps_logged": len(stamps),
-              "oom": oom, "ok": sps is not None and not oom}
+              "oom": oom, "timed_out": timed_out.is_set(), "ok": sps is not None and not oom}
     if sps is not None:
         result["steps_per_s"] = round(sps, 4)
         result["tokens_per_s"] = round(tokens_per_second(sps, bs * accum, mean_tokens), 1)

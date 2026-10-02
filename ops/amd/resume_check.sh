@@ -68,7 +68,7 @@ if [[ "$STATE" != "resume-local" ]]; then
   exit 1
 fi
 
-PYTHONUNBUFFERED=1 "${CMD[@]}" --resume >"$AMD_REMOTE_LOG/resume_resume.log" 2>&1 || {
+PYTHONUNBUFFERED=1 timeout 900 "${CMD[@]}" --resume >"$AMD_REMOTE_LOG/resume_resume.log" 2>&1 || {
   tail -20 "$AMD_REMOTE_LOG/resume_resume.log" >&2; amd_die "the resumed run failed"; }
 if "$PY" -m ops.amd.resume verdict --killed-at "$KILLED_AT" --log "$AMD_REMOTE_LOG/resume_resume.log" --out "$OUT"; then
   [[ -f "$RUN/adapter_model.safetensors" ]] || amd_die "resumed run left no adapter"

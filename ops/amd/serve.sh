@@ -161,5 +161,10 @@ else
 fi
 
 if (( WAIT )) && [[ "$MODE" == "probe" ]]; then
-  "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$PORT" --models "${NAMES[0]}" "$BASE"
+  if (( MERGED )); then   # the adapter's server first: the driver reads the first TOOL_CALLS_OK line
+    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$((PORT + 1))" --models "${NAMES[0]}"
+    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$PORT" --models "$BASE"
+  else
+    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$PORT" --models "${NAMES[0]}" "$BASE"
+  fi
 fi

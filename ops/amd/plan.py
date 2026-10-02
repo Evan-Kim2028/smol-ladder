@@ -489,7 +489,6 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
     def secs(stage: str) -> float:
         return rows[stage].seconds if stage in rows else 0.0
 
-    me = "python ops/amd/driver.py"
     flags = ["--size", cfg.size, "--region", cfg.region, "--image", cfg.image,
              "--ssh-key-fingerprint", cfg.fingerprint or "<ssh-key-fingerprint>",
              "--budget", f"{cfg.budget:g}"]
@@ -536,7 +535,8 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
         cfg, f"{cfg.remote_log}/measurements.json", f"{cfg.local_logs}/measurements.json")],
         0.0, "bring the measurements home; the projection is computed here", billed=False))
     steps.append(Step("smoke", "probe-serve", "droplet", [remote_script(
-        cfg, "serve.sh", "--probe", "--wait")],
+        cfg, "serve.sh", "--probe", "--wait",
+        *(["--merged"] if cfg.serve_mode == "merged" else []))],
         secs("smoke: serve + 20-task probe") * 0.5,
         "serve the base plus the smoke's adapter with the final flags: proves LoRA loads and "
         "the tool-call parser returns tool calls BEFORE any arm is trained"))

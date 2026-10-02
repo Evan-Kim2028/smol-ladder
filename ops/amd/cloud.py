@@ -141,12 +141,17 @@ def api_dollars(droplets: list[dict], now: float, default_rate: float) -> float:
     return total
 
 
-def reconcile(droplets: list[dict], ledger_path, now: float) -> bool:
+def reconcile(droplets: list[dict], ledger_path, now: float, grace: float = 120.0) -> bool:
     """If the ledger says a droplet is billing but the API shows none with the tag, it was
     reclaimed (spot) or destroyed elsewhere: close the interval so the ledger stops accruing.
-    Only ever called with a listing that succeeded; returns True if it closed one."""
+    Only ever called with a listing that succeeded; returns True if it closed one. An interval
+    younger than `grace` seconds is left alone: a droplet that was only just created may not be
+    in the tag listing yet, and closing its interval then would stop counting real spend."""
     events = L.read(ledger_path)
-    if L.open_interval(events) is not None and not droplets:
+    live = L.open_interval(events)
+    if live is not None and now - float(live["ts"]) < grace:
+        return False
+    if live is not None and not droplets:
         L.append(ledger_path, L.RECLAIMED, now=now,
                  reason="ledger had an open interval but no tagged droplet exists")
         return True

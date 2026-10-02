@@ -28,7 +28,6 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -192,6 +191,12 @@ def dry_run(cfg: P.Config, events: list[dict]) -> None:
 # ── gates and bookkeeping ─────────────────────────────────────────────────────────
 
 def gate(cfg: P.Config, step: P.Step, now: float | None = None) -> None:
+    """Refuse a billed step whose projection would pass either cap.
+
+    Steps with `reserve=False` (sync, tunnel-down, destroy) are the reserve itself: they print
+    their verdict but are NEVER refused. A budget guard that can refuse the destroy is a guard that
+    keeps the meter running at the exact moment it matters.
+    """
     if not step.billed or step.seconds <= 0:
         return
     now = time.time() if now is None else now
@@ -199,9 +204,11 @@ def gate(cfg: P.Config, step: P.Step, now: float | None = None) -> None:
     v = L.verdict(L.read(Path(cfg.ledger)), now, step.seconds, cfg.price, cfg.budget,
                   cfg.total_cap, reserve)
     print(f"## budget gate for {step.name}: {v.reason}")
-    if not v.allowed:
+    if not v.allowed and step.reserve:
         raise SystemExit(f"\nSTOPPING BEFORE '{step.name}'. {v.reason}\nNothing was started. Lower "
                          "--limit/--samples/--rungs, drop an arm, or raise --budget on purpose.")
+    if not v.allowed:
+        print(f"## {step.name} runs anyway: it is what stops the spending")
 
 
 def last_go(events: list[dict]) -> bool | None:
