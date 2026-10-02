@@ -221,7 +221,10 @@ early anyway: it is the long pole for the ladder and it is what validates a task
       trials** (`data/train/ja3_sft.manifest.json`; 0 rows dropped by the widest-key firewall). This
       item was open only because the old tree could not yield conversations; the `ja3` sweep is what
       closed it. The training run itself is item 6b below
-- [ ] 6b. Train **arm B** on those 2,029 traces, then **arm A+B** on 4,673 + 2,029, in that order
+- [ ] 6b. Train **arm B** on `data/train/ja3_sft_v2.jsonl` (**1,122 rows**: the same traces re-expressed
+      in the conversation `--agent bash` builds, every row replayed through the harness; the 2,029-row
+      `ja3_sft.jsonl` is v1 and was in the sweep's format, so adapters trained on it are invalid --
+      `docs/TRAINING.md` §0, §5), then **arm A+B** on 4,673 + 1,122, in that order
 - [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the best SFT arm — arm C
 - [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises — arm D
 - [ ] 9. jupyter-agent references at scale (the 4,217 ladder-grade tasks in `jtasks_v3`).
@@ -269,7 +272,10 @@ replicates a known target; B is the interesting comparison; A+B is the practical
 | C | best of A / B / A+B | + GRPO (LoRA) on SmolDataEnvs `train` | plain GRPO, no curriculum |
 | D | C | + hint-curriculum GRPO (L2/L3 withdrawn as pass rate rises) | **promoted from stretch goal**; the ~28% pass rate makes all-zero groups the binding constraint |
 
-**Arm B's data, as of 2026-10-01** (`data/train/ja3_sft.manifest.json`): **2,029 rows**, each
+**Arm B's data is now `ja3_sft_v2`** (2026-10-02, `data/train/ja3_sft_v2.manifest.json`, 1,122 rows;
+see `docs/TRAINING.md` §5). The paragraph below describes v1 as it was on 2026-10-01 and is superseded.
+
+**Arm B's v1 data, as of 2026-10-01** (`data/train/ja3_sft.manifest.json`): **2,029 rows**, each
 `messages` + `tools` (the SmolDataEnvs-sft format, one tool named `bash`) and nothing else, from
 **2,109 verified trials**; 983 of those trials had the gold answer below the leak floor. The firewall
 ran at its **widest key, `kaggle_table`** (170 tables; also `bucket_prefix` 170, `question` 393,

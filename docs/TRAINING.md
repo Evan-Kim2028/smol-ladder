@@ -21,6 +21,15 @@ template had nothing to render for a tool call: **38.1% of assistant turns rende
 turn is valid text and the loss still fell. **Adapters A, B and AB trained before this commit are
 invalid and are to be retrained.** Nothing was ever measured with them that should be reported.
 
+**Second correction, 2026-10-02: arm B was in a format the evaluation never builds.** `ja3_sft.jsonl`
+(**v1**) used the sweep's own conventions (a `./input` system prompt, a hard-wrapped user template,
+`./input` paths, `""` and `--- stderr ---` tool results, outputs up to 20,000 characters, an appended
+submission turn), while `run_ladder --agent bash` builds upstream's conversation byte for byte
+(LOCAL_MODELS.md 1e). A model trained on v1 is evaluated in a format it was not trained in, so A
+versus B would have measured format, not data. **Adapters trained on `ja3_sft.jsonl` (v1), or
+trained before commit `cf6a226`, are invalid and must be retrained.** Arm B is now
+`ja3_sft_v2.jsonl` (§5); the v1 files stay on disk, untouched, and nothing points at them.
+
 **What is fixed.** `prepare()` passes messages through intact and only normalises tool-call
 `arguments` to a dict (Qwen3.5's template iterates `arguments|items`; a JSON string raises in the
 template, so both datasets are normalised to the dict form they already carry). `train/render.py`
@@ -35,7 +44,8 @@ assistant turn is empty where the source had a call.
 |---|---|---|---|
 | `sft_upstream/train.jsonl` (4,439) | 16,273 / 16,273 | 16,273 / 16,273 | 0 |
 | `sft_upstream/val.jsonl` (234) | 826 / 826 | 826 / 826 | 0 |
-| `ja3_sft.jsonl` (2,029) | 17,173 / 17,173 | 17,173 / 17,173 | 0 |
+| `ja3_sft.jsonl` (2,029, v1, superseded) | 17,173 / 17,173 | 17,173 / 17,173 | 0 |
+| `ja3_sft_v2.jsonl` (1,122) | 8,115 / 8,115 | 8,115 / 8,115 | 0 |
 
 `python -m train.render FILE...` reproduces it; `tests/test_render.py` runs it on a committed
 fixture in the quick loop and on the whole files with `-m slow`.
@@ -46,6 +56,10 @@ fixture in the quick loop and on the whole files with `-m slow`.
 14.90M) counted per-message overhead, not the template's own output; a `tokens.json` staged before
 this commit must be re-staged or the cost projection is off by 4-5%.
 
+**Arm B is now `ja3_sft_v2`** (§5): **B 3,123,047 · AB 12,208,280** trained tokens at `max_length` 8,192
+(raw 3,178,803 / 12,394,907; A unchanged at 9,085,233). The B and AB figures above are v1's and are
+void; re-stage (`ops/amd/stage.py` now reads v2 and refuses a v2 whose manifest lacks a replay rate of 1.0).
+
 **What TRL does with labels, and how this differs from upstream.** `SFTConfig.assistant_only_loss`
 defaults to False and the Qwen3.5 template has no `{% generation %}` markers, so **both upstream's
 `train_sft.py` and ours train on every token** (system prompt, tool schema, user turn, tool results
@@ -53,7 +67,7 @@ and assistant turns alike). Differences between our configuration and upstream's
 (`04-smoldataenvs/scripts/train_sft.py`):
 
 - `max_length`: upstream 8,192; ours **4,096 on the laptop path** (`sft_lora` default), 8,192 on the
-  droplet (`AMD_MAX_LENGTH`). At 8,192 7.9% of `ja3_sft` rows still truncate.
+  droplet (`AMD_MAX_LENGTH`). At 8,192, 2.0% of `ja3_sft_v2` rows (7.9% of v1) still truncate.
 - Micro-batch: upstream 1 x accum 8; the droplet takes the smoke benchmark's batch and keeps the
   effective batch at 8.
 - Validation split: upstream `train_test_split(0.05, seed=42)` over all 4,677 rows; ours is the
@@ -64,12 +78,9 @@ and assistant turns alike). Differences between our configuration and upstream's
   under TRL 1.13). Same rendering.
 - Same: lr 2e-5, 1 epoch, LoRA r=16 / alpha=32 / dropout 0.05, `target_modules="all-linear"`,
   `exclude_modules="visual.*"`, gradient checkpointing, logging 5, eval/save cadence, seed 42.
-- Not the same by construction: arm B and AB data. **Arm B's rows use the ja3 sweep's own
-  conventions** -- a system prompt that says `./input` (and omits a full stop), the hard-wrapped
-  user template, `./input` paths, empty tool output as `""` (65 results) and a `--- stderr ---` divider in 1,605 results -- not
-  upstream's. The evaluation harness now speaks upstream's conventions exactly (LOCAL_MODELS.md
-  1e), so B and AB are evaluated in a format they were not trained in until the export is rewritten
-  to upstream's conventions. That is a decision for the owner and is not done here.
+- Not the same by construction: arm B and AB data (the solver, the question mix; see §5 "What still
+  differs between A and B"). The *format* is no longer one of the differences: v2 rows are replayed
+  through the harness's own loop and must rebuild byte for byte (§5).
 
 ---
 
@@ -199,9 +210,10 @@ which check refused them: `dropped {"question": 4}` is a fact about the run, not
 | source | available | format | notes |
 |---|---|---|---|
 | `smoldataenvs-sft` | **4,673** | bash | 4,439 train / 234 val after a 5% deterministic split |
-| **`ja3_sft`** (§5) | **2,029** | bash | **real traces.** Arm B's data. 80 refused, 0 by the firewall |
+| **`ja3_sft_v2`** (§5) | **1,122** | bash | **real traces, in the harness's conversation.** Arm B's data. 988 refused (reasons in §5), 0 by the firewall |
+| `ja3_sft` (v1, §5) | 2,029 | bash | **superseded: wrong format, adapters invalid.** Left on disk, nothing reads it |
 | **`ja3_fallback`** (§5) | **682** | bash | single-turn contract rows from `solutions/jupyter-agent`. **Not traces** |
-| `traces` | **1,258** (0 real / 1,258 fallback) | bash | 223 refused: 217 held-out tasks + 6 held-out questions. **Superseded for arm B by `ja3_sft`** |
+| `traces` | **1,258** (0 real / 1,258 fallback) | bash | 223 refused: 217 held-out tasks + 6 held-out questions. **Superseded for arm B by `ja3_sft_v2`** |
 | `rungs L1` | **590** | program | jupyter-agent only |
 | `rungs L2` | **591** | program | |
 | `rungs L3` | **591** | program | |
@@ -223,7 +235,151 @@ Three zeros worth explaining:
 
 ---
 
-## 5. Arm B's dataset: `ja3_sft`
+## 5. Arm B's dataset: `ja3_sft_v2`
+
+**Exported 2026-10-02 from the `ja3` transcript sweep** (run tag `ja3`, split `jupyter-agent-v3`,
+rung L1, model `stealth/space-bunny-alpha`), re-expressed in the conversation the evaluation harness
+builds. `ja3_sft.jsonl` (v1, below) is superseded.
+
+```sh
+uv run --extra train python -m train.export_ja3_v2 --out data/train    # replays every row, then tokenizes
+uv run python -m train.export_ja3_v2 --dry-run                          # counts + replay, writes nothing
+```
+
+| | |
+|---|---|
+| **path** | `data/train/ja3_sft_v2.jsonl` (9.8 MB, **1,122 rows**, `messages` + `tools` only) |
+| sidecars | `ja3_sft_v2.index.jsonl` (task id, v1 row position, op_family, per-row invented-text counts), `ja3_sft_v2.manifest.json` |
+| source | 2,110 verified trials, **1,122 exported, 988 refused** |
+| code | `train/export_ja3_v2.py` (translation), `train/replay.py` (the acceptance test) |
+| row order | v1's (`verified_trials` order). `index.v1_row` is the row's position in `ja3_sft.jsonl` for 1,117 of 1,122; the other 5 were refused by v1's leak check against its own prompt text and pass v2's. The join was checked on the model's turns: 2,013 of 2,029 v1 rows re-derive identically after the user message, and the other 16 differ only where v1's scrub rewrote a `/home/user/...` path |
+
+**One code path with the harness.** The system turn is `upstream.BASH_SYSTEM`; the user turn is
+`ladder.prompt_for(row, "jupyter-agent-v3", "L1", "bash")`, the function `run_ladder` calls for the same
+task, so the file list (`row["files"]`) and the answer-format line (`answer_format_of`) are derived as
+in evaluation; each tool result goes through `or_agent.truncate_output` and the harness's empty-output rule.
+
+**Answer-format mapping (`reward_mode` to the line).** Upstream's per-task line ("Express the value as
+a percentage ...", "Answer as a comma-separated list of ...") is the task's own instruction text. In
+SmolDataEnvs train it is present for `list` (366 of 367 tasks), `list_csv` (39 of 39) and some
+`flexible` tasks (95 of 152); `numeric` (0 of 2,906), `exact_short` (0 of 1,409) and `exact_bool`
+(0 of 127) never have one. The ja3 tasks are `numeric` 5,660, `exact_short` 1,658, `exact_bool` 200,
+so **all of them map to the empty line**, which `answer_format_of` returns and the template renders as
+one blank line.
+
+**The translation, rule by rule** (the `train/export_ja3_v2.py` docstring has the long form):
+
+| recorded (tools loop) | v2 row |
+|---|---|
+| `run_shell(command)` | `bash(command)`. `./input/x`, `input/x`, `./input`, `listdir('input')`, `cd input` become `/home/user/input`; the trial's scratch dir becomes `/workdir`; `cd . &&` is the model's own text and is kept |
+| `write_solution(code)` | `bash("cat > /workdir/solution.py << 'EOF' ... EOF")`, the code verbatim, result `(empty output, rc=0)` |
+| `stdout + "\n--- stderr ---\n" + stderr` | one stream, stderr appended after stdout (the interleaving was not recorded) |
+| `""` | `(empty output, rc=0)`. **Exit codes were not recorded**; 1,943 of the 1,952 empty results in the upstream rows are rc=0, so rc=0 is the convention the data supports |
+| output over 8,000 characters | first 8,000 + `\n... [truncated]`, the harness's rule (11 rows) |
+| `ls -la ./input` printing the symlink and the account name | the listing of the task's real input directory, in the layout of upstream's own `ls -la /home/user/input` results (see below) |
+| a bare `ls` listing `input` beside the model's files | that one line removed |
+| traceback frames in the recording venv | `/usr/local/lib/python3.N/...`, where `jail_bash` mounts the same libraries |
+| the model's last message | the closing assistant turn, verbatim: no sentence is written by the exporter |
+| (nothing: the sweep graded `solution.py` re-run offline) | one turn `echo -n "<graded prediction>" > /workdir/answer.txt`, answered `(empty output, rc=0)` |
+
+The `ls -la` replacement exists because that command opens nearly every transcript (1,936 of 2,110
+trials) and on the recording machine printed the `./input` symlink with the account name and a cache
+path; the sandbox has a real directory there. The block is `total N`, `.`, `..` and one line per
+file, with sizes read from the task's real input files and mode, owner and date copied from upstream's
+rows (`-rw-r--r-- 1 root root`, `drwxr-xr-x 2 user user`, `Aug 30 23:00`).
+
+**Submission idiom, measured on the 4,673 upstream rows** (the last write to `answer.txt`): `echo -n`
+2,433, `printf %s` 1,824, python 214, other 202; 4,672 of 4,673 rows end with a closing assistant
+message after the submission. So the submission is `echo -n "<value>" > /workdir/answer.txt` (the
+prompt's own example) and its reply is `(empty output, rc=0)`. `printf %s` would be answered with the
+harness's `Wrote N bytes ...` receipt; it is the minority idiom and was not chosen. A value containing
+`"`, `$`, a backtick, `\` or `!` is single-quoted (none of these 1,122 needed it) and every submission
+command is executed for real during the export and must write the value byte for byte.
+
+**Invented or rewritten text, counted** (manifest `invented_text`; "rows" = rows with at least one):
+
+| kind | count | rows | example row |
+|---|---|---|---|
+| submission command (`echo -n ...`) | 1,122 | 1,122 | `ja_0000_417_417191.ipynb_qa_5` |
+| its result, `(empty output, rc=0)` | 1,122 | 1,122 | same |
+| `ls -la` listing replacing the symlink line | 1,122 | 1,122 | same |
+| `cat > /workdir/solution.py << 'EOF'` framing | 1,191 | 1,122 | same |
+| `(empty output, rc=0)` for `written /app/solution.py` | 1,191 | 1,122 | same |
+| `(empty output, rc=0)` for an empty recording (rc assumed 0) | 7 | 6 | `ja_0002_336_2336120.ipynb_qa_2` |
+| stderr appended after stdout | 513 | 399 | `ja_0000_417_417191.ipynb_qa_5` |
+| `input` entry dropped from a bare `ls` | 269 | 261 | same |
+| *rewritten*: `./input` and friends to `/home/user/input` | 8,526 | 1,122 | same |
+| *rewritten*: scratch dir to `/workdir` | 324 | 284 | same |
+| *rewritten*: recording venv to `/usr/local/lib/python3.N` | 534 | 104 | `ja_0000_986_986807.ipynb_qa_4` |
+| *rewritten*: head-8,000 cut | 12 | 11 | same |
+
+**The 988 refusals, by reason.** A row is refused, never repaired, when the recording environment
+shows through in a way the translation cannot make true in the sandbox.
+
+| reason | rows |
+|---|---|
+| a command finds `input` relative to the script's own directory (`os.path.join(here, "input", ...)`; `/workdir` has no `input`, so the program would not run there) | 330 |
+| recording environment in a tool output: scratch or cache path (`kaggle/datasets/...`, other trial dirs) | 227 |
+| recording environment in a command: scratch or cache path | 165 |
+| recording environment in a tool output: local username (`ls -l` of other directories) | 86 |
+| a tool output was tail-cut at recording time (the sweep kept the LAST 20,000 characters; the harness keeps the head) | 81 |
+| transcript does not end with the graded answer | 35 |
+| gold answer in the prompt (`ladder.leaks`; 6 are the template's own example `95293`) | 30 |
+| a command names `/home/user` or `/workdir`, which the recording machine did not have | 11 |
+| recording environment in a command: home path | 10 |
+| recording environment in a tool output: home path | 4 |
+| a tool call without a command or code | 3 |
+| a recorded timeout (150 s, not the harness's 180) | 3 |
+| unsupported tool (`edit_solution`) / tool arguments not JSON / held-out question | 1 / 1 / 1 |
+
+**Acceptance test: every row replays.** `train/replay.py` scripts the model with the row's assistant
+turns and the shell with the row's tool outputs and runs `or_agent.bash_loop` (stop policy `model`, the
+default). The harness must rebuild the row's messages exactly, every message and in order (the upstream
+test lets trailing messages go unreplayed; this one does not). **1,122 of 1,122 rows replay
+byte-identically (rate 1.0).** `ops/amd/stage.py` refuses to stage arm B unless the manifest records
+that. `tests/test_export_ja3_v2.py` has a 3-row scrubbed fixture in the quick loop and the whole file
+under `-m slow`.
+
+**Rendering guard** (`python -m train.render data/train/ja3_sft_v2.jsonl`, `Qwen/Qwen3.5-2B` template,
+`enable_thinking=False`): 8,115 tool calls rendered of 8,115 in the source, 8,115 of 8,115 tool results,
+**0** empty assistant turns where the source had a call, 8,029 assistant turns, 0 problem rows.
+
+**Tokens** (rendered, `max_length` 8,192): arm B **1,122 rows, 3,178,803 raw, 3,123,047 trained**;
+median 2,344, p90 4,432, max 15,042; **1.96% of rows exceed 8,192** (v1: 7.9%). Arm A (train split,
+4,439 rows): 9,216,104 raw, 9,085,233 trained. **A+B is 5,561 rows, 12,394,907 raw, 12,208,280
+trained.** Assistant turns per row: median 7, p90 9, max 22 (0.5% exceed 16, the harness's `or_agent`
+ceiling), against upstream's median 4.
+
+**Scrub and firewall, re-asserted.** `export_ja3.leaks_machine` refuses `/home/<anything but user>`,
+`/Users/`, `/var/tmp/`, the local username, a hostname, a key or token and the Kaggle cache layout;
+`/home/user/input` is the intended path and is not flagged. The firewall keys are re-derived from the
+live SmolDataEnvs test/eval splits: 0 table drops and 1 question drop, the same task as v1.
+
+### What still differs between A and B
+
+After this export A and B are the same *format* and differ in the data. The **solver**: A is another
+model's trajectories, B is `stealth/space-bunny-alpha`'s. The **question mix**: A is SmolDataEnvs' own
+tasks (296 distinct answer-format lines, `list` and `flexible` answers); B is jupyter-agent notebook
+questions, all `numeric`, `exact_short` or `exact_bool` with no format line, and only the 1,122 of
+2,110 verified trials whose environment could be translated, which skews toward shorter, less
+error-prone sessions. The **invented submission step**: every B row ends with an exporter-written
+`echo -n` call and an exporter-chosen reply (1 of about 7 assistant turns), where A's submissions were
+written by its solver, and 39% of A's use `printf` with the `Wrote N bytes` receipt that B never has.
+**Trajectory length**: B's median is 7 assistant turns against A's 4, with 0.5% past 16. The **Python
+version**: B's tracebacks and library paths are Python 3.14's, as the harness's sandbox shows them,
+while A's 1,838 `python3.x` mentions are all 3.12, and the two differ in caret markers and some error
+wording. **Tool outputs truncated differently at recording time**: the sweep kept the last 20,000
+characters, merged stderr after stdout and recorded no exit code, so 81 tail-cut rows were refused,
+empty results are assumed rc=0, and the 11 rows with 8,001 to 19,999 characters are cut by the harness's
+head-8,000 rule, which A's own rows follow. Finally B's first command shows a synthesized `ls -la`
+(real sizes, upstream's owner, mode and date) where A's shows the real one. None of this can be removed
+by re-exporting; it is what "our solver's data" means.
+
+### v1 (superseded): `ja3_sft`
+
+The text below describes v1 as exported on 2026-10-01 and is kept for the record. **Adapters trained on
+it are invalid** (§0).
+
 
 **Exported 2026-10-01 from the `ja3` transcript sweep** (run tag `ja3`, split
 `jupyter-agent-v3`, rung L1, model `stealth/space-bunny-alpha`). This is the first training data in
@@ -371,9 +527,10 @@ uv run --extra train python -m train.export_sft --source traces --out data/train
 uv run --extra train python -m train.export_sft --source rungs --rung L2 --out data/train/rungs_L2
 uv run python -m train.rungs --counts      # availability, per rung, per source
 
-# Arm B: the ja3 transcript sweep, real traces + the contract rows (see §5)
-uv run python -m train.export_ja3 --out data/train
-# -> ja3_sft.jsonl 2029 rows, ja3_fallback.jsonl 682, firewall drops 0 table / 1 question
+# Arm B: the ja3 transcript sweep in the harness's conversation (see §5)
+uv run --extra train python -m train.export_ja3_v2 --out data/train
+# -> ja3_sft_v2.jsonl 1122 rows, 988 refused, replay 1122/1122, firewall drops 0 table / 1 question
+# (train.export_ja3 still writes the superseded v1 ja3_sft.jsonl and the contract-row ja3_fallback.jsonl)
 ```
 
 ### SFT — laptop (this box)
@@ -386,10 +543,10 @@ uv run --extra train python -m train.sft_lora \
     --out runs/sft_a \
     --max-length 4096 --load-in-4bit        # QLoRA: 4-bit weights, ~1.2 GB
 
-# Arm B. --max-length 8192, not 4096: 7.9% of the trace rows are longer than 8,192 tokens and the
-# median is 2,364, so 4096 would truncate about a quarter of the set (§5).
+# Arm B (v2). --max-length 8192, not 4096: 2.0% of the rows are longer than 8,192 tokens and the
+# median is 2,344; 4096 would truncate a larger share (§5).
 uv run --extra train python -m train.sft_lora \
-    --data data/train/ja3_sft.jsonl \
+    --data data/train/ja3_sft_v2.jsonl \
     --model Qwen/Qwen3.5-2B \
     --out runs/sft_b \
     --max-length 8192 --load-in-4bit
@@ -528,7 +685,7 @@ Two facts worth keeping either way:
    dataset and must never be done silently.
 
    **For arm B this decision is already made by construction and it is not the owner's to make
-   twice.** `ja3_sft` is exported from the v3 pool, which excludes every SmolDataEnvs test/eval
+   twice.** `ja3_sft_v2` is exported from the v3 pool, which excludes every SmolDataEnvs test/eval
    *table* on the bare dataset name; the export re-asserts that and reports 0 drops (§5). There is
    no arm-B variant of the `bucket_prefix` flag, because there is no arm-B row to apply it to.
 2. **Base model.** Everything defaults to `Qwen/Qwen3.5-2B`, the exact `base_model_name_or_path` in
@@ -536,13 +693,13 @@ Two facts worth keeping either way:
    `enable_thinking` template) because 2B does not fit a LoRA smoke run on 6 GB. Real runs use the
    2B.
 3. **Which SFT arm is "ours".** — **resolved 2026-10-01.** Arm A is upstream's 4.7K. Arm B is
-   **`data/train/ja3_sft.jsonl`, 2,029 rows of our own solver's real trajectories** (§5), exported
-   by `train/export_ja3.py` from the `ja3` transcript sweep. `--source traces` is superseded for
+   **`data/train/ja3_sft_v2.jsonl`, 1,122 rows of our own solver's real trajectories** (§5), exported
+   by `train/export_ja3_v2.py` from the `ja3` transcript sweep in the harness's own conversation
+   (v1, `ja3_sft.jsonl`, was in the sweep's format and is superseded; adapters trained on it are invalid). `--source traces` is superseded for
    arm B and must not be quoted as a trace dataset: it still reads the pre-2026-10-01 tree and finds
-   no conversation in it. What is still the owner's call: whether to train arm B on `ja3_sft`
-   alone (2,029 traces), on `ja3_fallback` alone (682 contract rows), or on the two concatenated
-   (2,711, with the contract rows teaching only the submission contract and the traces teaching the
-   exploration). §5 argues for the traces alone, and the fallback file exists so the alternative can
+   no conversation in it. What is still the owner's call: whether to train arm B on `ja3_sft_v2`
+   alone (1,122 traces), on `ja3_fallback` alone (682 contract rows; still in the v1 conventions, so
+   it needs the same re-export before use), or on the two concatenated. §5 argues for the traces alone, and the fallback file exists so the alternative can
    be run without re-deriving anything.
 4. **Where the arms run** — **leaning, not settled: the AMD Developer Cloud credit** (MI300X 192 GB,
    $1.99/h, $100 ≈ 50 h, expiring 30 days after applying) carries arms A–D, with **Kaggle as the
