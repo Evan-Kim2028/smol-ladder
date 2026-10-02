@@ -1,24 +1,25 @@
-"""Orchestrate the three SFT arms and their ladder evaluations on an AMD MI300X droplet.
+"""Run the session: three SFT arms, then one four-model ladder evaluation, on one AMD droplet.
 
-    driver.py --host <ip> --user root --dry-run          print every command, run nothing
-    driver.py --host <ip> --user root                    run the whole plan over ssh
-    driver.py --mode api --droplet <name|id> --destroy    destroy the droplet (API mode)
-    driver.py --mode api --droplet <name|id> --power-off  power it off without destroying
+    python ops/amd/driver.py dry-run            every command in order and the costed table; touches nothing
+    python ops/amd/driver.py plan [--json]      the costed table only
+    python ops/amd/driver.py preflight ...      read-only GETs: is this create going to work
+    python ops/amd/driver.py create ... --yes   POST the droplet, wait for the IP, record it
+    python ops/amd/driver.py bootstrap          upload the stage dir, run the ONE entry script
+    python ops/amd/driver.py smoke              checklist, throughput bench, kill/resume, probe, go/no-go
+    python ops/amd/driver.py project            re-run the go/no-go with new flags (no spend)
+    python ops/amd/driver.py train              SFT A, B, A+B (resumable, skips finished arms)
+    python ops/amd/driver.py serve              ONE vLLM: base + all adapters
+    python ops/amd/driver.py tunnel [up|down]   ssh -L to the droplet (loopback)
+    python ops/amd/driver.py eval               ladder on THIS laptop: L1 for all four, then L2..L4, control
+    python ops/amd/driver.py sync               adapters + logs off the droplet, then verify them
+    python ops/amd/driver.py destroy --yes      DELETE by tag, then GET until none remains
+    python ops/amd/driver.py go                 train -> serve -> tunnel -> eval -> sync -> destroy
+    python ops/amd/driver.py status             uptime and accrued cost, from the ledger
 
-## Two modes, and the difference is a credential
-
-**SSH mode** (`--host`/`--user`, the default) needs nothing but an ssh key: the owner creates the
-droplet in the console and attaches the laptop's public key. The agent cannot create or destroy
-anything; it runs the plan against a droplet that already exists. This is the mode to start with.
-
-**API mode** (`--mode api`) needs a DigitalOcean personal access token, because AMD Developer Cloud
-droplets are DigitalOcean droplets -- DigitalOcean documents `doctl` and `POST /v2/droplets` in its
-AMD section, with the MI300X size slugs. The token lives in `AMD_CLOUD_API_TOKEN` in the repo's
-git-ignored `.env` and is never passed as a flag, logged or committed.
-
-This module contains no network code: it builds the command list, and `run()` either prints it
-(`--dry-run`) or hands it to ssh/doctl. Everything worth testing -- the budget arithmetic, the
-step order, the per-step guards -- is pure and lives above `main()`.
+Nothing mutates the cloud without `--yes`, and `--yes` is only ever typed by the reviewer. Every
+billed step passes a budget gate first (ledger accrual + the step + a reserve for sync/destroy
+must stay under --budget and under the total cap), and every lifecycle event is appended to
+ops/amd/ledger.jsonl. See docs/AMD_RUNBOOK.md.
 """
 
 from __future__ import annotations
@@ -26,466 +27,541 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import time
 from pathlib import Path
 
 OPS = Path(__file__).resolve().parent
 REPO_ROOT = OPS.parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-# Published MI300X rate. See docs/AMD_RUNBOOK.md section 1 for the sources; the runbook's own
-# finding is that the $1.99 figure in the plan is unconfirmed and the official rate is higher,
-# which changes how much of the credit the plan can buy.
-DEFAULT_PRICE_PER_GPU_HOUR = 2.59
+from ops.amd import cloud  # noqa: E402
+from ops.amd import ledger as L  # noqa: E402
+from ops.amd import plan as P  # noqa: E402
+from ops.amd.doapi import DoApi, load_dotenv, token_from_env  # noqa: E402
 
-ARMS = ("A", "B", "AB")
-EVAL_ARMS = ("base", "A", "B", "AB")
-
-# Per-arm SFT estimates, in GPU-hours, for one MI300X at bf16 LoRA, max_length 8192, 1 epoch.
-# These are ESTIMATES and the derivation is in the runbook. The smoke run re-measures them: the
-# first arm's actual runtime is reported next to its estimate so the rest can be corrected before
-# they are spent, which is the whole point of running A first.
-SFT_HOURS_ESTIMATE = {"A": 2.5, "B": 1.0, "AB": 3.0}
-# Serving and sweeping the ladder, per model, on the same card.
-EVAL_HOURS_ESTIMATE = 0.75
-SETUP_HOURS = 0.75  # clone, venv, image pull, HF login, data rsync
-SMOKE_STEP_HOURS = 0.25  # per smoke step: a 20-step SFT run, then a 5-task sweep
-FINAL_SYNC_HOURS = 0.25  # the last rsync + Hub push, which happens while the GPU is still billed
+TRIAL_LINE = re.compile(r"^\[\d+/\d+\] .* reward=", re.M)
 
 
-@dataclass
-class Step:
-    """One thing the driver does, with enough context for --dry-run to be readable."""
+# ── configuration ─────────────────────────────────────────────────────────────────
 
-    name: str
-    argv: list[str]
-    note: str = ""
-    hours: float = 0.0
-    dollars: float = 0.0
-    # Steps that must not be skipped when resuming, and steps that are safe to repeat.
-    idempotent: bool = True
+def local_fingerprint(pub: Path) -> str:
+    """MD5 fingerprint of a public key, the form DigitalOcean wants. Empty if unavailable."""
+    try:
+        out = subprocess.check_output(["ssh-keygen", "-E", "md5", "-lf", str(pub)], text=True)
+        return out.split()[1].removeprefix("MD5:")
+    except (OSError, subprocess.CalledProcessError, IndexError):
+        return ""
 
 
-@dataclass
-class Plan:
-    steps: list[Step] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-
-    @property
-    def hours(self) -> float:
-        return sum(s.hours for s in self.steps)
-
-    @property
-    def dollars(self) -> float:
-        return sum(s.dollars for s in self.steps)
-
-    def as_json(self) -> dict:
-        return {
-            "steps": [
-                {"name": s.name, "argv": s.argv, "note": s.note,
-                 "hours": round(s.hours, 3), "dollars": round(s.dollars, 2)}
-                for s in self.steps
-            ],
-            "totals": {"hours": round(self.hours, 2), "dollars": round(self.dollars, 2)},
-            "warnings": self.warnings,
-        }
-
-
-def cost(hours: float, price: float) -> tuple[float, float]:
-    return hours, hours * price
-
-
-def budget_report(price: float, budget: float, arms: list[str],
-                  sft_hours: dict[str, float], eval_hours: float,
-                  eval_base: bool = True, setup_hours: float = SETUP_HOURS) -> dict:
-    """The table in the runbook, as data, so the doc and the tool cannot disagree.
-
-    Every number here is an ESTIMATE. The two inputs it is derived from are the published hourly
-    price and the per-arm GPU-hour estimates above; nothing in it is measured, and the smoke run
-    is what replaces it with a measurement.
-    """
-    # Quantise the hours once, then price the quantised hours. Doing it in this order makes the
-    # printed table add up to the printed total, which a budget table that does not add up gets
-    # ignored over.
-    rows = [{"stage": "setup", "hours": round(setup_hours, 2)}]
-    for arm in arms:
-        rows.append({"stage": f"sft-{arm}", "hours": round(sft_hours[arm], 2)})
-    eval_arms = list(arms) + (["base"] if eval_base else [])
-    for arm in eval_arms:
-        rows.append({"stage": f"eval-{arm}", "hours": round(eval_hours, 2)})
-    for row in rows:
-        row["dollars"] = round(row["hours"] * price, 2)
-    hours = sum(r["hours"] for r in rows)
-    dollars = sum(r["dollars"] for r in rows)
-    return {
-        "rows": rows,
-        "total_hours": round(hours, 2),
-        "total_dollars": round(dollars, 2),
-        "budget_dollars": budget,
-        "within_budget": dollars <= budget,
-        "headroom_dollars": round(budget - dollars, 2),
-        "price_per_gpu_hour": price,
-        "note": "ESTIMATES, not measurements. See docs/AMD_RUNBOOK.md section 3 for the derivation.",
-    }
+def add_common(ap: argparse.ArgumentParser) -> None:
+    g = ap.add_argument_group("hardware")
+    g.add_argument("--fallback", action="store_true",
+                   help=f"MI325X on-demand ({P.REGION_MI325X}, ${P.PRICE_MI325X}/h) instead of MI350X spot")
+    g.add_argument("--size", default="")
+    g.add_argument("--region", default="")
+    g.add_argument("--price", type=float, default=0.0, help="override the hourly rate")
+    g.add_argument("--image", default=P.IMAGE_DEFAULT)
+    g.add_argument("--ssh-key-fingerprint", default="")
+    g.add_argument("--ssh-pubkey", default=str(Path.home() / ".ssh" / "id_ed25519.pub"))
+    g.add_argument("--tag", default=P.TAG)
+    g = ap.add_argument_group("money")
+    g.add_argument("--budget", type=float, default=P.DEFAULT_BUDGET, help="session cap, dollars")
+    g.add_argument("--total-cap", type=float, default=P.TOTAL_CAP)
+    g.add_argument("--deadline-minutes", type=float, default=0.0)
+    g = ap.add_argument_group("work")
+    g.add_argument("--arms", default=",".join(P.ARMS))
+    g.add_argument("--max-length", type=int, default=8192)
+    g.add_argument("--limit", type=int, default=250, help="tasks per rung per model")
+    g.add_argument("--samples", type=int, default=2, help="samples at L1")
+    g.add_argument("--late-samples", type=int, default=1, help="samples at L2..L4")
+    g.add_argument("--rungs", default=",".join(P.RUNGS))
+    g.add_argument("--workers", type=int, default=12)
+    g.add_argument("--no-base", action="store_true", help="skip the base-model control")
+    g.add_argument("--no-program-control", action="store_true")
+    g.add_argument("--serve-mode", choices=["lora", "merged"], default="lora")
+    g = ap.add_argument_group("where")
+    g.add_argument("--host", default="", help="droplet IP (default: from the ledger)")
+    g.add_argument("--identity", default="")
+    g.add_argument("--commit", default="HEAD")
+    g.add_argument("--stage-dir", default="/tmp/smol-ladder-stage")
+    g.add_argument("--ledger", default=str(OPS / "ledger.jsonl"))
 
 
-def ssh_argv(host: str, user: str, remote: list[str], ident: str | None = None) -> list[str]:
-    argv = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
-    if ident:
-        argv += ["-i", ident]
-    argv.append(f"{user}@{host}")
-    argv += ["--"] + remote
-    return argv
+def build_config(args: argparse.Namespace) -> P.Config:
+    arms = tuple(a.strip().upper() for a in args.arms.split(",") if a.strip())
+    bad = [a for a in arms if a not in P.ARMS]
+    if bad:
+        raise SystemExit(f"unknown arm(s) {bad}; choose from {list(P.ARMS)}")
+    rungs = tuple(r.strip() for r in args.rungs.split(",") if r.strip())
+    if not rungs or any(r not in P.RUNGS for r in rungs):
+        raise SystemExit(f"--rungs must be a subset of {list(P.RUNGS)}")
+    fb = args.fallback
+    fp = args.ssh_key_fingerprint or local_fingerprint(Path(args.ssh_pubkey))
+    return P.Config(
+        size=args.size or (P.SIZE_MI325X if fb else P.SIZE_MI350X),
+        region=args.region or (P.REGION_MI325X if fb else P.REGION_MI350X),
+        price=args.price or (P.PRICE_MI325X if fb else P.PRICE_MI350X),
+        image=args.image, fingerprint=fp, tag=args.tag, budget=args.budget,
+        total_cap=args.total_cap, deadline_minutes=args.deadline_minutes, arms=arms,
+        max_length=args.max_length, limit=args.limit, samples=args.samples,
+        late_samples=args.late_samples, rungs=rungs, workers=args.workers,
+        include_base=not args.no_base, program_control=not args.no_program_control,
+        serve_mode=args.serve_mode, host=args.host, identity=args.identity, commit=args.commit,
+        stage_dir=args.stage_dir, ledger=args.ledger)
 
 
-def plan(cfg) -> Plan:
-    """The ordered run plan. Pure: no clock, no filesystem, no network.
-
-    The order is not arbitrary. Setup, then the first-hour ROCm smoke test, then arm A -- the arm
-    with the most rows and the published comparison -- so that its measured runtime is available to
-    correct the estimates for B and A+B before they are spent. Evaluation of an arm comes right
-    after its training, because an adapter that cannot be served should be discovered while the
-    droplet is already warm and the run is cheap to redo. Teardown is last and unconditional.
-    """
-    p = Plan()
-    price, budget = cfg.price, cfg.budget
-    arms = cfg.arms
-
-    def add(name, remote, note="", hours=0.0, idempotent=True):
-        hours_, dollars_ = cost(hours, price)
-        p.steps.append(Step(name, ssh_argv(cfg.host, cfg.user, remote, cfg.identity),
-                            note, hours_, dollars_, idempotent))
-
-    # 1. Setup. One ssh, one idempotent script: the repo is checked out at a pinned commit, the
-    #    venv is built inside the ROCm container, HF is logged in, the data is rsynced in.
-    setup = ["bash", f"{cfg.remote_root}/ops/amd/bootstrap.sh",
-             "--commit", cfg.commit, "--with-data", "--with-eval"]
-    add("bootstrap", setup, "idempotent: env, repo at a pinned commit, venv, HF login, data",
-        SETUP_HOURS)
-
-    # 2. The dead-man switch, started before anything that can hang. A window that is a poweroff
-    #    is also what keeps the meter honest if the laptop sleeps mid-run.
-    add("watchdog", ["bash", f"{cfg.remote_root}/ops/amd/watchdog.sh", "--once"],
-        "one tick, to prove the switch is armed before a long run starts")
-    p.steps[-1].argv = ssh_argv(cfg.host, cfg.user,
-                                ["bash", "-c",
-                                 f"nohup bash {cfg.remote_root}/ops/amd/watchdog.sh "
-                                 f"--max-minutes {cfg.max_minutes} --idle-minutes {cfg.idle_minutes} "
-                                 f">/dev/null 2>&1 & echo $!"],
-                                cfg.identity)
-    p.steps[-1].note = "start the long-running watchdog loop in the background"
-
-    # 3. The first-hour smoke test. Cheap, and it is the step that finds out whether the ROCm image
-    #    can train and serve at all before an arm has burned credit finding out the same thing more
-    #    slowly.
-    smoke = ["bash", f"{cfg.remote_root}/ops/amd/run_sft.sh", "--arm", "A", "--smoke",
-             "--inside-rocm"]
-    add("smoke-sft", smoke, "20 steps, proves bf16 LoRA trains on ROCm; measured before committing",
-        SMOKE_STEP_HOURS)
-    smoke_eval = ["bash", f"{cfg.remote_root}/ops/amd/run_eval.sh", "--arm", "base",
-                  "--limit", str(cfg.smoke_limit), "--rungs", "L1"]
-    add("smoke-eval", smoke_eval,
-        f"{cfg.smoke_limit} tasks, base model, proves vLLM serves and the ladder grades on ROCm",
-        SMOKE_STEP_HOURS)
-
-    # 4. The arms. Each: train, then evaluate, then sync its adapter back.
-    for arm in arms:
-        hours = cfg.sft_hours[arm]
-        # Touch the heartbeat before every long step. The watchdog treats a stale heartbeat as a
-        # dead orchestrator, so a 3-hour training run must be preceded by a touch rather than left
-        # to the one in step 3 -- otherwise a healthy run trips the switch mid-arm.
-        add(f"heartbeat-{arm}", ["touch", f"{cfg.remote_root}/.heartbeat"],
-            "refresh the watchdog's liveness signal before the long step")
-        train = ["bash", f"{cfg.remote_root}/ops/amd/run_sft.sh", "--arm", arm, "--inside-rocm"]
-        if cfg.resume:
-            train.append("--resume")
-        add(f"sft-{arm}", train, f"LoRA bf16, max_length {cfg.max_length}, 1 epoch (ESTIMATE)", hours)
-        add(f"sync-{arm}", ["bash", f"{cfg.remote_root}/ops/amd/sync_back.sh", "--push-hub"],
-            "push the adapter and log to the Hub before the next arm starts")
-        evaluate = ["bash", f"{cfg.remote_root}/ops/amd/run_eval.sh", "--arm", arm]
-        if cfg.limit:
-            evaluate += ["--limit", str(cfg.limit)]
-        add(f"eval-{arm}", evaluate,
-            f"serve base+{arm} with vLLM, ladder over {cfg.split}, tag {cfg.tag_prefix}-{arm}",
-            cfg.eval_hours)
-        add(f"results-{arm}",
-            ["bash", f"{cfg.remote_root}/ops/amd/sync_back.sh", "--push-hub",
-             "--to-laptop", "--tags", f"{cfg.tag_prefix}-{arm}"],
-            "rsync the sweep results back; the measurement, not the adapter, is the result")
-
-    # 6. The base control is evaluated last. It needs no training, so there is no reason to pay for
-    #    a server start before the arms that do, and it shares the droplet with whatever ran before.
-    if cfg.eval_base:
-        evaluate = ["bash", f"{cfg.remote_root}/ops/amd/run_eval.sh", "--arm", "base"]
-        if cfg.limit:
-            evaluate += ["--limit", str(cfg.limit)]
-        add("eval-base", evaluate,
-            "arm 0: the base control under --agent program, the floor every arm is read against",
-            cfg.eval_hours)
-        add("results-base",
-            ["bash", f"{cfg.remote_root}/ops/amd/sync_back.sh", "--push-hub",
-             "--to-laptop", "--tags", f"{cfg.tag_prefix}-base"],
-            "rsync the base model's results back")
-
-    # 7. Teardown, always. A poweroff is not enough: the droplet keeps billing until it is
-    #    destroyed, so this is the step that actually stops the meter.
-    add("sync-final", ["bash", f"{cfg.remote_root}/ops/amd/sync_back.sh", "--push-hub",
-                       "--to-laptop", "--tags", ",".join(f"{cfg.tag_prefix}-{a}" for a in EVAL_ARMS)],
-        "final sync: everything off the droplet and on the Hub", FINAL_SYNC_HOURS)
-    add("poweroff", ["shutdown", "-h", "now"],
-        "stops the work; billing continues until the droplet is DESTROYED")
-
-    if p.dollars > budget:
-        p.warnings.append(
-            f"PLAN OVER BUDGET: ${p.dollars:.2f} estimated against a ${budget:.2f} cap. "
-            "Cut --limit, drop an arm, or raise the cap deliberately.")
-    if p.hours * price < budget * 0.5:
-        p.warnings.append(
-            f"plan uses about half the cap (${p.dollars:.2f} of ${budget:.2f}); "
-            "there is room for a second seed or a k=2 sweep.")
-    if not cfg.identity:
-        p.warnings.append("no --identity given; ssh will use the agent's default key")
-    if not cfg.hub_namespace:
-        p.warnings.append(
-            "AMD_HUB_NAMESPACE is unset: adapters cannot be pushed to the Hub, so the only copy "
-            "of a trained adapter is this droplet's disk.")
-    return p
+def tokens_for(cfg: P.Config) -> dict[str, P.SetTokens]:
+    staged = P.load_tokens(Path(cfg.stage_dir) / "tokens.json", cfg.max_length)
+    return staged or P.heuristic_tokens(REPO_ROOT / "data", cfg.max_length)
 
 
-@dataclass
-class Config:
-    host: str
-    user: str
-    identity: str | None
-    commit: str
-    arms: list[str]
-    price: float
-    budget: float
-    max_minutes: int
-    idle_minutes: int
-    max_length: int
-    limit: int | None
-    split: str
-    tag_prefix: str
-    remote_root: str
-    eval_hours: float
-    smoke_hours: float
-    smoke_limit: int
-    resume: bool
-    eval_base: bool
-    hub_namespace: str
-    sft_hours: dict[str, float] = field(default_factory=lambda: dict(SFT_HOURS_ESTIMATE))
+def with_host(cfg: P.Config, events: list[dict]) -> P.Config:
+    """The droplet's IP comes from the ledger unless --host was given."""
+    if not cfg.host:
+        ready = L.latest(events, L.READY)
+        live = L.open_interval(events)
+        if ready and live and ready.get("droplet_id") == live.get("droplet_id"):
+            cfg.host = ready.get("ip", "")
+    return cfg
 
 
-def api_argv(action: str, droplet: str, token_env: str, region: str, size: str,
-             image: str, ssh_key_fingerprint: str | None, name: str) -> list[str]:
-    """The doctl invocations, built here so --dry-run can print them without doctl installed."""
-    base = ["doctl", "--config", "/dev/null", "compute", "droplet"]
-    if action == "create":
-        argv = base + ["create", name, "--region", region, "--size", size, "--image", image]
-        if ssh_key_fingerprint:
-            argv += ["--ssh-keys", ssh_key_fingerprint]
-        return argv
-    if action == "destroy":
-        return base + ["delete", droplet, "--force"]
-    if action == "power-off":
-        return base + ["action", "power-off", droplet, "--wait"]
-    if action == "power-on":
-        return base + ["action", "power-on", droplet, "--wait"]
-    if action == "get":
-        return base + ["get", droplet, "--format", "ID,Name,PublicIPv4,Status,Size,Created"]
-    if action == "list":
-        return base + ["list", "--format", "ID,Name,PublicIPv4,Status,Size,Created"]
-    raise ValueError(action)
+def make_plan(cfg: P.Config, events: list[dict]) -> tuple[list[P.Step], list[P.Row]]:
+    meas = P.measured_from_ledger(events)
+    tokens = tokens_for(cfg)
+    rows = P.projection(cfg, tokens, meas)
+    cfg.deadline_minutes = cfg.deadline_minutes or P.default_deadline_minutes(cfg, rows)
+    return P.build_plan(cfg, tokens, meas), rows
 
 
-def run(argv: list[str], dry_run: bool) -> int:
-    printable = " ".join(shlex.quote(a) for a in argv)
-    if dry_run:
-        print(f"  $ {printable}")
+# ── printing ──────────────────────────────────────────────────────────────────────
+
+def print_table(cfg: P.Config, rows: list[P.Row], spent_session: float = 0.0) -> dict:
+    total = P.total_dollars(rows, cfg.price)
+    hours = sum(r.seconds for r in rows) / 3600.0
+    kind = "spot" if cfg.spot else "on-demand"
+    print(f"## costed plan: {cfg.size} in {cfg.region} ({kind}) at ${cfg.price}/h, "
+          f"session budget ${cfg.budget:.2f}, total cap ${cfg.total_cap:.2f}, image {cfg.image}")
+    print(f"  {'stage':<30} {'hours':>6} {'dollars':>8}  basis")
+    for r in rows:
+        print(f"  {r.stage:<30} {r.seconds / 3600.0:>6.2f} {r.dollars(cfg.price):>8.2f}  {r.basis}")
+    print(f"  {'TOTAL':<30} {hours:>6.2f} {total:>8.2f}  "
+          f"(session headroom ${cfg.budget - total:.2f}, credit headroom ${P.CREDIT - total:.2f})")
+    if total > cfg.budget:
+        print(f"  !! OVER THE SESSION BUDGET by ${total - cfg.budget:.2f}")
+    if any(not r.measured and "UNMEASURED" in r.basis for r in rows):
+        print("  !! rows marked UNMEASURED are placeholders; the smoke measures them and `project` "
+              "re-renders this table before any arm is trained")
+    return {"rows": [{"stage": r.stage, "seconds": round(r.seconds), "dollars":
+                      round(r.dollars(cfg.price), 2), "basis": r.basis} for r in rows],
+            "total_hours": round(hours, 2), "total_dollars": round(total, 2),
+            "price_per_hour": cfg.price, "budget": cfg.budget, "within_budget": total <= cfg.budget}
+
+
+def show_step(step: P.Step) -> None:
+    where = {"laptop": "on this laptop", "droplet": "on the droplet (via ssh)", "api": "DigitalOcean API"}
+    billed = f"{step.seconds / 60.0:.0f} min billed" if step.billed and step.seconds else "not billed"
+    print(f"\n# [{step.phase}] {step.name} ({where[step.where]}; {billed})")
+    print(f"#   {step.note}")
+    if step.api:
+        print(f"#   {step.api}")
+    for i, cmd in enumerate(step.cmds):
+        print(f"  $ {cmd.shell()}" + (" &" if len(step.cmds) > 1 else ""))
+    if len(step.cmds) > 1:
+        print("  $ wait")
+
+
+def dry_run(cfg: P.Config, events: list[dict]) -> None:
+    steps, rows = make_plan(cfg, events)
+    print_table(cfg, rows)
+    print(f"\n## evaluation protocol: every model, base included, under --agent bash "
+          f"(the SmolDataEnvs-sft format the arms are trained in); base also under --agent program "
+          f"as a one-turn control. Chat template kwargs {P.CHAT_KWARGS} everywhere.")
+    print("\n## the whole session, in order. Nothing below is executed by this command.")
+    phase = ""
+    for step in steps:
+        if step.phase != phase:
+            phase = step.phase
+        show_step(step)
+    print("\n# afterwards: python ops/amd/driver.py status   (ledger says nothing is billing)")
+
+
+# ── gates and bookkeeping ─────────────────────────────────────────────────────────
+
+def gate(cfg: P.Config, step: P.Step, now: float | None = None) -> None:
+    if not step.billed or step.seconds <= 0:
+        return
+    now = time.time() if now is None else now
+    reserve = P.RESERVE_S if step.reserve else 0.0
+    v = L.verdict(L.read(Path(cfg.ledger)), now, step.seconds, cfg.price, cfg.budget,
+                  cfg.total_cap, reserve)
+    print(f"## budget gate for {step.name}: {v.reason}")
+    if not v.allowed:
+        raise SystemExit(f"\nSTOPPING BEFORE '{step.name}'. {v.reason}\nNothing was started. Lower "
+                         "--limit/--samples/--rungs, drop an arm, or raise --budget on purpose.")
+
+
+def last_go(events: list[dict]) -> bool | None:
+    for e in reversed(events):
+        if e.get("event") == L.MEASURED and "go" in e:
+            return bool(e["go"])
+    return None
+
+
+def run_cmd(cmd: P.Cmd, host: str, capture: bool = False) -> tuple[int, str]:
+    argv = [a.replace("<droplet-ip>", host) for a in cmd.argv]
+    env = dict(os.environ, **dict(cmd.env))
+    if "<droplet-ip>" in " ".join(cmd.argv) and not host:
+        raise SystemExit("no droplet IP: create it first or pass --host")
+    print("  $ " + cmd.shell(), flush=True)
+    if not capture:
+        return subprocess.call(argv, env=env), ""
+    proc = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True)
+    sys.stdout.write(proc.stdout)
+    return proc.returncode, proc.stdout
+
+
+def run_parallel(cmds: list[P.Cmd], host: str) -> int:
+    procs = []
+    for cmd in cmds:
+        print("  $ " + cmd.shell() + " &", flush=True)
+        procs.append(subprocess.Popen(cmd.argv, env=dict(os.environ, **dict(cmd.env))))
+    codes = [p.wait() for p in procs]
+    return max(codes) if codes else 0
+
+
+# ── measurements ──────────────────────────────────────────────────────────────────
+
+def parse_measurements(data: dict) -> dict:
+    """Fields of the ledger's `measured` event from the smoke's measurements.json."""
+    best = data.get("best") or {}
+    return {"tokens_per_s": best.get("tokens_per_s"), "batch_size": best.get("per_device_batch_size"),
+            "grad_accum": best.get("grad_accum"),
+            "checks_ok": data.get("checks_ok"), "resume_ok": (data.get("resume") or {}).get("ok")}
+
+
+def parse_probe_serve(text: str) -> dict:
+    out: dict = {}
+    m = re.search(r"READY_AFTER_S=(\d+(?:\.\d+)?)", text)
+    if m:
+        out["probe_start_s"] = float(m.group(1))
+    m = re.search(r"TOOL_CALLS_OK=([01])", text)
+    if m:
+        out["tool_calls_ok"] = m.group(1) == "1"
+    return out
+
+
+def seconds_per_trial(output: str, wall_seconds: float) -> float | None:
+    """Wall seconds per trial at the probe's worker count, from the harness's own progress lines."""
+    n = len(TRIAL_LINE.findall(output))
+    return wall_seconds / n if n else None
+
+
+def go_no_go(cfg: P.Config, events: list[dict], now: float) -> tuple[bool, list[str], dict]:
+    """The decision the smoke ends with. NO-GO on any failed check, an unmeasured throughput, or a
+    projection (money already spent + everything still to run) that passes either cap."""
+    meas = P.measured_from_ledger(events)
+    rows = P.projection(cfg, tokens_for(cfg), meas)
+    spent = L.spend(events, now, cfg.price)
+    remaining = P.remaining_after(rows, "sft")
+    rem_dollars = P.total_dollars(remaining, cfg.price)
+    reasons = []
+    for label, val in (("ROCm/stack checklist", meas.checks_ok), ("kill-and-resume", meas.resume_ok),
+                       ("LoRA serving + tool calls", meas.tool_calls_ok)):
+        if val is not True:
+            reasons.append(f"{label}: {'FAILED' if val is False else 'not measured'}")
+    if not meas.tokens_per_s:
+        reasons.append("training throughput not measured")
+    if not meas.sec_per_trial:
+        reasons.append("evaluation seconds-per-trial not measured")
+    if spent.session + rem_dollars > cfg.budget:
+        reasons.append(f"projected session ${spent.session + rem_dollars:.2f} "
+                       f"(${spent.session:.2f} spent + ${rem_dollars:.2f} to come) exceeds the "
+                       f"${cfg.budget:.2f} budget")
+    if spent.total + rem_dollars > cfg.total_cap:
+        reasons.append(f"projected total ${spent.total + rem_dollars:.2f} exceeds the "
+                       f"${cfg.total_cap:.2f} cap")
+    return (not reasons), reasons, {"spent": spent.session, "remaining": rem_dollars}
+
+
+def cmd_project(cfg: P.Config, events: list[dict]) -> bool:
+    ok, reasons, info = go_no_go(cfg, events, time.time())
+    rows = P.projection(cfg, tokens_for(cfg), P.measured_from_ledger(events))
+    print_table(cfg, rows)
+    print(f"\n  spent so far ${info['spent']:.2f}; still to run ${info['remaining']:.2f}")
+    if ok:
+        print("\n### GO/NO-GO: GO")
+    else:
+        print("\n### GO/NO-GO: NO-GO (stop; nothing further will run)")
+        for r in reasons:
+            print(f"  - {r}")
+        print("  options: --limit/--samples/--rungs smaller, drop an arm (--arms A,B), "
+              "--max-length smaller, or raise --budget on purpose; then `project` again.")
+    L.append(Path(cfg.ledger), L.MEASURED, go=ok, reasons=reasons)
+    if ok:
+        left = P.total_dollars(P.remaining_after(rows, "sft"), cfg.price) / cfg.price * 3600.0
+        minutes = int(left * 1.25 / 60.0 + 15)
+        print(f"  re-arm the dead-man switch from measurements (stop the old one first):\n"
+              f"  $ python ops/amd/deadman.py --deadline-minutes {minutes} --budget {cfg.budget:g} "
+              f"--total-cap {cfg.total_cap:g} --tag {cfg.tag}")
+    return ok
+
+
+# ── phases ────────────────────────────────────────────────────────────────────────
+
+def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
+              new_session: bool = False) -> None:
+    ledger = Path(cfg.ledger)
+    Path(cfg.local_logs).mkdir(parents=True, exist_ok=True)
+    for step in steps:
+        if only and step.phase != only:
+            continue
+        events = L.read(ledger)
+        with_host(cfg, events)
+        show_step(step)
+        gate(cfg, step)
+        L.append(ledger, L.STEP_START, step=step.name, projected_seconds=step.seconds)
+        t0 = time.time()
+        code = 0
+        out = ""
+        if step.name == "create":
+            code = do_create(cfg, api, new_session)
+        elif step.name == "destroy":
+            code = 0 if cloud.destroy(api, cfg.tag, ledger) else 1
+        elif step.name == "go-no-go":
+            code = 0 if cmd_project(cfg, L.read(ledger)) else 3
+        elif step.name == "verify-sync":
+            code = 0 if verify_sync(cfg) else 1
+        elif step.name in ("tunnel", "probe-tunnel"):
+            code = ensure_tunnel(cfg)
+        elif step.name == "tunnel-down":
+            code = subprocess.call(list(step.cmds[0].argv)) and 0
+        elif len(step.cmds) > 1:
+            code = run_parallel(step.cmds, cfg.host)
+        else:
+            code, out = run_cmd(step.cmds[0], cfg.host,
+                                capture=step.name in ("probe-eval", "probe-serve", "smoke-checks"))
+        wall = time.time() - t0
+        L.append(ledger, L.STEP_END, step=step.name, code=code, seconds=round(wall, 1),
+                 projected_seconds=step.seconds)
+        if step.name == "smoke-pull" and code == 0:
+            data = json.loads(Path(cfg.local_logs, "measurements.json").read_text())
+            L.append(ledger, L.MEASURED, **parse_measurements(data))
+        if step.name == "probe-serve":
+            L.append(ledger, L.MEASURED, **parse_probe_serve(out))
+        if step.name == "probe-eval" and code == 0:
+            spt = seconds_per_trial(out, wall)
+            if spt:
+                L.append(ledger, L.MEASURED, sec_per_trial=round(spt, 2), probe_wall_s=round(wall, 1))
+        if code != 0:
+            raise SystemExit(f"step '{step.name}' exited {code}. Nothing was cleaned up: "
+                             "`driver.py status` shows what is billing; `destroy --yes` stops it.")
+
+
+def do_create(cfg: P.Config, api, new_session: bool = False) -> int:
+    checks = cloud.preflight(api, cfg)
+    for name, ok, detail in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+    if not all(ok for _, ok, _ in checks):
+        raise SystemExit("preflight failed; nothing was created")
+    info = cloud.create(api, cfg, Path(cfg.ledger), new_session=new_session)
+    cfg.host = info["ip"]
+    print(f"  created droplet {info['droplet_id']} at {info['ip']} (billing started)")
+    return 0
+
+
+def ensure_tunnel(cfg: P.Config) -> int:
+    if subprocess.call(list(P.tunnel_check(cfg).argv), stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL) == 0:
+        print("  tunnel already up")
         return 0
-    print(f"  $ {printable}", flush=True)
-    if argv and argv[0] == "ssh":
-        # The secret is in the remote .env, never in argv, so nothing has to be scrubbed here.
-        return subprocess.call(argv)
-    return subprocess.call(argv)
+    return subprocess.call(list(P.tunnel_up(cfg).argv))
 
 
-def main() -> None:
+def sha_check(root: Path, sums_name: str = "SHA256SUMS.artifacts") -> list[str]:
+    """Names in the droplet's artifact checksum list that are missing or differ locally."""
+    from ops.amd.stage import sha256_file
+    sums = root / sums_name
+    if not sums.exists():
+        return [f"{sums_name} (missing)"]
+    bad = []
+    for line in sums.read_text().splitlines():
+        digest, _, name = line.partition("  ")
+        path = root / name
+        if not name or not path.exists() or sha256_file(path) != digest:
+            bad.append(name or line)
+    return bad
+
+
+def hub_repos(cfg: P.Config, namespace: str) -> dict[str, str]:
+    base = {"A": "smol-ladder-sft-a", "B": "smol-ladder-sft-b", "AB": "smol-ladder-sft-ab"}
+    return {a: f"{namespace}/{base[a]}" for a in P.ARMS if a in cfg.arms}
+
+
+def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
+                namespace: str | None = None) -> bool:
+    """After the sync, before the destroy: is everything that matters somewhere that is not the droplet?
+
+    1. every adapter is readable on the Hub (`hub_files(repo)` lists a repo's files; injected so a
+       test needs no network),
+    2. the droplet's own checksum list matches the copies pulled to logs/amd/,
+    3. every run tag has result files in the laptop's results tree (the laptop wrote them directly).
+    """
+    ok = True
+    ns = namespace
+    if hub_files is None:
+        from huggingface_hub import HfApi
+        from ops.amd.stage import resolve_namespace
+        ns = ns or resolve_namespace()
+        hub_files = HfApi().list_repo_files
+    for arm, repo in hub_repos(cfg, ns or "<namespace>").items():
+        try:
+            files = set(hub_files(repo))
+        except Exception as exc:  # noqa: BLE001 - any failure to read means "not verified"
+            files, _ = set(), print(f"  hub {repo}: {exc}")
+        good = {"adapter_config.json", "adapter_model.safetensors"} <= files
+        print(f"  {'PASS' if good else 'FAIL'}  adapter {arm} readable on the Hub ({repo})")
+        ok &= good
+    bad = sha_check(Path(cfg.local_logs))
+    print(f"  {'PASS' if not bad else 'FAIL'}  droplet checksums match local copies"
+          + (f": {bad}" if bad else ""))
+    ok &= not bad
+    root = runs_root or (REPO_ROOT / "data" / "runs")
+    for tag, expected in P.expected_trials(cfg).items():
+        n = len(list((root / tag / cfg.split).glob("*/*/result.json"))) if (root / tag).exists() else 0
+        n += len(list((root / tag / cfg.split).glob("*/*/s*/result.json"))) if (root / tag).exists() else 0
+        good = n > 0
+        print(f"  {'PASS' if good else 'FAIL'}  run tag {tag}: {n} result files (at most {expected})")
+        ok &= good
+    return ok
+
+
+def cmd_status(cfg: P.Config, events: list[dict], api) -> None:
+    now = time.time()
+    if api is not None:
+        try:
+            droplets = cloud.tagged(api, cfg.tag)
+            if cloud.reconcile(droplets, Path(cfg.ledger), now):
+                print("  ledger said billing but no tagged droplet exists: closed it as reclaimed")
+                events = L.read(Path(cfg.ledger))
+            print(f"  API: {len(droplets)} droplet(s) tagged {cfg.tag}: "
+                  f"{[(d.get('name'), d.get('status')) for d in droplets]}")
+        except SystemExit as exc:
+            print(f"  API check failed: {exc}")
+    s = L.summarise(events, now, cfg.price)
+    print("## status")
+    print(f"  state      {s['state']}")
+    print(f"  uptime     {s['uptime_seconds'] / 60.0:.1f} min   ip {s.get('ip') or '-'}")
+    print(f"  accrued    session ${s['session_dollars']:.2f} of ${cfg.budget:.2f}; "
+          f"total ${s['total_dollars']:.2f} of ${cfg.total_cap:.2f}  (${s['price_per_hour']}/h)")
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["ssh", "api"], default="ssh")
-    ap.add_argument("--host", help="droplet public IP; required in ssh mode")
-    ap.add_argument("--user", default="root", help="AMD's own docs use root@<ip>")
-    ap.add_argument("--identity", help="path to the laptop's ssh private key")
-    ap.add_argument("--droplet", help="droplet name or id, for api mode")
-    ap.add_argument("--region", default="atl1", help="ADC GPU droplets are documented as ATL1 only")
-    ap.add_argument("--size", default="gpu-mi300x1-192gb",
-                    help="1x MI300X slug; 8x is gpu-mi300x8-1536gb")
-    ap.add_argument("--image", default="", help="doctl image slug, if creating by API")
-    ap.add_argument("--ssh-key-fingerprint", help="ssh key id or fingerprint, for api mode")
-    ap.add_argument("--name", default="smol-ladder", help="droplet name, if creating by API")
-    ap.add_argument("--commit", default="", help="git commit to check out; defaults to HEAD")
-    ap.add_argument("--arms", default=",".join(ARMS), help="which arms to run")
-    ap.add_argument("--limit", type=int, help="tasks per ladder sweep; unset means all of them")
-    ap.add_argument("--split", default="test")
-    ap.add_argument("--tag-prefix", default="amd1")
-    ap.add_argument("--remote-root", default="/opt/smol-ladder")
-    ap.add_argument("--price", type=float, default=float(
-        os.environ.get("AMD_PRICE_PER_GPU_HOUR", DEFAULT_PRICE_PER_GPU_HOUR)))
-    ap.add_argument("--budget", type=float, default=float(os.environ.get("AMD_BUDGET_USD", 80)))
-    ap.add_argument("--max-minutes", type=int, default=int(
-        os.environ.get("AMD_WALLCLOCK_LIMIT_MIN", 0)) or None)
-    ap.add_argument("--idle-minutes", type=int, default=int(os.environ.get("AMD_IDLE_LIMIT_MIN", 45)))
-    ap.add_argument("--max-length", type=int, default=8192)
-    ap.add_argument("--resume", action="store_true", default=True)
-    ap.add_argument("--no-resume", dest="resume", action="store_false")
-    ap.add_argument("--no-eval-base", dest="eval_base", action="store_false", default=True)
-    ap.add_argument("--smoke-hours", type=float, default=0.5)
-    ap.add_argument("--smoke-limit", type=int, default=5)
-    ap.add_argument("--hub-namespace", default=os.environ.get("AMD_HUB_NAMESPACE", ""))
-    # The one-shot lifecycle verbs, which are the only steps that are not a plan.
-    ap.add_argument("--create", action="store_true", help="api mode: create the droplet")
-    ap.add_argument("--destroy", action="store_true", help="api mode: DESTROY the droplet (stops billing)")
-    ap.add_argument("--power-off", action="store_true", help="api mode: power off (does NOT stop billing)")
-    ap.add_argument("--status", action="store_true", help="api mode: print the droplet")
-    ap.add_argument("--dry-run", action="store_true", help="print every command; run nothing")
-    ap.add_argument("--json", action="store_true", help="emit the plan as JSON")
-    args = ap.parse_args()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    names = ["dry-run", "plan", "preflight", "create", "bootstrap", "smoke", "project", "train",
+             "serve", "tunnel", "eval", "sync", "destroy", "go", "status", "verify-sync",
+             "note-prior-spend"]
+    for n in names:
+        p = sub.add_parser(n)
+        add_common(p)
+        p.add_argument("--yes", action="store_true", help="really do the mutating call")
+        p.add_argument("--json", action="store_true")
+        if n == "create":
+            p.add_argument("--new-session", action="store_true",
+                           help="reset the session budget (default: only the first create does)")
+        if n == "tunnel":
+            p.add_argument("action", nargs="?", default="up", choices=["up", "down"])
+        if n == "note-prior-spend":
+            p.add_argument("dollars", type=float)
+    args = ap.parse_args(argv)
+    os.chdir(REPO_ROOT)
+    if not os.environ.get("AMD_OFFLINE"):   # the tests set it: no .env, so no token, so no network
+        load_dotenv(REPO_ROOT / ".env")
+    cfg = build_config(args)
+    events = L.read(Path(cfg.ledger))
+    with_host(cfg, events)
 
-    load_dotenv(REPO_ROOT / ".env")
-    token = os.environ.get("AMD_CLOUD_API_TOKEN", "")
+    def client() -> DoApi:
+        return DoApi(token_from_env())
 
-    # -- API mode: the lifecycle verbs, one at a time.
-    if args.mode == "api":
-        if not args.dry_run and not token:
-            raise SystemExit(
-                "AMD_CLOUD_API_TOKEN is not set. Put it in the repo's git-ignored .env as\n"
-                "  AMD_CLOUD_API_TOKEN=<digitalocean personal access token>\n"
-                "with `read:write` scope, or use --mode ssh which needs no token at all.")
-        if not args.dry_run and not shutil_which("doctl"):
-            raise SystemExit("doctl is not installed; see "
-                             "https://docs.digitalocean.com/reference/doctl/how-to/install/")
-        verb = None
-        if args.create:
-            verb = "create"
-        elif args.destroy:
-            verb = "destroy"
-        elif args.power_off:
-            verb = "power-off"
-        elif args.status:
-            verb = "get"
-        if verb:
-            argv = api_argv(verb, args.droplet or args.name, "AMD_CLOUD_API_TOKEN", args.region,
-                            args.size, args.image, args.ssh_key_fingerprint, args.name)
-            if verb in ("create", "destroy", "power-off", "power-on"):
-                print(f"## api: {verb} {args.droplet or args.name}")
-                if verb == "power-off":
-                    print("NOTE: a powered-off GPU droplet keeps billing. Destroy it to stop.")
-                if verb == "destroy":
-                    print("NOTE: destroying is irreversible; sync_back.sh --push-hub first.")
-                sys.exit(run(argv, args.dry_run))
-            sys.exit(run(argv, args.dry_run))
-        if not args.dry_run:
-            print(run(["doctl", "compute", "droplet", "list",
-                       "--format", "ID,Name,PublicIPv4,Status,Size,Created"], False))
-            sys.exit(0)
-        run(["doctl", "compute", "droplet", "list",
-             "--format", "ID,Name,PublicIPv4,Status,Size,Created"], True)
-        return
+    c = args.cmd
+    if c == "dry-run":
+        dry_run(cfg, events)
+        return 0
+    if c == "plan":
+        _, rows = make_plan(cfg, events)
+        table = print_table(cfg, rows)
+        if args.json:
+            print(json.dumps(table, indent=2))
+        return 0
+    if c == "status":
+        try:
+            api = client() if token_from_env() else None
+        except SystemExit:
+            api = None
+        cmd_status(cfg, events, api)
+        return 0
+    if c == "note-prior-spend":
+        L.append(Path(cfg.ledger), L.PRIOR, dollars=args.dollars)
+        print(f"recorded ${args.dollars:.2f} of earlier spend toward the total cap")
+        return 0
+    if c == "preflight":
+        res = cloud.preflight(client(), cfg)
+        for name, ok, detail in res:
+            print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+        return 0 if all(ok for _, ok, _ in res) else 1
+    if c == "project":
+        return 0 if cmd_project(cfg, events) else 3
+    if c == "verify-sync":
+        return 0 if verify_sync(cfg) else 1
 
-    # -- SSH mode: the plan.
-    if not args.host and not args.dry_run:
-        raise SystemExit("--host is required in ssh mode (the droplet's public IP).")
-    host = args.host or "0.0.0.0"
-    price = args.price
-    max_minutes = args.max_minutes or int(args.budget / price * 60)
-    commit = args.commit or os.environ.get("AMD_COMMIT") or default_commit()
-    cfg = Config(
-        host=host, user=args.user, identity=args.identity, commit=commit,
-        arms=[a.strip() for a in args.arms.split(",") if a.strip()],
-        price=price, budget=args.budget, max_minutes=max_minutes,
-        idle_minutes=args.idle_minutes, max_length=args.max_length, limit=args.limit,
-        split=args.split, tag_prefix=args.tag_prefix, remote_root=args.remote_root,
-        eval_hours=EVAL_HOURS_ESTIMATE, smoke_hours=args.smoke_hours,
-        smoke_limit=args.smoke_limit, resume=args.resume, eval_base=args.eval_base,
-        hub_namespace=args.hub_namespace)
-    bad = [a for a in cfg.arms if a not in ARMS]
-    if bad:
-        raise SystemExit(f"unknown arm(s) {bad}; want from {list(ARMS)}")
+    steps, _ = make_plan(cfg, events)
+    phases = {"create": ["create"], "bootstrap": ["bootstrap"], "smoke": ["smoke"],
+              "train": ["train"], "serve": ["serve"], "eval": ["eval"], "sync": ["sync"],
+              "destroy": ["destroy"], "tunnel": ["tunnel"]}
 
-    report = budget_report(price, args.budget, cfg.arms, cfg.sft_hours, EVAL_HOURS_ESTIMATE,
-                           eval_base=cfg.eval_base, setup_hours=SETUP_HOURS + 2 * SMOKE_STEP_HOURS)
-    p = plan(cfg)  # the smoke steps are already steps in the plan, so the totals already include them
+    if c == "create":
+        if not args.yes:
+            show_step(next(s for s in steps if s.name == "create"))
+            print("\n(not sent: add --yes to create the droplet and start billing)")
+            return 0
+        run_steps(cfg, steps, client(), only="create", new_session=args.new_session)
+        return 0
+    if c == "destroy":
+        if not args.yes:
+            show_step(next(s for s in steps if s.name == "destroy"))
+            print("\n(not sent: add --yes)")
+            return 0
+        api = client()
+        ok = cloud.destroy(api, cfg.tag, Path(cfg.ledger))
+        print(f"  billing stopped (verified by GET): {ok}")
+        return 0 if ok else 1
+    if c == "tunnel":
+        if args.action == "down":
+            return subprocess.call(list(P.tunnel_down(cfg).argv))
+        return ensure_tunnel(cfg)
 
-    if args.json:
-        print(json.dumps({"budget": report, "plan": p.as_json()}, indent=2))
-        return
-
-    print(f"## budget (ESTIMATES at ${price}/GPU-h, cap ${args.budget:.2f})")
-    for row in report["rows"]:
-        print(f"  {row['stage']:<12} {row['hours']:>6.2f} h  ${row['dollars']:>7.2f}")
-    print(f"  {'TOTAL':<12} {report['total_hours']:>6.2f} h  ${report['total_dollars']:>7.2f}"
-          f"   (cap ${args.budget:.2f}, headroom ${report['headroom_dollars']:.2f})")
-    print()
-    for w in p.warnings:
-        print(f"WARNING: {w}")
-    if p.warnings:
-        print()
-    print(f"## plan: {len(p.steps)} steps, {p.hours:.2f} h, ${p.dollars:.2f} estimated")
-    for step in p.steps:
-        print(f"- {step.name:<16} {step.hours:>5.2f} h  ${step.dollars:>6.2f}  {step.note}")
-    print()
-
-    if args.dry_run:
-        print("## dry run: the commands, in order, with nothing executed")
-        for step in p.steps:
-            print(f"\n# {step.name}: {step.note}")
-            run(step.argv, True)
-        print(f"\n## end of plan ({len(p.steps)} steps, ${p.dollars:.2f} estimated)")
-        return
-
-    for step in p.steps:
-        print(f"\n## {step.name}")
-        code = run(step.argv, False)
-        if code != 0 and not step.idempotent:
-            print(f"step {step.name} failed ({code}); stopping.")
-            sys.exit(code)
-        if code != 0:
-            print(f"WARNING: step {step.name} failed ({code}); continuing.")
-
-
-def default_commit() -> str:
-    try:
-        return subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-                                       text=True).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "HEAD"
-
-
-def shutil_which(name: str) -> str | None:
-    from shutil import which
-    return which(name)
-
-
-def load_dotenv(path: Path) -> None:
-    """Read .env without a dependency and without clobbering the real environment.
-
-    `set -a; source .env` is the shell way but this is python and the file may hold values with
-    spaces in them; a tiny parser that only accepts KEY=VALUE is safer and has no side effects.
-    """
-    if not path.exists():
-        return
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip().strip("'\"")
-        os.environ.setdefault(key, value)
+    if c in ("train", "go") and last_go(events) is not True:
+        raise SystemExit("no GO on record: run `driver.py smoke` (or `project`) first. The "
+                         "measured projection must fit the budget before anything is trained.")
+    if c == "go":
+        api = client()
+        try:
+            for ph in ("train", "serve", "tunnel", "eval", "sync"):
+                run_steps(cfg, steps, api, only=ph)
+        finally:
+            # The destroy runs whatever happened above: a failed eval must not leave a GPU billing.
+            run_steps(cfg, [s for s in steps if s.name in ("tunnel-down", "destroy")], api)
+        return 0
+    run_steps(cfg, steps, None, only=phases[c][0])
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -6,3 +6,4 @@ __pycache__/
 # untracked in every one of them.
 /data
 /logs
+ops/amd/ledger.jsonl
