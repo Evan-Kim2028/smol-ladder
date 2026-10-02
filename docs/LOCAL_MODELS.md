@@ -114,6 +114,24 @@ For each released model, under its own protocol, with its own prompt text byte-f
   `model.safetensors`. That does not fit in a 6 GB card in any precision this card runs well;
   it must be cast to bf16/fp16 first (4.4 GB) or quantised.
 
+### 1d. Context budget and tool-output truncation (`--agent bash`)
+
+Served models have a finite window (16,384 tokens on the AMD vLLM), and a model that `cat`s a CSV
+used to overflow it, get a 400, burn five retries and crash with no transcript. Now:
+
+- Tool output is cut to its first 8,000 characters plus `\n... [truncated]` (`TOOL_OUTPUT_MAX_CHARS`).
+  Upstream's loop is not published; this is what its SFT rows show (max tool result 8,016 chars, 126
+  of them exactly head-8,000 + that marker; p99 4,687, p95 1,541). Each request's `max_tokens` is
+  1,024 (eval_pass1's cap) clamped to the room left. The window comes from `GET /v1/models`
+  `max_model_len`, or `SMOL_LADDER_MAX_MODEL_LEN`.
+- Context exhausted (no room left, or a context-length 400) ends the episode as a normal exit-0
+  trial with `stop_reason: "context_exhausted"`, graded on whatever `answer.txt` holds: a model
+  failure. Other 4xx (not 429) are never retried; 429/5xx/timeouts/empty choices still are, and a
+  failure after retries is still a harness failure (`exit 1`).
+- `transcript.json` is written from a `finally` for every trial. `result.json` gains `stop_reason`
+  (`answer_submitted`, `model_stopped`, `max_turns`, `context_exhausted`, `single_turn`, `error`),
+  `turns_used`, `last_prompt_tokens`, `truncated_outputs`, `context_length`.
+
 ---
 
 ## 2. What we changed in the code

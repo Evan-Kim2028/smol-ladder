@@ -347,6 +347,8 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         "SMOL_LADDER_CHAT_TEMPLATE_KWARGS": os.environ.get("SMOL_LADDER_CHAT_TEMPLATE_KWARGS",
                                                            ""),
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
+        # Context window override for the bash loop's budget (else read from GET /v1/models).
+        "SMOL_LADDER_MAX_MODEL_LEN": os.environ.get("SMOL_LADDER_MAX_MODEL_LEN", ""),
     }
     # A key held under a non-default name has to travel under its own name too, since that is
     # what SMOL_LADDER_API_KEY_ENV now points at.
@@ -390,12 +392,25 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
             turns = None
         if isinstance(turns, list):
             (work / "transcript.json").write_text(json.dumps(turns))
+    episode = {}
+    try:
+        episode = json.loads((trial_scratch / "episode.json").read_text())
+    except (OSError, ValueError):
+        pass
     shutil.rmtree(trial_scratch, ignore_errors=True)
     result = {"task_id": row["task_id"], "model": model, "agent_status": agent_status,
               "agent": agent, "base_url": env["SMOL_LADDER_BASE_URL"],
               "agent_seconds": round(time.time() - t0, 1),
               "prediction": "", "reward": 0.0}
     result.update(git_provenance())
+    if episode:
+        # A context-exhausted episode is a finished trial the model lost (exit 0, graded on
+        # whatever answer.txt holds); only a trial whose loop raised stays a harness failure.
+        result["stop_reason"] = episode.get("stop_reason")
+        result["turns_used"] = episode.get("turns")
+        result["last_prompt_tokens"] = episode.get("last_prompt_tokens")
+        result["truncated_outputs"] = episode.get("truncated_outputs")
+        result["context_length"] = episode.get("context_length")
     result["prompt_sha256"] = prompt_sha256(prompt)
     result["ladder_sha256"] = ladder_fingerprint()
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -583,36 +598,41 @@ def _agent_script(agent: str, model: str, max_turns: int) -> str:
     # No format placeholders of its own, so it is concatenated after the %-formatting rather than
     # folded into it: `dump % args` with no specifier is a TypeError, and one of the three bodies
     # formats separately from the other two purely because of where its arguments sit.
-    dump = ("open('transcript.json','w').write(json.dumps(log));"
-            "open('turns.json','w').write(json.dumps("
-            "sum(1 for m in log if m.get('role')=='assistant')))")
+    # The transcript is written from a `finally`, so a trial that crashes mid-loop (transport
+    # failure, a bug) still leaves the conversation it had; episode.json carries the loop's
+    # stop_reason and counters for result.json.
+    def wrap(setup: str, run: str) -> str:
+        return (head + "\nE=A.Episode()\n" + setup + "\ntry:\n"
+                + "".join("    " + line + "\n" for line in run.splitlines())
+                + "finally:\n    A.dump_trial(M, E)\n")
     if agent == "tools":
-        body = ("log=A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
-                "lambda c: open('solution.py','w').write(c), %r, %d);" % (model, max_turns))
-        return head + body + dump
+        return wrap("M=[]", "A.solve_loop(sys.argv[1], lambda c: A.run_command(c),"
+                    "lambda c: open('solution.py','w').write(c), %r, %d, messages=M, episode=E)"
+                    % (model, max_turns))
     if agent == "program":
         # Upstream's generation step exactly: one turn, no tools, 1024 new tokens. The extracted
         # program is written to solution.py so the offline grading pass below runs it sealed, the
         # same way it runs our agent's -- the prediction is what the program printed when re-run,
         # never the model's stdout. The one-turn log is still a transcript: it is the whole
-        # conversation under this protocol, and it is what makes the run trainable. It is the
-        # caller's own M extended by that one exchange, so it opens with the system and user turns
-        # this protocol was run with -- the same reason solve_loop returns the whole
-        # conversation rather than the replies alone.
-        body = ("M=[{'role':'system','content':U.PROGRAM_SYSTEM},"
-                "{'role':'user','content':sys.argv[1]}];"
-                "out=A.program_once(M, %r);"
-                "M.append({'role':'assistant','content':out['message'].get('content') or ''});"
-                "log=M;"
-                "open('solution.py','w').write(out['code']);" % model)
-        return head + body + dump
+        # conversation under this protocol, and it is what makes the run trainable.
+        return wrap(
+            "M=[{'role':'system','content':U.PROGRAM_SYSTEM},"
+            "{'role':'user','content':sys.argv[1]}]",
+            "E.stop_reason='error'\n"
+            "out=A.program_once(M, %r)\n"
+            "M.append({'role':'assistant','content':out['message'].get('content') or ''})\n"
+            "E.turns=1; E.stop_reason='single_turn'\n"
+            "open('solution.py','w').write(out['code'])" % model)
     if agent == "bash":
-        body = ("M=[{'role':'system','content':U.BASH_SYSTEM},"
-                "{'role':'user','content':sys.argv[1]}];"
-                "log=A.bash_loop(M, lambda c: A.run_command(c),"
-                "lambda: (open('answer.txt').read() if os.path.exists('answer.txt') else None),"
-                "%r, %d);" % (model, max_turns))
-        return head + body + dump
+        # Output is not tail-clipped by run_command here (limit=None): bash_loop applies upstream's
+        # head cut itself, and clipping twice would leave a cut that is neither.
+        return wrap(
+            "M=[{'role':'system','content':U.BASH_SYSTEM},"
+            "{'role':'user','content':sys.argv[1]}]",
+            "E.context_length=A.context_length(A.endpoint(), %r)\n"
+            "A.bash_loop(M, lambda c: A.run_command(c, limit=None),"
+            "lambda: (open('answer.txt').read() if os.path.exists('answer.txt') else None),"
+            "%r, %d, episode=E)" % (model, model, max_turns))
     raise ValueError(f"unknown agent protocol {agent!r}")
 
 

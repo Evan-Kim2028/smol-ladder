@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import tempfile
 import time
@@ -138,6 +139,35 @@ def api_key() -> str:
     return key
 
 
+class ClientError(RuntimeError):
+    """A 4xx other than 429: the request itself is wrong, so it is never retried."""
+
+    def __init__(self, message: str, status: int = 400, body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+class ContextOverflow(ClientError):
+    """The server refused the request because prompt + max_tokens exceeds the context length."""
+
+
+def is_context_error(body: str) -> bool:
+    low = body.lower()
+    return "context length" in low or "context_length" in low or "maximum context" in low
+
+
+def overflow_numbers(body: str) -> tuple[int | None, int | None]:
+    """(input tokens, context length) as far as the error text says.
+
+    vLLM: "You passed 16385 input tokens and requested 0 output tokens. However, the model's
+    context length is only 16384 tokens" / "...your prompt contains at least 15500 input tokens".
+    """
+    m = re.search(r"(\d+)\s+input tokens", body)
+    c = re.search(r"context length is (?:only )?(\d+)", body, re.I)
+    return (int(m.group(1)) if m else None, int(c.group(1)) if c else None)
+
+
 def call_model(messages: list[dict], model: str, tools: list[dict] | None,
                ep: Endpoint | None = None, max_tokens: int | None = None) -> dict:
     """One chat completion, with retries.
@@ -175,14 +205,21 @@ def call_model(messages: list[dict], model: str, tools: list[dict] | None,
                 return payload
             last = json.dumps(payload)[:200]
         except urllib.error.HTTPError as e:
-            last = f"HTTP {e.code}: {e.read().decode()[:200]}"
+            body_text = e.read().decode("utf-8", "replace")
+            last = f"HTTP {e.code}: {body_text[:300]}"
+            if 400 <= e.code < 500 and e.code != 429:
+                # The same request gets the same answer: retrying it five times only delays the
+                # failure by a minute and hides what it was.
+                cls = ContextOverflow if is_context_error(body_text) else ClientError
+                raise cls(f"{ep.base_url} rejected the request: {last}", e.code, body_text) from None
         except Exception as e:  # noqa: BLE001 - any transport error is worth one more try
             last = f"{type(e).__name__}: {e}"
         time.sleep(min(60, 5 * 2**attempt))
     raise RuntimeError(f"{ep.base_url} gave no completion after 5 attempts: {last}")
 
 
-def run_command(command: str, timeout: int = 150, cwd: str | None = None) -> str:
+def run_command(command: str, timeout: int = 150, cwd: str | None = None,
+                limit: int | None = 20_000) -> str:
     """Run a shell command for the agent, never raising.
 
     Two things an agent does routinely used to hang the whole trial:
@@ -224,7 +261,7 @@ def run_command(command: str, timeout: int = 150, cwd: str | None = None) -> str
         return f"[timed out after {timeout}s]"
     text = out.decode("utf-8", "replace") + \
         ("\n--- stderr ---\n" + err.decode("utf-8", "replace") if err else "")
-    return text[-20_000:]
+    return text if limit is None else text[-limit:]
 
 
 def _as_file(text: str) -> Path:
@@ -234,8 +271,132 @@ def _as_file(text: str) -> Path:
     return path
 
 
+# ── context budget ────────────────────────────────────────────────────────────
+# Tool output is capped the way upstream's own SFT rows are. Measured on
+# data/train/sft_upstream (4,439 train rows, 16,273 tool results): no tool result is longer than
+# 8,016 characters, 126 are exactly 8,016, and every one of those is the first 8,000 characters
+# of the output plus the 16 characters "\n... [truncated]". That is a head-only cut at 8,000, so
+# it is the cut the models were trained on and the one evaluation reproduces. (Upstream's repo
+# publishes no agent loop, so the rows are the only record of it.) p99 of tool results is 4,687
+# characters and p95 1,541, so the cut touches about 1 result in 130.
+TOOL_OUTPUT_MAX_CHARS = 8000
+TRUNCATION_MARKER = "\n... [truncated]"
+
+# Upstream's one published generation cap is eval_pass1's 1024 new tokens. A bash turn is a tool
+# call or a closing sentence: p99 of assistant turns in the SFT rows is ~2,200 characters.
+BASH_MAX_TOKENS = 1024
+# Below this many tokens of room a tool call cannot even be completed, so the episode ends.
+MIN_COMPLETION_TOKENS = 64
+CONTEXT_MARGIN = 8
+CONTEXT_ENV = "SMOL_LADDER_MAX_MODEL_LEN"
+
+
+def truncate_output(text: str, limit: int = TOOL_OUTPUT_MAX_CHARS) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    return text[:limit] + TRUNCATION_MARKER, True
+
+
+def context_length(ep: Endpoint, model: str, env: dict | None = None) -> int | None:
+    """The served context window: the env override, else vLLM's `max_model_len` from GET /models.
+
+    None when neither is known (OpenRouter's /models carries no such field per served model), in
+    which case the loop relies on the server's own 400 to learn the limit.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(CONTEXT_ENV)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    try:
+        req = urllib.request.Request(f"{ep.base_url}/models", headers=ep.headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp).get("data") or []
+        entry = next((d for d in data if d.get("id") == model), data[0] if data else {})
+        n = entry.get("max_model_len")
+        return int(n) if n else None
+    except Exception:  # noqa: BLE001 - an unknown window is not a reason to fail the trial
+        return None
+
+
+class Episode:
+    """What happened in one loop, for result.json. Mutated by the loops as they run."""
+
+    def __init__(self, ctx: int | None = None):
+        self.stop_reason: str | None = None
+        self.turns = 0
+        self.last_prompt_tokens: int | None = None
+        self.truncated_outputs = 0
+        self.context_length = ctx
+        self._sent = 0
+
+    def estimate_prompt_tokens(self, messages: list[dict], tools: list[dict] | None) -> int:
+        """Prompt size for the next request. Exact usage of the previous request plus a
+        conservative estimate of what was appended since; with no usage, an optimistic
+        chars/4 (a too-big request is caught by the server's 400 and retried exactly)."""
+        if self.last_prompt_tokens is not None:
+            return self.last_prompt_tokens + len(json.dumps(messages[self._sent:])) // 3
+        return (len(json.dumps(messages)) + len(json.dumps(tools or []))) // 4
+
+    def as_dict(self) -> dict:
+        return {"stop_reason": self.stop_reason, "turns": self.turns,
+                "last_prompt_tokens": self.last_prompt_tokens,
+                "truncated_outputs": self.truncated_outputs,
+                "context_length": self.context_length}
+
+
+def complete_within_context(messages: list[dict], model: str, tools: list[dict] | None,
+                            ep: Endpoint, episode: Episode, cap: int | None) -> dict | None:
+    """One completion whose max_tokens fits the remaining context; None when none can.
+
+    None is "context exhausted", a property of the model's conversation, not a transport error.
+    """
+    max_tokens = cap
+    if episode.context_length:
+        room = (episode.context_length - episode.estimate_prompt_tokens(messages, tools)
+                - CONTEXT_MARGIN)
+        if room < MIN_COMPLETION_TOKENS:
+            return None
+        max_tokens = min(cap, room) if cap else room
+    try:
+        try:
+            completion = call_model(messages, model, tools, ep, max_tokens=max_tokens)
+        except ContextOverflow as e:
+            used, window = overflow_numbers(e.body)
+            window = window or episode.context_length
+            if used is None or window is None:
+                return None
+            episode.context_length = window
+            room = window - used - CONTEXT_MARGIN
+            if room < MIN_COMPLETION_TOKENS:
+                return None
+            completion = call_model(messages, model, tools, ep,
+                                    max_tokens=min(cap, room) if cap else room)
+    except ContextOverflow:
+        return None
+    usage = completion.get("usage") or {}
+    if usage.get("prompt_tokens") is not None:
+        episode.last_prompt_tokens = usage["prompt_tokens"]
+        episode._sent = len(messages)
+    return completion
+
+
+def dump_trial(messages: list[dict], episode: Episode | None = None) -> None:
+    """Write transcript.json (and turns.json, episode.json) into the cwd. Called from a finally
+    in the jailed script, so a crashed or exhausted trial still leaves its conversation."""
+    Path("transcript.json").write_text(json.dumps(messages))
+    Path("turns.json").write_text(json.dumps(
+        sum(1 for m in messages if m.get("role") == "assistant")))
+    if episode is not None:
+        Path("episode.json").write_text(json.dumps(episode.as_dict()))
+
+
 def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
-               max_turns: int = 40, ep: Endpoint | None = None) -> list[dict]:
+               max_turns: int = 40, ep: Endpoint | None = None,
+               messages: list[dict] | None = None,
+               episode: Episode | None = None) -> list[dict]:
     """The model loop, independent of Harbor.
 
     run_shell(command) -> str executes in the task container; write_solution(code) stages
@@ -256,12 +417,23 @@ def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
     whose content is the record of what actually happened.
     """
     ep = ep or endpoint()
-    messages: list[dict] = [
+    episode = episode or Episode()
+    if messages is None:
+        messages = []
+    # The caller may hand in the list so it can save it from a `finally` if the loop raises.
+    messages.extend([
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": instruction},
-    ]
+    ])
+    episode.stop_reason = "error"  # replaced on every clean exit; stays if a call raises
     for _ in range(max_turns):
-        completion = call_model(messages, model, TOOLS, ep)
+        # No max_tokens and no budget here (prompts and caps unchanged); a context overflow
+        # still ends the episode cleanly instead of crashing.
+        completion = complete_within_context(messages, model, TOOLS, ep, episode, None)
+        if completion is None:
+            episode.stop_reason = "context_exhausted"
+            break
+        episode.turns += 1
         message = completion["choices"][0]["message"]
         calls = message.get("tool_calls") or []
         messages.append({
@@ -270,6 +442,7 @@ def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
             **({"tool_calls": calls} if calls else {}),
         })
         if not calls:
+            episode.stop_reason = "model_stopped"
             break
         results = []
         for call in calls:
@@ -285,6 +458,8 @@ def solve_loop(instruction: str, run_shell, write_solution, model: str = MODEL,
                 output = run_shell(args.get("command", ""))
             results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
         messages.extend(results)
+    else:
+        episode.stop_reason = "max_turns"
     return messages
 
 
@@ -317,7 +492,8 @@ def program_once(messages: list[dict], model: str, ep: Endpoint | None = None,
 
 
 def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
-              max_turns: int = 16, ep: Endpoint | None = None) -> list[dict]:
+              max_turns: int = 16, ep: Endpoint | None = None,
+              episode: Episode | None = None) -> list[dict]:
     """The SFT protocol: one `bash` tool, and the loop ends when the answer is submitted.
 
     Stopping on submission is upstream's "then stop" made executable. Without it a 2B model that
@@ -327,6 +503,11 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
 
     Upstream's trajectories run 3-12 turns; 16 is a ceiling that no published row reaches.
 
+    Tool output is cut to TOOL_OUTPUT_MAX_CHARS the way upstream's rows are, each request's
+    max_tokens is 1024 clamped to the room left in the context, and an exhausted context ends the
+    episode (stop_reason "context_exhausted", graded on whatever answer.txt holds) rather than
+    crashing it. `episode` is filled in with stop_reason, turns and token/truncation counts.
+
     Returns the caller's `messages`, extended in place, so the transcript includes the system and
     user turns the caller built -- this is the protocol the SFT arm trains in, so its trajectory
     is the one whose completeness matters most. `messages` is mutated rather than copied because
@@ -334,8 +515,15 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
     the submission is attached to the turn that made it.
     """
     ep = ep or endpoint()
+    episode = episode or Episode(context_length(ep, model))
+    episode.stop_reason = "error"  # replaced on every clean exit; stays if a call raises
     for _ in range(max_turns):
-        completion = call_model(messages, model, BASH_TOOL, ep)
+        completion = complete_within_context(messages, model, BASH_TOOL, ep, episode,
+                                             BASH_MAX_TOKENS)
+        if completion is None:
+            episode.stop_reason = "context_exhausted"
+            break
+        episode.turns += 1
         message = completion["choices"][0]["message"]
         calls = message.get("tool_calls") or []
         turn = len(messages)
@@ -345,6 +533,7 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
             **({"tool_calls": calls} if calls else {}),
         })
         if not calls:
+            episode.stop_reason = "model_stopped"
             break
         results = []
         for call in calls:
@@ -354,15 +543,17 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
             except json.JSONDecodeError:
                 args = {}
             command = localise_paths(args.get("command", ""))
-            output = run_shell(command)
+            output, cut = truncate_output(run_shell(command))
+            episode.truncated_outputs += cut
             results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
         messages.extend(results)
         submitted = read_answer()
         if submitted is not None:
-            # On the assistant turn, so an exporter finds the submission without re-running the
-            # trial -- and with the call's own arguments, which is where the value actually is.
             messages[turn]["submitted"] = submitted
+            episode.stop_reason = "answer_submitted"
             break
+    else:
+        episode.stop_reason = "max_turns"
     return messages
 
 

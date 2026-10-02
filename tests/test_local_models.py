@@ -28,7 +28,8 @@ from smol_ladder.upstream import (BASH_TOOL, PROGRAM_SYSTEM, extract_code, local
 class Stub:
     """An OpenAI-compatible chat/completions endpoint that replies from a script."""
 
-    def __init__(self, replies, error_aware=False):
+    def __init__(self, replies, error_aware=False, models=None):
+        self.models = models  # body of GET /v1/models, or None for a server without one
         self.replies = list(replies)
         self.error_aware = error_aware
         self.requests: list[dict] = []
@@ -40,6 +41,13 @@ class Stub:
 
             def log_message(self, *_args):
                 pass
+
+            def do_GET(self):
+                body = json.dumps(outer.models or {}).encode()
+                self.send_response(200 if outer.models else 404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
@@ -714,3 +722,197 @@ def test_the_retry_budget_is_spent_and_the_error_says_why(monkeypatch):
     message = str(caught.value)
     assert "429" in message, message
     assert stub.base_url in message, message
+
+# ── tool-output truncation and the context budget ─────────────────────────────
+
+OVERFLOW = {"error": {"message": (
+    "You passed 16385 input tokens and requested 0 output tokens. However, the model's context "
+    "length is only 16384 tokens, resulting in a maximum input length of 16384 tokens.")}}
+
+
+def _endpoint_for(monkeypatch, stub, ctx=None):
+    from smol_ladder.or_agent import endpoint
+    monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+    monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr("smol_ladder.or_agent.time.sleep", lambda _s: None)
+    if ctx:
+        monkeypatch.setenv("SMOL_LADDER_MAX_MODEL_LEN", str(ctx))
+    else:
+        monkeypatch.delenv("SMOL_LADDER_MAX_MODEL_LEN", raising=False)
+    return endpoint()
+
+
+def _run_bash_loop(monkeypatch, replies, ctx=None, shell=lambda c: "ok", answer=lambda: None,
+                   max_turns=16, models=None):
+    from smol_ladder.or_agent import Episode, bash_loop, context_length
+    with flaky_stub(replies) as stub:
+        stub.models = models
+        ep = _endpoint_for(monkeypatch, stub, ctx)
+        episode = Episode(context_length(ep, "m"))
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+        bash_loop(messages, shell, answer, "m", max_turns, ep, episode)
+    return messages, episode, stub
+
+
+def test_a_tool_output_is_cut_the_way_upstreams_rows_are():
+    """Upstream's SFT rows: first 8,000 characters + "\\n... [truncated]" (8,016 in all), never
+    longer. Measured on data/train/sft_upstream; see the constants' comment."""
+    from smol_ladder.or_agent import TOOL_OUTPUT_MAX_CHARS, TRUNCATION_MARKER, truncate_output
+    assert (TOOL_OUTPUT_MAX_CHARS, TRUNCATION_MARKER) == (8000, "\n... [truncated]")
+    assert truncate_output("a" * 8000) == ("a" * 8000, False)
+    out, cut = truncate_output("a" * 8001)
+    assert cut and len(out) == 8016 and out.endswith("\n... [truncated]")
+
+
+def test_a_huge_tool_output_is_truncated_before_it_joins_the_conversation(monkeypatch):
+    replies = [assistant(calls=[("bash", {"command": "cat big.csv"})]), assistant("done")]
+    messages, episode, _ = _run_bash_loop(monkeypatch, replies, shell=lambda c: "x" * 50_000)
+    tool = [m for m in messages if m["role"] == "tool"][0]
+    assert len(tool["content"]) == 8016 and tool["content"].endswith("[truncated]")
+    assert episode.truncated_outputs == 1
+    assert episode.stop_reason == "model_stopped"
+
+
+def test_a_non_retryable_4xx_is_raised_at_once_not_retried_five_times(monkeypatch):
+    from smol_ladder.or_agent import ClientError
+    with flaky_stub([(401, {"error": "bad key"})] * 8) as stub:
+        with pytest.raises(ClientError, match="401"):
+            call_with_retries(monkeypatch, stub)
+    assert len(stub.requests) == 1
+
+
+def test_a_5xx_is_still_retried(monkeypatch):
+    with flaky_stub([(500, {"error": "boom"}), (502, {"error": "boom"}), assistant("1")]) as stub:
+        call_with_retries(monkeypatch, stub)
+    assert len(stub.requests) == 3
+
+
+def test_max_tokens_is_upstreams_cap_but_never_more_than_the_room_left(monkeypatch):
+    messages, episode, stub = _run_bash_loop(monkeypatch, [assistant("hi")], ctx=16384)
+    assert stub.requests[0]["max_tokens"] == 1024
+    messages, episode, stub = _run_bash_loop(monkeypatch, [assistant("hi")], ctx=400)
+    assert 0 < stub.requests[0]["max_tokens"] < 400
+
+
+def test_no_room_for_a_completion_ends_the_episode_without_calling_the_server(monkeypatch):
+    messages, episode, stub = _run_bash_loop(monkeypatch, [assistant("hi")], ctx=50)
+    assert stub.requests == []
+    assert episode.stop_reason == "context_exhausted"
+
+
+def test_a_server_side_context_overflow_ends_the_episode_cleanly(monkeypatch):
+    """The reported crash: the conversation passed 16,384 tokens. No retries, no exception."""
+    messages, episode, stub = _run_bash_loop(
+        monkeypatch, [assistant(calls=[("bash", {"command": "cat x"})]), (400, OVERFLOW)])
+    assert len(stub.requests) == 2, "the 400 was retried"
+    assert episode.stop_reason == "context_exhausted"
+    assert episode.turns == 1
+
+
+def test_an_overflow_with_a_little_room_is_retried_once_with_the_exact_max_tokens(monkeypatch):
+    near = {"error": {"message": "You passed 16000 input tokens and requested 1024 output "
+                      "tokens. However, the model's context length is only 16384 tokens"}}
+    messages, episode, stub = _run_bash_loop(monkeypatch, [(400, near), assistant("done")])
+    assert [r["max_tokens"] for r in stub.requests] == [1024, 16384 - 16000 - 8]
+    assert episode.stop_reason == "model_stopped"
+
+
+def test_the_context_length_comes_from_the_server_with_an_env_override(monkeypatch):
+    from smol_ladder.or_agent import context_length
+    models = {"data": [{"id": "m", "max_model_len": 16384}]}
+    with Stub([], models=models) as stub:
+        ep = _endpoint_for(monkeypatch, stub)
+        assert context_length(ep, "m") == 16384
+        monkeypatch.setenv("SMOL_LADDER_MAX_MODEL_LEN", "4096")
+        assert context_length(ep, "m") == 4096
+    with Stub([]) as stub:  # no /models: unknown, not an error
+        monkeypatch.delenv("SMOL_LADDER_MAX_MODEL_LEN")
+        assert context_length(_endpoint_for(monkeypatch, stub), "m") is None
+
+
+def test_the_stop_reasons(monkeypatch):
+    call = lambda: assistant(calls=[("bash", {"command": "ls"})])  # noqa: E731
+    _, ep_, _ = _run_bash_loop(monkeypatch, [call()] * 3, max_turns=2)
+    assert (ep_.stop_reason, ep_.turns) == ("max_turns", 2)
+    _, ep_, _ = _run_bash_loop(monkeypatch, [call()], answer=lambda: "42")
+    assert ep_.stop_reason == "answer_submitted"
+    _, ep_, _ = _run_bash_loop(monkeypatch, [assistant("no tools")])
+    assert ep_.stop_reason == "model_stopped"
+
+
+def test_a_transport_failure_still_raises_and_is_marked_error(monkeypatch):
+    from smol_ladder.or_agent import ClientError, Episode, bash_loop
+    with flaky_stub([(401, {"error": "no"})]) as stub:
+        ep = _endpoint_for(monkeypatch, stub)
+        episode = Episode()
+        with pytest.raises(ClientError):
+            bash_loop([{"role": "user", "content": "q"}], lambda c: "", lambda: None, "m", 4,
+                      ep, episode)
+    assert episode.stop_reason == "error"
+
+
+_ROW = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
+        "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
+
+
+def _once(tmp_path, monkeypatch, replies, agent, prompt=None):
+    import smol_ladder.run_ladder as runner
+    inputs = _inputs_outside_tmp(tmp_path)
+    work = tmp_path / "trial" / "L1"
+    with flaky_stub(replies) as stub:
+        _stub_env(monkeypatch, stub)
+        monkeypatch.delenv("SMOL_LADDER_MAX_MODEL_LEN", raising=False)
+        result = runner.once(_ROW, prompt or runner_bash_prompt(), work, Path(sys.prefix), "m", 8,
+                             inputs_of=lambda r: inputs, rung_label="L1", agent=agent)
+    return result, work
+
+
+def test_a_context_exhausted_bash_trial_is_a_finished_model_failure_with_a_transcript(
+        tmp_path, monkeypatch):
+    replies = [assistant(calls=[("bash", {"command": "ls input"})]), (400, OVERFLOW)]
+    result, work = _once(tmp_path, monkeypatch, replies, "bash")
+    assert result["agent_status"] == "exit 0", result.get("stderr", "")[:400]
+    assert result["stop_reason"] == "context_exhausted"
+    assert result["reward"] == 0.0 and result["prediction"] == ""
+    assert result["turns_used"] == 1 and result["truncated_outputs"] == 0
+    roles = [m["role"] for m in json.loads((work / "transcript.json").read_text())]
+    assert roles == ["system", "user", "assistant", "tool"]
+
+
+def test_a_submitted_answer_records_stop_reason_turns_and_prompt_tokens(tmp_path, monkeypatch):
+    submit = assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})])
+    submit["usage"] = {"prompt_tokens": 777, "completion_tokens": 20}
+    result, _ = _once(tmp_path, monkeypatch, [submit], "bash")
+    assert result["reward"] == 1.0
+    assert (result["stop_reason"], result["turns_used"], result["last_prompt_tokens"]) == (
+        "answer_submitted", 1, 777)
+
+
+def test_a_huge_output_in_a_real_trial_is_truncated_and_counted(tmp_path, monkeypatch):
+    replies = [assistant(calls=[("bash", {"command": "python3 -c \"print('x'*30000)\""})]),
+               assistant("done")]
+    result, work = _once(tmp_path, monkeypatch, replies, "bash")
+    assert result["truncated_outputs"] == 1 and result["stop_reason"] == "model_stopped"
+    tool = [m for m in json.loads((work / "transcript.json").read_text())
+            if m["role"] == "tool"][0]
+    assert len(tool["content"]) == 8016
+
+
+@pytest.mark.parametrize("agent", ["bash", "tools", "program"])
+def test_a_crashed_trial_still_leaves_its_transcript_and_stays_a_harness_failure(
+        tmp_path, monkeypatch, agent):
+    result, work = _once(tmp_path, monkeypatch, [(401, {"error": "no"})] * 3, agent,
+                         prompt="Q?" if agent != "bash" else None)
+    assert result["agent_status"] == "exit 1"
+    roles = [m["role"] for m in json.loads((work / "transcript.json").read_text())]
+    assert roles == ["system", "user"]
+    assert result["stop_reason"] == "error"
+
+
+def test_the_tools_mode_ends_cleanly_when_the_context_is_exhausted(tmp_path, monkeypatch):
+    replies = [assistant(calls=[("run_shell", {"command": "ls input"})]), (400, OVERFLOW)]
+    result, work = _once(tmp_path, monkeypatch, replies, "tools", prompt="Q?")
+    assert result["agent_status"] == "exit 0", result.get("stderr", "")[:400]
+    assert result["stop_reason"] == "context_exhausted"
+    assert (work / "transcript.json").exists()
