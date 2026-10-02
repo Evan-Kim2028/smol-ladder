@@ -94,7 +94,7 @@ _USERNAME = re.compile(rf"\b{re.escape(LOCAL_USER)}\b") if len(LOCAL_USER) >= 4 
 #: synprobe2/...` from a synthetic-probe run was found in 7 of the first 320 verified trials), this
 #: checkout's worktrees, and the Kaggle cache layout the jail binds in.
 _MACHINE = re.compile(
-    r"/(?:home|Users)/[^\s\"':,)\]]+"
+    r"/(?:home|Users)/(?!user\b)[^\s\"':,)\]]+"
     r"|/var/tmp/[^\s\"':,)\]]*"
     r"|/tmp/[^\s\"':,)\]]*smol[^\s\"':,)\]]*"
     r"|\b[a-z0-9_.-]+-wt-[a-z0-9_-]+"          # worktree directories
@@ -112,6 +112,10 @@ _SECRET = re.compile(
 #: A machine's own name. Matched as a whole word and only when it is not a table's column, which
 #: is why it is applied after the path rules.
 _HOSTNAME = re.compile(rf"\b{re.escape(socket.gethostname())}\b")
+#: A home directory that is not the sandbox's own. `/home/user` is where the upstream protocol
+#: puts the tables (`/home/user/input`), so it is the intended path and is neither scrubbed nor
+#: flagged; every other `/home/<name>` and `/Users/<name>` still is.
+_HOME_PATH = re.compile(r"/(?:home|Users)/(?!user\b)")
 
 #: Replacements, applied in order. The path rules collapse to `./input/<file>` for anything whose
 #: last component is a real table name, and to a neutral `./input` for anything else -- an `ls -la`
@@ -151,7 +155,7 @@ def scrub(text: str) -> str:
 def leaks_machine(text: str) -> list[str]:
     """What survived the scrub, by rule. An empty list is the export's precondition for writing."""
     found = []
-    if "/home/" in text or "/Users/" in text:
+    if _HOME_PATH.search(text):
         found.append("home path")
     if "/var/tmp/" in text or "/tmp/smol" in text:
         found.append("scratch or cache path")
@@ -429,6 +433,7 @@ def export_traces(data: Path | None = None, limit: int | None = None) -> tuple[l
     families: Counter = Counter()
     short_answer = 0
     turns: list[int] = []
+    task_ids: list[str] = []          # row i of the output belongs to task_ids[i]
     seen: set[str] = set()
     for task_id, directory, result in verified_trials(root, catalogue):
         if task_id in seen:
@@ -474,9 +479,10 @@ def export_traces(data: Path | None = None, limit: int | None = None) -> tuple[l
             dropped["scrub could not remove: " + ", ".join(leaked)] += 1
             continue
         rows.append(clean)
+        task_ids.append(task_id)
         if limit and len(rows) >= limit:
             break
-    return rows, {"dropped": dict(dropped), "op_family": dict(families.most_common()),
+    return rows, {"dropped": dict(dropped), "task_ids": task_ids, "op_family": dict(families.most_common()),
                   "turns": turns, "verified_trials": len(seen),
                   "gold_answer_below_the_leak_floor": short_answer}
 
@@ -640,6 +646,7 @@ def main() -> None:
     args = ap.parse_args()
 
     rows, report = export_traces(limit=args.limit)
+    report.pop("task_ids", None)       # v2's join key; not part of v1's manifest
     stats = token_stats(rows, args.tokenizer)
     fallback_rows, fallback_report = export_fallbacks(limit=args.limit)
     fallback_stats = token_stats(fallback_rows, args.tokenizer)
