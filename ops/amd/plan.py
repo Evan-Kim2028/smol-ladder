@@ -107,7 +107,7 @@ LORA_RANK = 16
 # already trained, so a bad serving stack shows up on it before any of OUR GPU hours are spent.
 EVAL_ONLY_DEFAULT = (("R", "AdithyaSK/smoldataenvs-sft-2b-v0"),)
 GATE_ARM = "R"
-GATE_TASKS = 60                   # the gate's fixed subset: the first 60 tasks of the split
+GATE_TASKS = 60                   # the gate's fixed subset: 60 tasks stratified by tier (gate.py, gate_subset.txt)
 MAX_WORKERS_SAFE = 10             # session 1: 8 per model was fine, 20 hung every engine
 
 # ── time estimates, in seconds ───────────────────────────────────────────────────────────
@@ -365,12 +365,18 @@ def tunnel_check(cfg: Config) -> Cmd:
 
 # ── the laptop-side evaluation commands ────────────────────────────────────────────
 
+# The harness runs from the repo's own venv, directly: five `uv run` processes started at once raced
+# on uv's lock and its network resolution (and a failed resolution is not a failed trial).
+LOCAL_PYTHON = str(Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python")
+GATE_SUBSET_IDS = "ops/amd/gate_subset.txt"     # gate.SUBSET_IDS; a test keeps the two in step
+
 CHAT_KWARGS = '{"enable_thinking": false}'
 
 
 def eval_cmd(cfg: Config, arm: str, rungs: str, samples: int, *, agent: str = "bash",
              tag: str | None = None, model: str | None = None, limit: int | None = None,
-             max_turns: int | None = None, retry_failed: bool = False) -> Cmd:
+             max_turns: int | None = None, retry_failed: bool = False,
+             task_ids: str | None = None) -> Cmd:
     """One sweep of one model at one rung set, run on the laptop against the tunnel.
 
     `--agent bash` is the protocol the SFT data is in, with the harness's default `--bash-stop
@@ -384,12 +390,14 @@ def eval_cmd(cfg: Config, arm: str, rungs: str, samples: int, *, agent: str = "b
     variable is kept so a hand run can still point it somewhere.
     """
     turns = max_turns if max_turns is not None else (1 if agent == "program" else cfg.max_turns)
-    argv = ["uv", "run", "python", "-m", "smol_ladder.run_ladder",
+    argv = [LOCAL_PYTHON, "-m", "smol_ladder.run_ladder",
             "--split", cfg.split, "--model", model or served_name(arm),
             "--run-tag", tag or run_tag(cfg, arm), "--agent", agent,
             "--rungs", rungs, "--samples", str(samples), "--no-climb",
             "--limit", str(limit if limit is not None else cfg.limit),
             "--workers", str(cfg.workers), "--max-turns", str(turns)]
+    if task_ids:
+        argv += ["--task-ids", task_ids]
     if retry_failed:
         argv.append("--retry-failed")
     return Cmd(tuple(argv),
@@ -433,7 +441,8 @@ def gate_cmds(cfg: Config) -> list[Cmd]:
     """The gate: the same sweep as L1 (same run tags, same flags), on the first 60 tasks, for the
     base and the released adapter at once. Same tags, so the full L1 run finds these 60 trials
     done and does not pay for them again."""
-    return [eval_cmd(cfg, a, "L1", 1, limit=gate_limit(cfg)) for a in gate_arms(cfg)]
+    return [eval_cmd(cfg, a, "L1", 1, limit=gate_limit(cfg), task_ids=GATE_SUBSET_IDS)
+            for a in gate_arms(cfg)]
 
 
 def expected_trials(cfg: Config) -> dict[str, int]:
@@ -836,7 +845,7 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
     steps.append(Step("gate", "gate-tunnel", "laptop", [tunnel_up(cfg)], 0.0,
                       "ssh -L to every served port, loopback on both ends", billed=False))
     steps.append(Step("gate", "gate-eval", "laptop", gate_cmds(cfg), secs(ROW_GATE_EVAL),
-                      f"the fixed first-{gate_limit(cfg)}-task subset at L1, base and {GATE_ARM} "
+                      f"the fixed seeded {gate_limit(cfg)}-task subset (stratified by difficulty tier) at L1, base and {GATE_ARM} "
                       "concurrently, one sample each, supervised (stall, error-rate and health "
                       "checks); run tags are the L1 tags, so these trials are not bought twice"))
     steps.append(Step("gate", "stop-gate-server", "droplet", [remote_script(

@@ -29,8 +29,61 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The gate's tasks: a fixed seeded sample stratified by difficulty tier (committed; regenerate with
+# `python -m ops.amd.gate subset`). The first 60 task ids of the split are 25% easy against the split's
+# 13%, which made the gate easier than the evaluation it vouches for.
+SUBSET_IDS = "ops/amd/gate_subset.txt"       # one id per line: what `run_ladder --task-ids` reads
+SUBSET_JSON = "ops/amd/gate_subset.json"     # the same ids with the seed and the tier allocation
+SUBSET_SEED = 42
+
+
+def stratified_subset(rows: list[dict], n: int, seed: int = SUBSET_SEED) -> tuple[list[str], dict]:
+    """`n` task ids, drawn at random within each difficulty tier in proportion to the tier's share
+    of `rows` (largest remainder, ties by tier name), in split order. Deterministic: the draw per
+    tier uses its own `random.Random(f"{seed}:{tier}")` over the tier's sorted ids, so it does not
+    depend on row order or on the other tiers."""
+    import random
+    if n > len(rows):
+        raise ValueError(f"asked for {n} tasks from a split of {len(rows)}")
+    by_tier: dict[str, list[str]] = {}
+    for r in rows:
+        by_tier.setdefault(str(r["difficulty_tier"]), []).append(r["task_id"])
+    total = len(rows)
+    quota = {t: n * len(ids) / total for t, ids in by_tier.items()}
+    alloc = {t: int(q) for t, q in quota.items()}
+    for t in sorted(by_tier, key=lambda t: (-(quota[t] - alloc[t]), t))[: n - sum(alloc.values())]:
+        alloc[t] += 1
+    chosen: set[str] = set()
+    for tier, ids in by_tier.items():
+        chosen |= set(random.Random(f"{seed}:{tier}").sample(sorted(ids), alloc[tier]))
+    order = sorted(r["task_id"] for r in rows)
+    ids = [t for t in order if t in chosen]
+    meta = {"n": n, "seed": seed, "split_counts": {t: len(v) for t, v in sorted(by_tier.items())},
+            "allocation": dict(sorted(alloc.items())), "ids": ids,
+            "derivation": "ops.amd.gate.stratified_subset(rows of the SmolDataEnvs test split, n, seed): "
+                          "per difficulty_tier, random.Random(f'{seed}:{tier}').sample(sorted ids, k), "
+                          "k by largest remainder of n x the tier's share; ids in sorted order"}
+    return ids, meta
+
+
 STOP_REASONS = ("answer_submitted", "model_stopped", "max_turns", "context_exhausted")
 ANSWER_STOPS = ("answer_submitted", "model_stopped")
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="regenerate the committed gate subset from the dataset")
+    ap.add_argument("cmd", choices=["subset"])
+    ap.add_argument("--n", type=int, default=60)
+    ap.add_argument("--seed", type=int, default=SUBSET_SEED)
+    args = ap.parse_args(argv)
+    from smol_ladder.tasks import load_split
+    root = Path(__file__).resolve().parents[2]
+    ids, meta = stratified_subset(load_split("test"), args.n, args.seed)
+    (root / SUBSET_IDS).write_text("\n".join(ids) + "\n")
+    (root / SUBSET_JSON).write_text(json.dumps(meta, indent=1) + "\n")
+    print(meta["allocation"], "of", meta["split_counts"])
+    return 0
 
 
 def is_clean(result: dict) -> bool:
@@ -194,3 +247,7 @@ def decide(base: ModelStats, adapter: ModelStats, *, adapter_name: str, differs:
                  "reasons, then `driver.py gate-decide --accept-gate` (free) to continue, or "
                  "destroy.")
     return Decision(False, True, [], False, lines)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

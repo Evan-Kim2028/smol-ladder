@@ -41,6 +41,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -747,6 +748,8 @@ def record_gate_tasks(cfg: P.Config, runs_root: Path) -> list[str]:
     f = Path(cfg.local_logs) / "gate_tasks.json"
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(ids))
+    # The subset the gate was SUPPOSED to run (seed, tier allocation), beside the ids it did run.
+    shutil.copyfile(REPO_ROOT / G.SUBSET_JSON, f.with_name("gate_subset.json"))
     return ids
 
 

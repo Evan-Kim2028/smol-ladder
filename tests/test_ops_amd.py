@@ -740,9 +740,13 @@ def test_the_gate_is_the_l1_sweep_on_a_fixed_subset_under_the_l1_run_tags():
     l1 = {argv_of(c, "--run-tag"): c for c in next(s for s in eval_steps() if s.name == "eval-L1").cmds}
 
     def without_limit(cmd):
-        i = cmd.argv.index("--limit")
-        return cmd.argv[:i] + cmd.argv[i + 2:]
-    for c in gate:    # same tag, same model, same flags but the limit: the 60 trials are reused
+        argv = list(cmd.argv)
+        for flag in ("--limit", "--task-ids"):
+            if flag in argv:
+                i = argv.index(flag)
+                del argv[i:i + 2]
+        return argv
+    for c in gate:    # same tag, same model, same flags but the limit and the subset: the trials are reused
         full = l1[argv_of(c, "--run-tag")]
         assert without_limit(c) == without_limit(full) and c.env == full.env
     assert P.gate_limit(cfg(limit=40)) == 40
@@ -4645,3 +4649,10 @@ def test_stale_or_missing_token_counts_are_refused(tmp_path):
     c2, data2 = good_stage(tmp_path / "x")
     with pytest.raises(SystemExit, match="max-length"):
         driver.check_stage_for_upload(cfg(stage_dir=c2.stage_dir, max_length=4096), head="a" * 40, data_dir=data2)
+
+
+def test_harness_processes_run_the_repo_venv_python_directly_not_five_uv_runs():
+    for _, cmds in P.eval_phases(cfg()):
+        for c in cmds:
+            assert c.argv[0] == str(REPO_ROOT / ".venv" / "bin" / "python") and "uv" not in c.argv[:2]
+            assert c.argv[1:3] == ("-m", "smol_ladder.run_ladder")
