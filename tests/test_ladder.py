@@ -398,3 +398,18 @@ def test_sandbox_reads_input_offline():
     row = load_split("test")[0]
     inp = input_dir(row)
     assert inp.exists()
+
+
+def test_the_control_block_extends_l1_and_says_nothing_about_the_task():
+    from smol_ladder import ladder
+    """L1+control is L1 plus one fixed block of behaviour rules: the same text for every task."""
+    rows = load_split("test")[:2]
+    blocks = []
+    for row in rows:
+        l1 = ladder.prompt_for(row, "test", "L1", "bash")
+        control = ladder.prompt_for(row, "test", "L1+control", "bash")
+        assert control.startswith(l1) and control != l1
+        blocks.append(control[len(l1):])
+        assert ladder.hint_source(row, "test", "L1+control") == "fixed"
+    assert blocks[0] == blocks[1] == "\n\nWorking rules:\n\n" + ladder.control_hint()
+    assert len(ladder.control_hint().split()) <= 110

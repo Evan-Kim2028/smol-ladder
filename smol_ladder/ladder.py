@@ -992,6 +992,8 @@ def hint_source(row: dict, split: str, rung: str) -> str:
     """
     if rung in {"L1", "L1+schema"}:
         return "none"
+    if rung == "L1+control":
+        return "fixed"          # one model-written block, the same for every task
     return "llm" if load_hint(row, split) is not None else "ast"
 
 
@@ -1040,6 +1042,15 @@ def bash_question(row: dict) -> str:
     return found.group(1) if found else row["question"]
 
 
+def control_hint() -> str:
+    """The L1+control block: behaviour rules, identical for every task, with no information about
+    any task. Like L1+schema it is a control and not a rung. It tests whether the small model's
+    failures to commit to an answer (repeat loops, whole-table prints) can be fixed by saying so.
+    The text was written by the hint model from the base model's failure counts
+    (`control_hint.provenance.json` holds the request) and is used verbatim."""
+    return (Path(__file__).with_name("control_hint.txt")).read_text().strip()
+
+
 def prompt_for(row: dict, split: str, rung: str, agent: str = "tools") -> str:
     """The user turn for a rung.
 
@@ -1070,6 +1081,8 @@ def prompt_for(row: dict, split: str, rung: str, agent: str = "tools") -> str:
         return base
     if rung == "L1+schema":
         return base + f"\n\nSchema of the input tables:\n\n{schema_dump(row, split)}"
+    if rung == "L1+control":
+        return base + f"\n\nWorking rules:\n\n{control_hint()}"
     source = read_source(row, split)
     if source is None:
         # Falling back to the plain prompt would make this rung byte-identical to L1: the

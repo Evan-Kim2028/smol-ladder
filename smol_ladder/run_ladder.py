@@ -910,7 +910,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
     root = runs_root or (DATA / "runs" / split)
     have_source = read_source(row, split) is not None
     for rung in rungs:
-        prompt_rung = rung.replace("_schema", "+schema")
+        prompt_rung = rung.replace("_schema", "+schema").replace("_control", "+control")
         # The control is built from the tables alone, so it needs no reference. Gating it on
         # one would throw away the L1-vs-L1+schema comparison on every task whose reference we
         # failed to build, which is most of the failures we care about.

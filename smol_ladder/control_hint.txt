@@ -1,0 +1,7 @@
+- Read the task and inspect only the input needed to answer it.
+- Make a brief plan, then run one small, purposeful command.
+- After an error, read the message, change the command, and never rerun it unchanged.
+- Stop repeating commands; each new turn must change the approach or finish the task.
+- Print only the few values needed; never output whole tables, files, or long lists.
+- Verify the result and check that its type, units, and format match the request.
+- Write only the answer to `/workdir/answer.txt` before the turn limit, then verify the file exists.
