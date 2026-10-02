@@ -422,7 +422,41 @@ be set on the first run or an interrupted run loses everything.
 
 ---
 
-## 8. Decisions the owner must make
+## 8. Plain-language hints on the held-out splits
+
+`smol_ladder.gen_hints` writes L2/L3 hints from each verified reference and validates each one
+(files and columns must exist in the real tables, no gold answer, L3 must add to L2). A hint that
+fails three times is cached as `failed: true` and `ladder.py` falls back to the AST extraction for
+that task — that is the "fallback" bucket below, not a gap.
+
+Coverage as of **2026-10-01 20:50**, measured against `ladder.load_hint` (which only returns a hint
+that is current for the reference hash and the prompt version), over
+`uv run python -m smol_ladder.gen_hints --split <split> --workers N`:
+
+| split | tasks | verified reference | valid hint (model-written) | leak-rejected / fallback to AST | no reference (L2–L4 skipped) | hint files on disk |
+|---|---|---|---|---|---|---|
+| `test` | 250 | **213** | **197** | **16** | 37 | 213 |
+| `eval` | 144 | **118** | **113** | **5** | 26 | 66 |
+
+**`eval` is at 66 of 118 and its run is not finished.** The OpenRouter route
+(`stealth/space-bunny-alpha` over `SMOL_LADDER_BASE_URL`) stalled mid-run: threads ended up on
+sockets in `CLOSE_WAIT` with the server long gone, so `urllib`'s 180 s read timed out and
+`call_model`'s retry-and-backoff loop (5 attempts, 5·2ⁿ capped at 60 s) had no way out. Direct
+probes from the same shell answered in 0.5–1.5 s throughout, so this is a read-side hang on a dead
+connection, not endpoint slowness. A second agent is finishing both splits over a different route;
+**this number will move.**
+
+Two facts worth keeping either way:
+
+- `test` is complete: 197 of 213 references have a validated model hint, 16 fell back to the AST
+  after three leak rejections each, and all 213 references have a hint *file* (an unusable one is
+  cached so a rerun does not re-roll it forever).
+- `ladder.hint_source` records which of the two a rung's text came from, so a summary can separate
+  model-written L2/L3 from AST-derived ones within one split. Neither is a stub.
+
+---
+
+## 9. Decisions the owner must make
 
 1. **Firewall strictness** (§3) — **decided 2026-10-01: keep the default**, `task_id,question`, which
    keeps **4,673** rows and replicates arm A. The table-level `bucket_prefix` check stays an **opt-in
