@@ -39,7 +39,8 @@ from ops.amd.doapi import load_dotenv  # noqa: E402
 
 REQUIRED_IN_COMMIT = ("train/sft_lora.py", "train/format.py", "smol_ladder/upstream.py",
                       "ops/amd/entrypoint.sh", "ops/amd/smoke.sh", "ops/amd/run_sft.sh",
-                      "ops/amd/serve.sh", "ops/amd/common.sh")
+                      "ops/amd/serve.sh", "ops/amd/common.sh", "ops/amd/sft_run.py",
+                      "ops/amd/merge_adapter.py", "ops/amd/probe_tools.py")
 MSG_OVERHEAD_TOKENS = 8      # role markers and separators per message in the chat template
 FALLBACK_BYTES_PER_TOKEN = 3.0
 TOKENIZER_GLOB = "models--Qwen--Qwen3.5-2B/snapshots/*/tokenizer.json"

@@ -2,15 +2,17 @@
 # shellcheck source-path=SCRIPTDIR
 # Measure before spending. Runs on the droplet, once, before any arm is trained.
 #
-#   smoke.sh [--max-length 8192] [--bench-seconds 120]
+#   smoke.sh [--max-length 8192] [--bench-seconds 120] [--bench-batches 4]
 #
 #   A. the ROCm checklist, scripted, one PASS/FAIL per item; any critical FAIL stops here
-#   B. SFT throughput with the real trainer on the real base and data at 3 batch sizes
-#   C. one real kill-and-resume (resume_check.sh); leaves a tiny adapter for the serve probe
+#   B. SFT throughput with the real trainer on the real base and data (batch 4 by default: that is
+#      what session 1 trained at; `--bench-batches 2 4 8` widens it at about 3.5 billed minutes each)
+#   C. one real kill-and-resume (resume_check.sh)
 #
 # It writes $AMD_REMOTE_LOG/measurements.json. The LAPTOP turns that into a costed projection and
 # a go/no-go (driver.py project): token counts and prices live there, so the droplet only
-# measures. The serve + 20-task probe that completes the picture is the driver's next step.
+# measures. The gate (the released adapter served and evaluated, driver.py gate) is the driver's
+# next step and is what proves serving, tool calls and the harness before anything is trained.
 
 set -euo pipefail
 # shellcheck source=common.sh
@@ -18,10 +20,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 amd_load_env "$AMD_REMOTE_ROOT/.env"
 
 BENCH_SECONDS=120
+BENCH_BATCHES=(4)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --max-length)    AMD_MAX_LENGTH="$2"; shift 2 ;;
     --bench-seconds) BENCH_SECONDS="$2"; shift 2 ;;
+    --bench-batches) shift; BENCH_BATCHES=()
+                     while [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; do BENCH_BATCHES+=("$1"); shift; done ;;
     *) amd_die "unknown argument '$1'" ;;
   esac
 done
@@ -77,9 +82,9 @@ if (( CRITICAL_FAILS > 0 )); then
   exit 3
 fi
 
-amd_log "=== B. SFT throughput on the real base, ${BENCH_SECONDS}s per batch size ==="
+amd_log "=== B. SFT throughput on the real base, ${BENCH_SECONDS}s at batch ${BENCH_BATCHES[*]} ==="
 "$PY" ops/amd/bench.py run --out "$AMD_REMOTE_LOG/bench.json" --seconds "$BENCH_SECONDS" \
-  --max-length "$AMD_MAX_LENGTH" || { amd_log "benchmark produced nothing trainable"; \
+  --max-length "$AMD_MAX_LENGTH" --batches "${BENCH_BATCHES[@]}" || { amd_log "benchmark produced nothing trainable"; \
   "$PY" ops/amd/bench.py finalize --checks "$CHECKS" --bench "$AMD_REMOTE_LOG/bench.json" --out "$AMD_REMOTE_LOG/measurements.json"; exit 3; }
 
 amd_log "=== C. kill and resume ==="

@@ -12,9 +12,9 @@
 # trainer with --resume, and check where it restarted.
 #
 # train/sft_lora.py saves every max(50, max_steps // 2) steps, so a 60-step run is the smallest
-# one that checkpoints at step 50 and still has something left to do. The finished adapter of the
-# resumed run is kept at runs/resume_check: the probe server loads it as `amd-probe-2b` to prove
-# LoRA serving works before any arm is trained.
+# one that checkpoints at step 50 and still has something left to do. (The real arms checkpoint
+# every --save-steps through ops/amd/sft_run.py; this check calls the trainer directly, which is
+# enough to prove the restart logic.)
 
 set -euo pipefail
 # shellcheck source=common.sh

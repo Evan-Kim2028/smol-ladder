@@ -40,17 +40,27 @@ AMD_HUB_ADAPTER_AB="${AMD_HUB_ADAPTER_AB:-smol-ladder-sft-ab}"
 AMD_HUB_ARTIFACTS="${AMD_HUB_ARTIFACTS:-smol-ladder-runs}"
 
 # ── serving ──────────────────────────────────────────────────────────────────────
+# One vLLM process per model, each serving a MERGED checkpoint (LoRA serving does not work for this
+# model on vLLM 0.17.1: it crashes at cuda-graph warmup, and with --enforce-eager it cannot load a
+# peft all-linear adapter). Ports are fixed by model, so the laptop's tunnel and harness and these
+# scripts cannot disagree (plan.py's port_order is the other copy; a test keeps the two in step):
+# base 8000, A 8001, B 8002, AB 8003, then the Hub adapters in the order they are given (R 8004).
 AMD_VLLM_PORT="${AMD_VLLM_PORT:-8000}"
 AMD_VLLM_WAIT_S="${AMD_VLLM_WAIT_S:-900}"
 AMD_MAX_MODEL_LEN="${AMD_MAX_MODEL_LEN:-16384}"
-# One server for four models: the base is 4.6 GB and an adapter is ~90 MB, so the rest of the
-# card is KV cache, which is what makes four concurrent sweeps fast.
-# That 85% is why the probe server MUST be stopped before any arm trains (the plan has an explicit
-# stop step and run_sft.sh stops it again and then asserts the memory is free).
-AMD_GPU_UTIL="${AMD_GPU_UTIL:-0.85}"
-# qwen3_coder is what the vLLM Qwen3.5 recipe names. If the smoke probe reports raw <tool_call> text,
+# Five 2B engines share one card: 0.17 of it each (measured: 0.15-0.2 each works, and five at 0.2
+# leave nothing for the compile and cuda-graph memory that sits outside the fraction).
+AMD_SERVER_UTIL="${AMD_SERVER_UTIL:-0.17}"
+# An engine can fail to start ("Engine core initialization failed", a cuda-graph capture assertion)
+# when the servers that were just killed have not given the card back yet. The start waits for the
+# memory first and retries a failed engine once after waiting again.
+AMD_START_TRIES="${AMD_START_TRIES:-2}"
+AMD_GPU_ROOM_WAIT_S="${AMD_GPU_ROOM_WAIT_S:-180}"
+# qwen3_coder is what the vLLM Qwen3.5 recipe names. If the probe reports raw <tool_call> text,
 # switch the parser here (for example `hermes`) without editing the script.
 AMD_TOOL_PARSER="${AMD_TOOL_PARSER:-qwen3_coder}"
+# The released upstream adapter: evaluated, never trained, and the gate's subject.
+AMD_HUB_R="${AMD_HUB_R:-AdithyaSK/smoldataenvs-sft-2b-v0}"
 
 amd_log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 amd_die() { amd_log "FATAL: $*"; exit 1; }
@@ -89,18 +99,27 @@ amd_arm_hub_repo() {
 amd_served_name() {
   case "$1" in
     base) printf 'amd-base-2b\n' ;;
-    probe) printf 'amd-probe-2b\n' ;;
-    A|B|AB) printf 'amd-%s-2b\n' "$(amd_lower "$1")" ;;
+    [A-Z0-9]*) printf 'amd-%s-2b\n' "$(amd_lower "$1")" ;;
     *) amd_die "unknown model '$1'" ;;
   esac
 }
 
-# ── GPU memory must be free before an arm trains ────────────────────────────────
-# A live server holds most of the card and the benchmark picked its batch size on an EMPTY card:
-# training beside it would run on a sliver of the memory with a batch size nobody measured, and a
-# live vLLM also counts as "work" for the idle watchdog.
+# The fixed port of a model trained here (Hub adapters are given theirs explicitly).
+amd_port() {
+  case "$1" in
+    base) printf '%s\n' "$AMD_VLLM_PORT" ;;
+    A)    printf '%s\n' "$((AMD_VLLM_PORT + 1))" ;;
+    B)    printf '%s\n' "$((AMD_VLLM_PORT + 2))" ;;
+    AB)   printf '%s\n' "$((AMD_VLLM_PORT + 3))" ;;
+    *)    amd_die "no fixed port for '$1'" ;;
+  esac
+}
+
+# ── GPU memory must be free before an arm trains or a server starts ─────────────
+# The servers hold most of the card and the benchmark picked its batch size on an EMPTY card:
+# training beside a live server would run on a sliver of the memory with a batch size nobody
+# measured, and a live vLLM also counts as "work" for the idle watchdog.
 AMD_GPU_FREE_MIN="${AMD_GPU_FREE_MIN:-0.90}"      # fraction of the card that must be free
-AMD_GPU_ROOM_WAIT_S="${AMD_GPU_ROOM_WAIT_S:-180}"  # how long to wait for it (amd_wait_gpu_room)
 
 amd_gpu_free_fraction() {
   "$AMD_VENV/bin/python" -c 'import torch; free, total = torch.cuda.mem_get_info(); print(free / total)'

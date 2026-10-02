@@ -362,13 +362,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--adapter")
     ap.add_argument("--out")
     ap.add_argument("--check", metavar="DIR", help="verify an existing merged directory and exit")
+    ap.add_argument("--label", help="with --check: the served model's name, for the MERGE_OK line "
+                                    "the driver reads (it wires the report into the evaluation guard)")
     args = ap.parse_args(argv)
     if args.check:
         why = check(Path(args.check))
         for w in why:
             print(f"merge check FAILED: {w}", file=sys.stderr)
         if not why:
+            rep = json.loads((Path(args.check) / REPORT).read_text())
             print(f"merge check ok: {args.check}")
+            if args.label:
+                print(f"MERGE_OK model={args.label} modules_applied={rep['modules_applied']} "
+                      f"tensors_changed={rep['tensors_changed']} "
+                      f"max_relative_delta={rep['max_relative_delta']:.3g}")
         return 1 if why else 0
     if not (args.base and args.adapter and args.out):
         ap.error("--base, --adapter and --out are required (or --check DIR)")

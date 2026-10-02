@@ -1,6 +1,6 @@
 """Does the running vLLM turn model output into a real `tool_call`? Asked BEFORE any arm trains.
 
-    python -m ops.amd.probe_tools --port 8000 --models amd-base-2b amd-probe-2b
+    python -m ops.amd.probe_tools --port 8001 --models amd-a-2b --base-port 8000 --base-model amd-base-2b
 
 The bash agent protocol lives or dies on this: if `--tool-call-parser` does not match the model's
 output format, every request returns plain text, the harness sees no tool call, every trial ends
@@ -10,7 +10,7 @@ schema and system prompt (smol_ladder.upstream) to each model a few times and re
 parsed `bash` tool call with valid JSON arguments from the adapter. A raw `<tool_call>` left in
 the content is the signature of a parser mismatch and is reported as such.
 
-Prints `TOOL_CALLS_OK=1` if the first named adapter (the probe) produced one, else 0. The base
+Prints `TOOL_CALLS_OK=1` if the first named adapter produced one, else 0. The base
 is informational: an untuned base may legitimately answer in prose.
 
 Second check, `ADAPTER_DIFFERS_FROM_BASE`: the first training row (up to its first assistant turn,
@@ -22,6 +22,10 @@ symptom that cannot be a coincidence. It also prints each model's token-level ag
 row's own training target (`ADAPTER_TARGET_AGREEMENT`, `BASE_TARGET_AGREEMENT`: the fraction of the
 target's tokens, split on word and punctuation boundaries, that the output has at the same
 position), which is the first evidence of whether the adapter learned the format at all.
+
+The last line is `ADAPTER_CHECK model=<name> differs=<0|1> tool_calls_ok=<0|1>`, the one line
+serve.sh greps for and the driver records: an adapter that is identical to the base, or that returns
+no parsed tool call, must not be evaluated.
 """
 
 from __future__ import annotations
@@ -161,6 +165,7 @@ def main() -> int:
         if i == 0 and counts.get("tool_call"):
             ok = True
     print(f"TOOL_CALLS_OK={1 if ok else 0}")
+    tool_ok = 1 if ok else 0
     base_model = args.base_model or (args.models[1] if len(args.models) > 1 else None)
     if base_model is None:
         return 0
@@ -170,6 +175,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - an unmeasured check must read as a failure
         print(f"  adapter check could not run: {exc}")
         print("ADAPTER_DIFFERS_FROM_BASE=0")
+        print(f"ADAPTER_CHECK model={args.models[0]} differs=0 tool_calls_ok={tool_ok}")
         return 0
     print(f"  fixed training prompt, temperature 0: adapter {args.models[0]!r} vs base {base_model!r}")
     print(f"  adapter output: {res['adapter_text']!r}")
@@ -183,6 +189,8 @@ def main() -> int:
     print(f"ADAPTER_DIFFERS_FROM_BASE={1 if res['differs'] else 0}")
     print(f"ADAPTER_TARGET_AGREEMENT={res['adapter_agreement']:.4f}")
     print(f"BASE_TARGET_AGREEMENT={res['base_agreement']:.4f}")
+    print(f"ADAPTER_CHECK model={args.models[0]} differs={1 if res['differs'] else 0} "
+          f"tool_calls_ok={tool_ok}")
     return 0
 
 

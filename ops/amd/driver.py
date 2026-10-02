@@ -1,22 +1,27 @@
-"""Run the session: three SFT arms, then one four-model ladder evaluation, on one AMD droplet.
+"""Run the session: a gate on the released adapter, three SFT arms, then one five-model evaluation.
 
     python ops/amd/driver.py dry-run            every command in order and the costed table; touches nothing
     python ops/amd/driver.py plan [--json]      the costed table only
     python ops/amd/driver.py preflight ...      read-only GETs: is this create going to work
     python ops/amd/driver.py create ... --yes   POST the droplet, wait for the IP, record it
     python ops/amd/driver.py bootstrap          upload the stage dir, run the ONE entry script
-    python ops/amd/driver.py smoke              checklist, throughput bench, kill/resume, probe, go/no-go
+    python ops/amd/driver.py smoke              checklist, throughput bench, kill/resume, then the GATE
+    python ops/amd/driver.py gate               the gate alone (serve base + released adapter, 60 tasks)
+    python ops/amd/driver.py gate-decide        re-read the gate's results and decide (no spend);
+                                                --accept-gate continues past a rate that did not clear
     python ops/amd/driver.py project            re-run the go/no-go with new flags (no spend)
-    python ops/amd/driver.py train              SFT A, B, A+B (resumable, skips finished arms)
-    python ops/amd/driver.py serve              ONE vLLM: base + all adapters
-    python ops/amd/driver.py tunnel [up|down]   ssh -L to the droplet (loopback)
-    python ops/amd/driver.py eval --stage L1    L1 for all four models, then STOP: read it, then buy more
-    python ops/amd/driver.py eval --stage rest  L2-L4 and the one-turn control (--stage hints / control / all)
+    python ops/amd/driver.py train              SFT A, B, A+B (resumable, auto-resume, skips finished arms)
+    python ops/amd/driver.py serve              one vLLM per model (merged), every adapter checked
+    python ops/amd/driver.py tunnel [up|down]   ssh -L to every served port (loopback)
+    python ops/amd/driver.py eval               L1 for all five models, supervised, then STOP: read it,
+                                                then buy more with --stage sample2|hints|control|rest
     python ops/amd/driver.py sync               adapters + logs off the droplet, then verify them
     python ops/amd/driver.py destroy --yes      DELETE by tag, then GET until none remains
     python ops/amd/driver.py go                 train -> serve -> tunnel -> eval -> sync -> destroy
     python ops/amd/driver.py status             droplet, uptime, dollars accrued and remaining, the
-                                                caps, the $95 hard limit, and whether the deadman lives
+                                                caps, the $95 hard limit, whether the deadman lives
+                                                (restart it after any laptop re-login) and which ssh
+                                                agent is in use
 
 Nothing mutates the cloud without `--yes`, and `--yes` is only ever typed by the reviewer. Every
 billed step passes a budget gate first (ledger accrual + the step + a reserve for sync/destroy
@@ -51,10 +56,9 @@ sys.path.insert(0, str(REPO_ROOT))
 from ops.amd import cloud  # noqa: E402
 from ops.amd import ledger as L  # noqa: E402
 from ops.amd import plan as P  # noqa: E402
+from ops.amd import supervise as SUP  # noqa: E402
+from ops.amd import gate as G  # noqa: E402
 from ops.amd.doapi import DoApi, child_env, load_dotenv, token_from_env  # noqa: E402
-
-TRIAL_LINE = re.compile(r"^\[\d+/\d+\] .* reward=", re.M)
-
 
 # ── configuration ─────────────────────────────────────────────────────────────────
 
@@ -105,22 +109,64 @@ def add_common(ap: argparse.ArgumentParser) -> None:
                    help=f"working total cap, dollars (never above the ${P.HARD_TOTAL_LIMIT:g} hard limit)")
     g.add_argument("--deadline-minutes", type=float, default=0.0)
     g = ap.add_argument_group("work")
-    g.add_argument("--arms", default=",".join(P.ARMS))
+    g.add_argument("--arms", default=",".join(P.ARMS), help="arms to TRAIN")
+    g.add_argument("--eval-only", default=",".join(f"{n}={r}" for n, r in P.EVAL_ONLY_DEFAULT),
+                   help="Hub adapters that are served and evaluated but not trained, NAME=owner/repo "
+                        "comma-separated (default: the released upstream adapter as R). R is the "
+                        "gate's subject and must stay in the list")
     g.add_argument("--max-length", type=int, default=8192)
     g.add_argument("--limit", type=int, default=250, help="tasks per rung per model")
-    g.add_argument("--samples", type=int, default=2, help="samples at L1")
+    g.add_argument("--samples", type=int, default=1,
+                   help="samples at L1; a second one is its own purchase (eval --stage sample2)")
     g.add_argument("--late-samples", type=int, default=1, help="samples at L2..L4")
     g.add_argument("--rungs", default=",".join(P.RUNGS))
-    g.add_argument("--workers", type=int, default=12)
+    g.add_argument("--workers", type=int, default=P.Config.workers,
+                   help="parallel trials PER MODEL. 8 is measured safe; 20 hung every engine in "
+                        f"session 1. Above {P.MAX_WORKERS_SAFE} needs --i-know")
+    g.add_argument("--i-know", action="store_true",
+                   help=f"allow --workers above {P.MAX_WORKERS_SAFE} (it stalled session 1's "
+                        "evaluation for two hours)")
+    g.add_argument("--tag-prefix", default=P.Config.tag_prefix,
+                   help="run tags are <prefix>-<model>; reusing a prefix reuses its finished "
+                        "trials, which is the point for the gate and a hazard for anything else")
     g.add_argument("--no-base", action="store_true", help="skip the base-model control")
     g.add_argument("--no-program-control", action="store_true")
-    g.add_argument("--serve-mode", choices=["lora", "merged"], default="merged")
+    g = ap.add_argument_group("gate")
+    g.add_argument("--gate-tasks", type=int, default=P.GATE_TASKS)
+    g.add_argument("--gate-margin", type=float, default=P.Config.gate_margin,
+                   help="the released adapter's pass rate must beat the base's by this much")
+    g.add_argument("--gate-max-failures", type=int, default=P.Config.gate_max_failures,
+                   help="harness failures tolerated per model")
+    g.add_argument("--accept-gate", action="store_true",
+                   help="continue although the released adapter did not beat the base by the "
+                        "margin (the stack itself must still have passed)")
+    g = ap.add_argument_group("supervision (eval and the gate)")
+    g.add_argument("--stall-minutes", type=float, default=SUP.DEFAULT_STALL_MIN,
+                   help="no new result.json for this long stops the harnesses and restarts the servers")
+    g.add_argument("--error-window", type=int, default=SUP.DEFAULT_WINDOW,
+                   help="harness-failure share is judged over each model's last N results")
+    g.add_argument("--error-share", type=float, default=SUP.DEFAULT_ERROR_SHARE)
+    g = ap.add_argument_group("training")
+    g.add_argument("--ckpt-steps", type=int, default=P.Config.ckpt_steps,
+                   help="checkpoint (and push to the Hub) every N steps")
+    g.add_argument("--train-attempts", type=int, default=P.Config.train_attempts,
+                   help="automatic resumes of one arm after a crash (a GPU reset costs one interval)")
     g = ap.add_argument_group("where")
     g.add_argument("--host", default="", help="droplet IP (default: from the ledger)")
     g.add_argument("--identity", default="")
     g.add_argument("--commit", default="HEAD")
     g.add_argument("--stage-dir", default="/tmp/smol-ladder-stage")
     g.add_argument("--ledger", default=str(OPS / "ledger.jsonl"))
+
+
+def parse_eval_only(text: str) -> tuple[tuple[str, str], ...]:
+    out = []
+    for item in (t.strip() for t in text.split(",") if t.strip()):
+        name, sep, repo = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--eval-only entry {item!r} must be NAME=owner/repo")
+        out.append((name.strip().upper(), repo.strip()))
+    return tuple(out)
 
 
 def build_config(args: argparse.Namespace) -> P.Config:
@@ -131,24 +177,51 @@ def build_config(args: argparse.Namespace) -> P.Config:
     rungs = tuple(r.strip() for r in args.rungs.split(",") if r.strip())
     if not rungs or any(r not in P.RUNGS for r in rungs):
         raise SystemExit(f"--rungs must be a subset of {list(P.RUNGS)}")
+    if args.workers < 1:
+        raise SystemExit("--workers must be at least 1")
+    if args.workers > P.MAX_WORKERS_SAFE and not args.i_know:
+        raise SystemExit(
+            f"--workers {args.workers} is above {P.MAX_WORKERS_SAFE}. Session 1 measured 8 per model "
+            "as safe and 20 per model as the setting under which every vLLM engine hung at zero "
+            "throughput for two hours (about $5 gone). Pass --i-know to override.")
     fb = args.fallback
     fp = args.ssh_key_fingerprint or local_fingerprint(Path(args.ssh_pubkey))
-    return P.Config(
-        size=args.size or (P.SIZE_MI325X if fb else P.SIZE_MI350X),
-        region=args.region or (P.REGION_MI325X if fb else P.REGION_MI350X),
-        price=args.price or (P.PRICE_MI325X if fb else P.PRICE_MI350X),
-        image=args.image, fingerprint=fp, tag=args.tag, budget=args.budget,
-        total_cap=args.total_cap, deadline_minutes=args.deadline_minutes, arms=arms,
-        max_length=args.max_length, limit=args.limit, samples=args.samples,
-        late_samples=args.late_samples, rungs=rungs, workers=args.workers,
-        include_base=not args.no_base, program_control=not args.no_program_control,
-        serve_mode=args.serve_mode, host=args.host, identity=args.identity, commit=args.commit,
-        stage_dir=args.stage_dir, ledger=args.ledger)
+    try:
+        return P.Config(
+            size=args.size or (P.SIZE_MI325X if fb else P.SIZE_MI350X),
+            region=args.region or (P.REGION_MI325X if fb else P.REGION_MI350X),
+            price=args.price or (P.PRICE_MI325X if fb else P.PRICE_MI350X),
+            image=args.image, fingerprint=fp, tag=args.tag, budget=args.budget,
+            total_cap=args.total_cap, deadline_minutes=args.deadline_minutes, arms=arms,
+            eval_only=parse_eval_only(args.eval_only),
+            max_length=args.max_length, limit=args.limit, samples=args.samples,
+            late_samples=args.late_samples, rungs=rungs, workers=args.workers,
+            tag_prefix=args.tag_prefix, include_base=not args.no_base,
+            program_control=not args.no_program_control,
+            host=args.host, identity=args.identity, commit=args.commit,
+            stage_dir=args.stage_dir, ledger=args.ledger, gate_tasks=args.gate_tasks,
+            gate_margin=args.gate_margin, gate_max_failures=args.gate_max_failures,
+            ckpt_steps=args.ckpt_steps, train_attempts=args.train_attempts,
+            stall_minutes=args.stall_minutes, error_window=args.error_window,
+            error_share=args.error_share, accept_gate=args.accept_gate)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def tokens_for(cfg: P.Config) -> dict[str, P.SetTokens]:
+    """Staged token counts if they were made for the data on disk now, else the recount/heuristic.
+    tokens.json is the source of truth (stage.py counts A and B with the real tokenizer and
+    computes AB as A + B), but one staged from other data is refused, loudly: a plan costed from
+    last session's v1 arm B is out by a factor of two."""
+    data = REPO_ROOT / "data"
     staged = P.load_tokens(Path(cfg.stage_dir) / "tokens.json", cfg.max_length)
-    return staged or P.heuristic_tokens(REPO_ROOT / "data", cfg.max_length)
+    if staged:
+        why = P.stale_tokens(staged, data)
+        if not why:
+            return staged
+        print(f"  note: ignoring the staged token counts ({why}); re-run ops/amd/stage.py",
+              file=sys.stderr)
+    return P.heuristic_tokens(data, cfg.max_length)
 
 
 def with_host(cfg: P.Config, events: list[dict]) -> P.Config:
@@ -195,30 +268,38 @@ def print_table(cfg: P.Config, rows: list[P.Row], spent_session: float = 0.0) ->
     print(f"## costed plan: {cfg.size} in {cfg.region} ({kind}) at ${cfg.price}/h, "
           f"session budget ${cfg.budget:.2f}, total cap ${cfg.total_cap:.2f} "
           f"(HARD limit ${P.HARD_TOTAL_LIMIT:.2f}), image {cfg.image}")
-    print(f"  {'stage':<30} {'hours':>6} {'dollars':>8}  basis")
+    print(f"  {'stage':<38} {'hours':>6} {'dollars':>8}  basis")
     for r in rows:
-        print(f"  {r.stage:<30} {r.seconds / 3600.0:>6.2f} {r.dollars(cfg.price):>8.2f}  {r.basis}")
-    print(f"  {'TOTAL':<30} {hours:>6.2f} {total:>8.2f}  "
+        print(f"  {r.stage:<38} {r.seconds / 3600.0:>6.2f} {r.dollars(cfg.price):>8.2f}  {r.basis}")
+    print(f"  {'TOTAL, every row':<38} {hours:>6.2f} {total:>8.2f}  "
           f"(session headroom ${cfg.budget - total:.2f}, credit headroom ${P.CREDIT - total:.2f})")
-    if total > cfg.budget:
-        print(f"  !! OVER THE SESSION BUDGET by ${total - cfg.budget:.2f}")
-    staged = P.staged_dollars(rows, cfg.price)
-    if staged["hints"] or staged["control"]:
-        print(f"  {'-' * 60}")
-        print(f"  stop after L1:  ${staged['l1_only']:.2f} in all (everything above except the two "
-              "optional rows below)")
-        print(f"  + L2-L4:        ${staged['hints']:.2f} incremental   (eval --stage hints)")
-        print(f"  + control:      ${staged['control']:.2f} incremental   (eval --stage control)")
+    st = P.staged_dollars(rows, cfg.price)
+    print(f"  {'-' * 60}")
+    print("  what the session costs, by where you stop:")
+    print(f"    gate only (then destroy):        ${st['gate_only']:.2f}")
+    print(f"    gate + train + L1 eval + sync:   ${st['core']:.2f}   <- the plan")
+    for key, label in (("sample2", "+ L1 second sample"), ("hints", "+ L2-L4"),
+                       ("control", "+ program control")):
+        if st[key]:
+            print(f"    {label + ':':<32} ${st[key]:.2f} incremental   (eval --stage {key})")
+    print(f"    everything bought:               ${st['all']:.2f}")
+    if st["core"] > cfg.budget:
+        print(f"  !! THE PLAN IS OVER THE SESSION BUDGET by ${st['core'] - cfg.budget:.2f}")
+    elif total > cfg.budget:
+        print(f"  note: buying every optional stage would pass the session budget by "
+              f"${total - cfg.budget:.2f}")
     if any(not r.measured and "UNMEASURED" in r.basis for r in rows):
-        print("  !! rows marked UNMEASURED are placeholders; the smoke measures them and `project` "
-              "re-renders this table before any arm is trained")
+        print("  !! rows marked UNMEASURED are placeholders; `project` re-renders this table")
     return {"rows": [{"stage": r.stage, "seconds": round(r.seconds), "dollars":
                       round(r.dollars(cfg.price), 2), "basis": r.basis} for r in rows],
             "total_hours": round(hours, 2), "total_dollars": round(total, 2),
-            "price_per_hour": cfg.price, "budget": cfg.budget, "within_budget": total <= cfg.budget,
-            "l1_only_dollars": round(staged["l1_only"], 2),
-            "incremental_dollars": {"L2-L4": round(staged["hints"], 2),
-                                    "control": round(staged["control"], 2)}}
+            "price_per_hour": cfg.price, "budget": cfg.budget,
+            "within_budget": st["core"] <= cfg.budget,
+            "gate_only_dollars": round(st["gate_only"], 2),
+            "core_dollars": round(st["core"], 2),
+            "incremental_dollars": {"sample2": round(st["sample2"], 2),
+                                    "L2-L4": round(st["hints"], 2),
+                                    "control": round(st["control"], 2)}}
 
 
 def show_step(step: P.Step) -> None:
@@ -238,8 +319,11 @@ def dry_run(cfg: P.Config, events: list[dict]) -> None:
     steps, rows = make_plan(cfg, events)
     print_table(cfg, rows)
     print(f"\n## evaluation protocol: every model, base included, under --agent bash "
-          f"(the SmolDataEnvs-sft format the arms are trained in); base also under --agent program "
-          f"as a one-turn control. Chat template kwargs {P.CHAT_KWARGS} everywhere.")
+          f"(the SmolDataEnvs-sft format the arms are trained in, --bash-stop model); base also "
+          f"under --agent program as a one-turn control. Chat template kwargs {P.CHAT_KWARGS} "
+          f"everywhere. Models: {', '.join(P.eval_arms(cfg))} on ports "
+          f"{', '.join(str(P.port_for(cfg, a)) for a in P.eval_arms(cfg))}; "
+          f"{cfg.workers} workers per model.")
     print("\n## the whole session, in order. Nothing below is executed by this command.")
     phase = ""
     for step in steps:
@@ -429,31 +513,18 @@ def parse_measurements(data: dict) -> dict:
             "checks_ok": data.get("checks_ok"), "resume_ok": (data.get("resume") or {}).get("ok")}
 
 
-def parse_probe_serve(text: str) -> dict:
-    out: dict = {}
-    m = re.search(r"READY_AFTER_S=(\d+(?:\.\d+)?)", text)
-    if m:
-        out["probe_start_s"] = float(m.group(1))
-    m = re.search(r"TOOL_CALLS_OK=([01])", text)
-    if m:
-        out["tool_calls_ok"] = m.group(1) == "1"
-    m = re.search(r"ADAPTER_DIFFERS_FROM_BASE=([01])", text)
-    if m:
-        out["adapter_differs"] = m.group(1) == "1"
-    for key, name in (("adapter_target_agreement", "ADAPTER_TARGET_AGREEMENT"),
-                      ("base_target_agreement", "BASE_TARGET_AGREEMENT")):
-        m = re.search(name + r"=([0-9.]+)", text)
-        if m:
-            out[key] = float(m.group(1))
-    return out
+ADAPTER_CHECK = re.compile(r"^ADAPTER_CHECK model=(\S+) differs=([01]) tool_calls_ok=([01])", re.M)
+MERGE_OK = re.compile(r"^MERGE_OK model=(\S+) modules_applied=(\d+) tensors_changed=(\d+)", re.M)
 
 
-def seconds_per_trial(output: str, wall_seconds: float, models: int = 1) -> float | None:
-    """Wall seconds per trial of ONE model at the probe's worker count and concurrency, from the
-    harness's own progress lines. With `models` harnesses running at once the lines of all of them
-    are counted, so each model's trial count is the total divided by `models`."""
-    n = len(TRIAL_LINE.findall(output))
-    return wall_seconds / (n / models) if n else None
+def parse_serve(text: str) -> dict:
+    """What serve.sh printed about each adapter it served: the merge report's verdict, whether a
+    parsed `bash` tool call came back, whether its temperature-0 output differs from the base's."""
+    checks = {m.group(1): {"differs": m.group(2) == "1", "tool_calls_ok": m.group(3) == "1"}
+              for m in ADAPTER_CHECK.finditer(text)}
+    merges = {m.group(1): {"modules_applied": int(m.group(2)), "tensors_changed": int(m.group(3))}
+              for m in MERGE_OK.finditer(text)}
+    return {"adapter_checks": checks, "merge_checks": merges}
 
 
 def go_no_go(cfg: P.Config, events: list[dict], now: float) -> tuple[bool, list[str], dict]:
@@ -466,15 +537,14 @@ def go_no_go(cfg: P.Config, events: list[dict], now: float) -> tuple[bool, list[
     rem_dollars = P.total_dollars(remaining, cfg.price)
     reasons = []
     for label, val in (("ROCm/stack checklist", meas.checks_ok), ("kill-and-resume", meas.resume_ok),
-                       ("LoRA serving + tool calls", meas.tool_calls_ok),
-                       ("adapter output differs from the base's on a training prompt",
-                        meas.adapter_differs)):
+                       ("released adapter: tool calls through the served stack", meas.tool_calls_ok),
+                       ("released adapter's output differs from the base's on a training prompt",
+                        meas.adapter_differs),
+                       ("the gate (released adapter vs base through the harness)", meas.gate_go)):
         if val is not True:
             reasons.append(f"{label}: {'FAILED' if val is False else 'not measured'}")
     if not meas.tokens_per_s:
         reasons.append("training throughput not measured")
-    if not meas.sec_per_trial:
-        reasons.append("evaluation seconds-per-trial not measured")
     if spent.session + rem_dollars > cfg.budget:
         reasons.append(f"projected session ${spent.session + rem_dollars:.2f} "
                        f"(${spent.session:.2f} spent + ${rem_dollars:.2f} to come) exceeds the "
@@ -509,7 +579,7 @@ def cmd_project(cfg: P.Config, events: list[dict]) -> bool:
 
 # ── phases ────────────────────────────────────────────────────────────────────────
 
-CAPTURED = ("probe-eval", "probe-serve", "smoke-checks")   # output parsed for measurements
+CAPTURED = ("gate-serve", "serve", "smoke-checks")   # output parsed for measurements
 
 
 class SyncUnverified(SystemExit):
@@ -555,16 +625,176 @@ def shielded_signals():
             signal.signal(s, handler)
 
 
-def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
-              new_session: bool = False) -> None:
+RUNS_ROOT = REPO_ROOT / "data" / "runs"
+
+
+def progress_log(cfg: P.Config, step: P.Step) -> Path:
+    return Path(cfg.local_logs) / f"progress-{step.name}.log"
+
+
+def record_serve(cfg: P.Config, out: str, gate: bool) -> None:
+    """Ledger what serve.sh reported about each adapter, stamped with this droplet. The evaluation
+    refuses to start unless the latest record covers every adapter it will evaluate; the gate's
+    own record carries the released adapter's tool-call and differs-from-base verdicts."""
+    ledger = Path(cfg.ledger)
+    found = parse_serve(out)
+    extra: dict = {}
+    adapter = P.served_name(P.GATE_ARM)
+    if gate and adapter in found["adapter_checks"]:
+        extra = {"tool_calls_ok": found["adapter_checks"][adapter]["tool_calls_ok"],
+                 "adapter_differs": found["adapter_checks"][adapter]["differs"]}
+    L.append(ledger, L.MEASURED, serve_gate=gate, **found, **extra, **stamp(cfg, L.read(ledger)))
+
+
+def eval_blockers(cfg: P.Config, events: list[dict]) -> list[str]:
+    """Why the evaluation must not start (empty = it may). Wires the guards into the plan: a
+    passed gate on THIS droplet, and a serve step whose merge reports and adapter checks cover
+    every adapter that is about to be evaluated."""
+    key = measure_key(cfg, events)
+    why = []
+    if P.measured_from_ledger(events, key).gate_go is not True:
+        why.append("no gate GO on record for this droplet (run `driver.py smoke`, or `gate` and "
+                   "`gate-decide`): evaluating before the stack is proven is how session 1 wasted "
+                   "its money")
+    serve = None
+    for e in reversed(events):
+        if e.get("event") == L.MEASURED and "adapter_checks" in e and not e.get("serve_gate") \
+                and (e.get("droplet_id"), e.get("hardware")) == tuple(key):
+            serve = e
+            break
+    if serve is None:
+        why.append("no `serve` on record for this droplet (it merges, checks and starts every model)")
+    else:
+        for arm in P.served_adapters(cfg):
+            name = P.served_name(arm)
+            if name not in serve.get("merge_checks", {}):
+                why.append(f"{name}: no passing merge report on record")
+            check = serve.get("adapter_checks", {}).get(name)
+            if not check:
+                why.append(f"{name}: no adapter check on record")
+            elif not check.get("differs"):
+                why.append(f"{name}: its temperature-0 output is IDENTICAL to the base's (the "
+                           "adapter is not applied)")
+            elif not check.get("tool_calls_ok"):
+                why.append(f"{name}: no parsed bash tool call came back")
+    return why
+
+
+def restart_servers(cfg: P.Config, serve_step: P.Step, runner=None, tunnel=None) -> bool:
+    """Bring the servers back after a stall: the same serve step (it stops everything, waits for
+    the GPU memory to be released, and retries a failed engine start once), then the tunnel."""
+    runner = runner or run_cmd
+    tunnel = tunnel or ensure_tunnel
+    code, out = runner(serve_step.cmds[0], cfg.host, capture=True,
+                       timeout=P.step_timeout(serve_step))
+    record_serve(cfg, out, gate=serve_step.name == "gate-serve")
+    return code == 0 and tunnel(cfg) == 0
+
+
+def run_supervised(cfg: P.Config, step: P.Step, steps: list[P.Step], *, sup_cls=None,
+                   runs_root: Path | None = None, launch=None, restart=None, sleep=None,
+                   clock=None, probe=None) -> int:
+    """An evaluation step under the supervisor (see ops/amd/supervise.py). Everything injectable
+    is a parameter so a test drives it without a process, a socket or a sleep."""
+    ledger = Path(cfg.ledger)
+    serve_name = "gate-serve" if step.name == "gate-eval" else "serve"
+    serve_step = next(s for s in steps if s.name == serve_name)
+    log_path = progress_log(cfg, step)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(line: str) -> None:
+        print(line, flush=True)
+        with log_path.open("a") as fh:
+            fh.write(line + "\n")
+
+    def start(retry: bool) -> list:
+        procs = []
+        for cmd in step.cmds:
+            c = P.with_retry_failed(cmd) if retry else cmd
+            print("  $ " + c.shell() + " &", flush=True)
+            procs.append(SUP.Proc(list(c.argv), child_env(dict(c.env))))
+        return procs
+
+    extra = {k: v for k, v in (("sleep", sleep), ("clock", clock), ("probe", probe)) if v}
+    sup = (sup_cls or SUP.Supervisor)(
+        name=step.name, targets=[SUP.Target.from_cmd(c.argv, c.env) for c in step.cmds],
+        results_root=runs_root or RUNS_ROOT, launch=launch or start,
+        restart_servers=restart or (lambda: restart_servers(cfg, serve_step)), log=log,
+        accrued=lambda: L.spend(L.read(ledger), time.time(), cfg.price).session,
+        stall_s=cfg.stall_minutes * 60.0, window=cfg.error_window, error_share=cfg.error_share,
+        **extra)
+    outcome = sup.run()
+    if outcome.code == 0 and step.name == "gate-eval":
+        L.append(ledger, L.MEASURED, trials_per_min=round(sup.final_rate, 2),
+                 **stamp(cfg, L.read(ledger)))
+    if outcome.code != 0:
+        print(f"\n!! {outcome.message}", flush=True)
+        L.append(ledger, L.NOTE, text=outcome.message)
+    return outcome.code
+
+
+def gate_task_ids(cfg: P.Config, runs_root: Path) -> list[str]:
+    """The fixed subset the gate ran: recorded when the gate's evaluation finished, so a decision
+    re-read after the full L1 run (same run tags, 250 tasks) still judges the same 60."""
+    f = Path(cfg.local_logs) / "gate_tasks.json"
+    if f.exists():
+        return json.loads(f.read_text())
+    return G.task_ids_present(runs_root, [P.run_tag(cfg, a) for a in P.gate_arms(cfg)], cfg.split)
+
+
+def record_gate_tasks(cfg: P.Config, runs_root: Path) -> list[str]:
+    ids = G.task_ids_present(runs_root, [P.run_tag(cfg, a) for a in P.gate_arms(cfg)], cfg.split)
+    f = Path(cfg.local_logs) / "gate_tasks.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(ids))
+    return ids
+
+
+def cmd_gate_decide(cfg: P.Config, runs_root: Path | None = None) -> bool:
+    """Read the gate's results and the serve checks, print the report, record the verdict."""
+    root = runs_root or RUNS_ROOT
+    ledger = Path(cfg.ledger)
+    events = L.read(ledger)
+    key = measure_key(cfg, events)
+    meas = P.measured_from_ledger(events, key)
+    ids = gate_task_ids(cfg, root)
+    adapter = P.GATE_ARM
+    name = P.served_name(adapter)
+    merge_ok = None
+    for e in reversed(events):
+        if e.get("event") == L.MEASURED and e.get("serve_gate") \
+                and (e.get("droplet_id"), e.get("hardware")) == tuple(key):
+            merge_ok = name in e.get("merge_checks", {})
+            break
+    base = G.stats_for("base", G.read_results(root, P.run_tag(cfg, "base"), cfg.split), ids)
+    other = G.stats_for(adapter, G.read_results(root, P.run_tag(cfg, adapter), cfg.split), ids)
+    dec = G.decide(base, other, adapter_name=adapter, differs=meas.adapter_differs,
+                   tool_calls_ok=meas.tool_calls_ok, merge_ok=merge_ok, margin=cfg.gate_margin,
+                   max_failures=cfg.gate_max_failures, accepted=cfg.accept_gate)
+    print("\n".join(dec.lines))
+    L.append(ledger, L.MEASURED, gate_go=dec.go, gate_accepted=dec.accepted,
+             gate_reasons=dec.hard_failures, **stamp(cfg, L.read(ledger)))
+    return dec.go
+
+
+def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str | tuple = "",
+              new_session: bool = False, names: tuple = ()) -> None:
     ledger = Path(cfg.ledger)
     Path(cfg.local_logs).mkdir(parents=True, exist_ok=True)
+    phases = (only,) if isinstance(only, str) and only else tuple(only or ())
     for step in steps:
-        if only and step.phase != only:
+        if phases and step.phase not in phases:
+            continue
+        if names and step.name not in names:
             continue
         events = L.read(ledger)
         with_host(cfg, events)
         show_step(step)
+        if step.phase == "eval":
+            blockers = eval_blockers(cfg, events)
+            if blockers:
+                raise SystemExit("\nSTOPPING BEFORE the evaluation. Nothing was started:\n  - "
+                                 + "\n  - ".join(blockers))
         gate(cfg, step)
         L.append(ledger, L.STEP_START, step=step.name, projected_seconds=step.seconds)
         t0 = time.time()
@@ -581,12 +811,18 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
             code, out = run_cmd(step.cmds[0], cfg.host, timeout=P.step_timeout(step))
         elif step.name == "go-no-go":
             code = 0 if cmd_project(cfg, L.read(ledger)) else 3
+        elif step.name == "gate-decide":
+            code = 0 if cmd_gate_decide(cfg) else 3
         elif step.name == "verify-sync":
             code = 0 if verify_sync(cfg, ran=ran_steps(L.read(ledger))) else 1
-        elif step.name in ("tunnel", "probe-tunnel"):
+        elif step.name in ("tunnel", "gate-tunnel"):
             code = ensure_tunnel(cfg)
         elif step.name == "tunnel-down":
             code = subprocess.call(list(step.cmds[0].argv), env=child_env()) and 0
+        elif step.phase == "eval" or step.name == "gate-eval":
+            code = run_supervised(cfg, step, steps)
+            if step.name == "gate-eval" and code == 0:
+                record_gate_tasks(cfg, RUNS_ROOT)
         elif len(step.cmds) > 1:
             code, out = run_parallel(step.cmds, cfg.host, capture=step.name in CAPTURED,
                                      timeout=P.step_timeout(step))
@@ -602,13 +838,8 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
         if step.name == "smoke-pull" and code == 0:
             data = json.loads(Path(cfg.local_logs, "measurements.json").read_text())
             L.append(ledger, L.MEASURED, **parse_measurements(data), **stamp(cfg, L.read(ledger)))
-        if step.name == "probe-serve":
-            L.append(ledger, L.MEASURED, **parse_probe_serve(out), **stamp(cfg, L.read(ledger)))
-        if step.name == "probe-eval" and code == 0:
-            spt = seconds_per_trial(out, wall, models=len(step.cmds))
-            if spt:
-                L.append(ledger, L.MEASURED, sec_per_trial=round(spt, 2), probe_wall_s=round(wall, 1),
-                         probe_models=len(step.cmds), **stamp(cfg, L.read(ledger)))
+        if step.name in ("gate-serve", "serve"):
+            record_serve(cfg, out, gate=step.name == "gate-serve")
         if code != 0 and step.name == "verify-sync":
             raise SyncUnverified("verify-sync FAILED: something that matters is not safely off "
                                  "the droplet (the FAIL lines above say what).")
@@ -700,26 +931,36 @@ def go(cfg: P.Config, steps: list[P.Step], api, now=time.time) -> int:
 
 
 SSH_WAIT_S = 600.0
+SSH_PROBE_TIMEOUT_S = 60.0
+
+
+def ssh_is_ready(cfg: P.Config, code: int, out: str) -> bool:
+    """The command really ran: it exited 0 AND printed the exact line only a finished shell makes.
+    A first-boot droplet answers sshd and prints "Please wait while we get your droplet ready..."
+    while running nothing, so an exit status alone proves nothing."""
+    return code == 0 and f"{P.READY_PREFIX}{cfg.user}" in (ln.strip() for ln in out.splitlines())
 
 
 def wait_for_ssh(cfg: P.Config, runner=None, sleep=time.sleep, clock=time.monotonic,
                  limit: float = SSH_WAIT_S, interval: float = 10.0) -> int:
-    """A droplet is `active` in the API before sshd takes logins, so the first scp would fail on a
-    perfectly healthy machine. Poll a trivial command until it works, up to `limit` seconds."""
+    """A droplet is `active` in the API before it runs commands (sshd answers first, then the
+    image's first-boot setup holds every command for minutes). Poll `echo READY_$(whoami)` until
+    its exact output returns, up to `limit` seconds, each try bounded by a timeout."""
     runner = runner or run_cmd
-    cmd = P.ssh(cfg, ["true"])
+    cmd = P.ssh_ready(cfg)
     start = clock()
     attempt = 0
     while True:
         attempt += 1
-        code, _ = runner(cmd, cfg.host, timeout=30.0)
-        if code == 0:
-            print(f"  sshd answered on attempt {attempt}")
+        code, out = runner(cmd, cfg.host, capture=True, timeout=SSH_PROBE_TIMEOUT_S)
+        if ssh_is_ready(cfg, code, out):
+            print(f"  the droplet runs commands (attempt {attempt})")
             return 0
         if clock() - start >= limit:
-            print(f"  sshd did not answer within {limit:.0f}s ({attempt} attempts)")
+            print(f"  the droplet did not run a command within {limit:.0f}s ({attempt} attempts)")
             return 1
-        print(f"  sshd not ready (attempt {attempt}); retrying in {interval:.0f}s")
+        print(f"  not ready (attempt {attempt}: exit {code}, no {P.READY_PREFIX}{cfg.user} line); "
+              f"retrying in {interval:.0f}s")
         sleep(interval)
 
 
@@ -768,16 +1009,17 @@ def sha_check(root: Path, sums_name: str = "SHA256SUMS.artifacts") -> list[str]:
 
 EVAL_STAGES = {
     "L1": ("eval-L1",),
+    "sample2": ("eval-sample2",),
     "hints": ("eval-L2", "eval-L3", "eval-L4"),
     "control": ("eval-control",),
-    "rest": ("eval-L2", "eval-L3", "eval-L4", "eval-control"),
-    "all": ("eval-L1", "eval-L2", "eval-L3", "eval-L4", "eval-control"),
+    "rest": ("eval-sample2", "eval-L2", "eval-L3", "eval-L4", "eval-control"),
+    "all": ("eval-L1", "eval-sample2", "eval-L2", "eval-L3", "eval-L4", "eval-control"),
 }
 
 
 def select_eval(steps: list[P.Step], stage: str) -> list[P.Step]:
-    """The plan with only the requested evaluation stage's steps in the eval phase. `L1` runs the
-    four models at L1 and stops: the reviewer reads those numbers, then buys `hints` or not."""
+    """The plan with only the requested evaluation stage's steps in the eval phase. `L1` runs every
+    model at L1 and stops: the reviewer reads those numbers, then buys more or not."""
     keep = set(EVAL_STAGES[stage])
     chosen = [s for s in steps if s.phase != "eval" or s.name in keep]
     if not any(s.phase == "eval" for s in chosen):
@@ -801,11 +1043,13 @@ TRIAL_FLOOR = 0.9     # a run tag must hold at least this fraction of the trials
 
 
 def trial_files(root: Path, tag: str, split: str, rung: str) -> int:
+    """Result files the harness ran to the end (agent_status "exit 0"). A file that records a
+    harness failure is not a trial: a tag of 250 timeouts must not pass for a finished sweep."""
     base = root / tag / split
     if not base.exists():
         return 0
-    return (len(list(base.glob(f"*/{rung}/result.json")))
-            + len(list(base.glob(f"*/{rung}/s*/result.json"))))
+    files = list(base.glob(f"*/{rung}/result.json")) + list(base.glob(f"*/{rung}/s*/result.json"))
+    return sum(not SUP.is_failure(f) for f in files)
 
 
 def required_trials(cfg: P.Config, ran: set[str] | None = None) -> dict[str, tuple[str, int, int]]:
@@ -816,6 +1060,8 @@ def required_trials(cfg: P.Config, ran: set[str] | None = None) -> dict[str, tup
     it was told not to run)."""
     rung = "L1" if "L1" in cfg.rungs else cfg.rungs[0]
     n = cfg.samples if rung == "L1" else cfg.late_samples
+    if rung == "L1" and ran is not None and "eval-sample2" in ran:
+        n = max(n, 2)
     out: dict[str, tuple[str, int, int]] = {}
     if ran is None or f"eval-{rung}" in ran:
         for arm in P.eval_arms(cfg):
@@ -833,9 +1079,10 @@ def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
     1. every adapter is readable on the Hub (`hub_files(repo)` lists a repo's files; injected so a
        test needs no network),
     2. the droplet's own checksum list matches the copies pulled to logs/amd/,
-    3. every run tag that was evaluated holds at least 90% of the trials it was asked for in the
-       laptop's results tree (the laptop wrote them directly). A tag with one result file is a
-       sweep that died, not a result.
+    3. every run tag that was evaluated holds at least 90% of the trials it was asked for, as CLEAN
+       results (harness failures do not count), in the laptop's results tree (the laptop wrote
+       them directly). A tag with one result file is a sweep that died, not a result. The
+       released adapter's tag is checked like the others; only trained arms have a Hub repo.
     """
     ok = True
     ns = namespace
@@ -860,10 +1107,43 @@ def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
     for tag, (rung, expected, minimum) in required_trials(cfg, ran).items():
         n = trial_files(root, tag, cfg.split, rung)
         good = n >= minimum
-        print(f"  {'PASS' if good else 'FAIL'}  run tag {tag}: {n} {rung} result files "
+        print(f"  {'PASS' if good else 'FAIL'}  run tag {tag}: {n} clean {rung} result files "
               f"(expected {expected}, need at least {minimum} = {TRIAL_FLOOR:.0%})")
         ok &= good
     return ok
+
+
+AGENT_FALLBACK = "/run/user/{uid}/keyring/ssh"
+
+
+def ensure_ssh_agent(environ=None, uid: int | None = None, exists=os.path.exists) -> tuple[str, str]:
+    """Make sure ssh can reach an agent. `SSH_AUTH_SOCK` from the environment if it names a socket
+    that exists; otherwise the desktop keyring's /run/user/<uid>/keyring/ssh if that exists (a
+    re-login leaves a shell started before it holding a socket that is gone, and every ssh then
+    asks for a key it cannot find). Exports the one chosen so every child process inherits it.
+    Returns (socket, where it came from); ("", "none") if neither exists."""
+    environ = os.environ if environ is None else environ
+    uid = os.getuid() if uid is None else uid
+    sock = environ.get("SSH_AUTH_SOCK", "")
+    if sock and exists(sock):
+        return sock, "SSH_AUTH_SOCK from the environment"
+    fallback = AGENT_FALLBACK.format(uid=uid)
+    if exists(fallback):
+        environ["SSH_AUTH_SOCK"] = fallback
+        why = "the environment's socket is gone" if sock else "SSH_AUTH_SOCK is not set"
+        return fallback, f"fallback: {why}"
+    return "", "none: no SSH_AUTH_SOCK and no keyring socket (ssh will rely on --identity)"
+
+
+def agent_key_state(runner=subprocess.run) -> str:
+    """Whether the agent holds a key, from `ssh-add -l` (0 keys listed, 1 none, 2 unreachable)."""
+    try:
+        proc = runner(["ssh-add", "-l"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "could not run ssh-add"
+    if proc.returncode == 0:
+        return f"{len(proc.stdout.splitlines())} key(s) loaded"
+    return "agent reachable but NO key loaded" if proc.returncode == 1 else "agent unreachable"
 
 
 def cmd_status(cfg: P.Config, events: list[dict], api) -> None:
@@ -879,10 +1159,11 @@ def cmd_status(cfg: P.Config, events: list[dict], api) -> None:
         except SystemExit as exc:
             print(f"  API check failed: {exc}")
     s = L.summarise(events, now, cfg.price)
-    print_status(cfg, s, now)
+    sock, source = ensure_ssh_agent()
+    print_status(cfg, s, now, agent=f"{sock or '-'} ({source}); {agent_key_state()}")
 
 
-def print_status(cfg: P.Config, s: dict, now: float) -> None:
+def print_status(cfg: P.Config, s: dict, now: float, agent: str = "") -> None:
     """Everything the reviewer needs to decide whether to continue, from the ledger alone."""
     cap = P.effective_total_cap(cfg.total_cap)
     print("## status")
@@ -899,7 +1180,11 @@ def print_status(cfg: P.Config, s: dict, now: float) -> None:
                                     total_cap=cfg.total_cap)
     print(f"  deadman    {'HEARTBEAT FRESH' if fresh else 'NO LIVE DEADMAN'}: {why}")
     if not fresh:
+        print("             a laptop re-login kills the dead-man process: if you logged in again "
+              "since starting it, it is gone and the heartbeat above is stale")
         print(f"             start it:  {deadman_command(cfg)}")
+    if agent:
+        print(f"  ssh agent  {agent}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -907,9 +1192,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    names = ["dry-run", "plan", "preflight", "create", "bootstrap", "smoke", "project", "train",
-             "serve", "tunnel", "eval", "sync", "destroy", "go", "status", "verify-sync",
-             "note-prior-spend"]
+    names = ["dry-run", "plan", "preflight", "create", "bootstrap", "smoke", "gate", "gate-decide",
+             "project", "train", "serve", "tunnel", "eval", "sync", "destroy", "go", "status",
+             "verify-sync", "note-prior-spend"]
     for n in names:
         p = sub.add_parser(n)
         add_common(p)
@@ -919,16 +1204,18 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--new-session", action="store_true",
                            help="reset the session budget (default: only the first create does)")
         if n in ("eval", "go"):
-            p.add_argument("--stage", choices=list(EVAL_STAGES), default="all",
-                           help="evaluation stage: L1 = the four models at L1 only, then stop (look "
-                                "at it, then decide); hints = L2-L4; control = the one-turn "
-                                "control; rest = hints + control; all = everything (default)")
+            p.add_argument("--stage", choices=list(EVAL_STAGES), default="L1",
+                           help="evaluation stage: L1 (default) = every model at L1, one sample, "
+                                "then stop (look at it, then decide); sample2 = the second L1 "
+                                "sample; hints = L2-L4; control = the one-turn control; rest = "
+                                "sample2 + hints + control; all = everything")
         if n == "tunnel":
             p.add_argument("action", nargs="?", default="up", choices=["up", "down"])
         if n == "note-prior-spend":
             p.add_argument("dollars", type=float)
     args = ap.parse_args(argv)
     os.chdir(REPO_ROOT)
+    ensure_ssh_agent()
     if not os.environ.get("AMD_OFFLINE"):   # the tests set it: no .env, so no token, so no network
         load_dotenv(REPO_ROOT / ".env")
     cfg = build_config(args)
@@ -968,13 +1255,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if cmd_project(cfg, events) else 3
     if c == "verify-sync":
         return 0 if verify_sync(cfg, ran=ran_steps(events)) else 1
+    if c == "gate-decide":
+        # Free: reads the gate's result files. The only way past a gate whose rate did not clear
+        # the margin is this command with --accept-gate; the project step then re-renders the plan.
+        if not cmd_gate_decide(cfg):
+            return 3
+        return 0 if cmd_project(cfg, L.read(Path(cfg.ledger))) else 3
 
     steps, _ = make_plan(cfg, events)
     if c in ("eval", "go"):
         steps = select_eval(steps, args.stage)
-    phases = {"create": ["create"], "bootstrap": ["bootstrap"], "smoke": ["smoke"],
-              "train": ["train"], "serve": ["serve"], "eval": ["eval"], "sync": ["sync"],
-              "destroy": ["destroy"], "tunnel": ["tunnel"]}
+    phases = {"create": ("create",), "bootstrap": ("bootstrap",), "smoke": ("smoke", "gate"),
+              "gate": ("gate",), "train": ("train",), "serve": ("serve",), "eval": ("eval",),
+              "sync": ("sync",), "destroy": ("destroy",), "tunnel": ("tunnel",)}
 
     if c == "create":
         if not args.yes:
@@ -1003,7 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
                          "anything is trained, and a GO from an earlier droplet does not carry over.")
     if c == "go":
         return go(cfg, steps, client())
-    run_steps(cfg, steps, None, only=phases[c][0])
+    run_steps(cfg, steps, None, only=phases[c])
     return 0
 
 
