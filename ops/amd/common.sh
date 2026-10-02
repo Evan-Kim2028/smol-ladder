@@ -28,6 +28,7 @@ AMD_BASE_MODEL="${AMD_BASE_MODEL:-Qwen/Qwen3.5-2B}"
 # Everything that downloads a model passes the revision; override only on purpose.
 AMD_BASE_REVISION="${AMD_BASE_REVISION:-15852e8c16360a2fea060d615a32b45270f8a8fc}"        # Qwen/Qwen3.5-2B
 AMD_HUB_R_REVISION="${AMD_HUB_R_REVISION:-19e64721085d859f9f93e85e0400c12097bfbfef}"      # AdithyaSK/smoldataenvs-sft-2b-v0
+export AMD_BASE_REVISION AMD_HUB_R_REVISION   # container_setup.sh reads the base revision from the environment
 AMD_MAX_LENGTH="${AMD_MAX_LENGTH:-8192}"
 AMD_SEED="${AMD_SEED:-42}"
 # The training stack, EXACTLY as session 1 ran it (logs/amd/droplet-logs/versions.log; datasets from the
