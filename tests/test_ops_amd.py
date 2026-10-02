@@ -87,6 +87,7 @@ class FakeApi:
         self.droplet_polls = 0
         self.vanish_after_delete = True
         self.deleted = False
+        self.account_extra: list[dict] = []     # droplets on the account that are not ours
 
     def get(self, path):
         self.calls.append(("GET", path, None))
@@ -99,7 +100,12 @@ class FakeApi:
         if path.startswith("/droplets?tag_name"):
             return 200, {"droplets": [] if (self.deleted and self.vanish_after_delete)
                          else list(self.tagged)}
+        if path.startswith("/droplets?per_page"):
+            mine = [] if (self.deleted and self.vanish_after_delete) else list(self.tagged)
+            return 200, {"droplets": mine + list(self.account_extra)}
         if path.startswith("/droplets/"):
+            if self.deleted and self.vanish_after_delete:
+                return 404, {"id": "not_found"}
             self.droplet_polls += 1
             status = "new" if self.droplet_polls < 3 else "active"
             nets = {"v4": [{"type": "public", "ip_address": "198.51.100.7"}]} \
@@ -1124,7 +1130,8 @@ def test_tick_destroys_by_tag_verifies_with_a_get_and_logs_to_the_ledger(tmp_pat
                      dry_run=False, sleep=lambda s: None)
     assert d.destroy
     assert mutations(api) == [("DELETE", "/droplets?tag_name=smol-ladder", None)]
-    assert api.calls[-1][1].startswith("/droplets?tag_name=smol-ladder")        # follow-up GET
+    after = api.calls[api.calls.index(("DELETE", "/droplets?tag_name=smol-ladder", None)) + 1:]
+    assert any(c[0] == "GET" and c[1].startswith("/droplets?tag_name=smol-ladder") for c in after)
     events = L.read(led)
     assert L.open_interval(events) is None
     assert any(e["event"] == L.NOTE and "deadman destroyed" in e.get("text", "") for e in events)
@@ -1223,6 +1230,7 @@ def test_recreating_after_a_reclaim_is_the_same_session_so_the_spend_still_count
     ev = L.read(led)
     assert [e["event"] for e in ev].count(L.SESSION) == 1
     assert L.spend(ev, T0 + 2 * HOUR).session == pytest.approx(2.46)          # the first hour still counts
+    L.append(led, L.DESTROYED, now=T0 + 2.5 * HOUR)
     cloud.create(FakeApi(), cfg(), led, sleep=lambda s: None, now=lambda: T0 + 3 * HOUR, new_session=True)
     assert [e["event"] for e in L.read(led)].count(L.SESSION) == 2
 
@@ -2018,3 +2026,180 @@ def test_the_deadman_command_in_the_refusal_is_detached_and_priced_for_the_hardw
     cmd = driver.deadman_command(c)
     assert cmd.startswith("setsid nohup python ops/amd/deadman.py") and "--price 3.8" in cmd
     assert "< /dev/null &" in cmd and f"--ledger {c.ledger}" in cmd
+
+
+# ═══ create: an answer that does not say whether the droplet exists ═════════════════
+
+class AmbiguousApi(FakeApi):
+    """POST answers `post_status` with no droplet; the tag listing shows one only after
+    `appears_after` listings (None = never)."""
+
+    def __init__(self, post_status, appears_after=None, **kw):
+        super().__init__(**kw)
+        self.post_status, self.appears_after, self.listings = post_status, appears_after, 0
+
+    def post(self, path, body):
+        self.calls.append(("POST", path, body))
+        return self.post_status, {"error": "gateway timeout"}
+
+    def get(self, path):
+        if path.startswith("/droplets?tag_name"):
+            self.calls.append(("GET", path, None))
+            self.listings += 1
+            if self.appears_after is not None and self.listings > self.appears_after:
+                return 200, {"droplets": [{"id": 42, "name": "smol-ladder", "status": "new"}]}
+            return 200, {"droplets": []}
+        return super().get(path)
+
+
+@pytest.mark.parametrize("status", [0, 429, 500, 502, 503, 504, 408])
+def test_an_ambiguous_create_never_closes_the_ledger_interval(tmp_path, status):
+    api, led = AmbiguousApi(status), tmp_path / "l.jsonl"
+    with pytest.raises(SystemExit) as exc:
+        cloud.create(api, cfg(), led, sleep=lambda s: None, now=lambda: T0)
+    assert "UNKNOWN" in str(exc.value) and "Do NOT create again" in str(exc.value)
+    ev = L.read(led)
+    assert L.open_interval(ev) is not None and not any(e["event"] in L.CLOSING for e in ev)
+    assert L.spend(ev, T0 + HOUR).open                    # still counted by every guard
+
+
+def test_an_ambiguous_create_polls_the_tag_listing_for_about_90_seconds(tmp_path):
+    api, naps = AmbiguousApi(0), []
+    with pytest.raises(SystemExit):
+        cloud.create(api, cfg(), tmp_path / "l.jsonl", sleep=naps.append, now=lambda: T0)
+    assert 85 <= sum(naps) <= 100 and api.listings >= 18
+
+
+def test_an_ambiguous_create_that_landed_is_adopted_and_carried_on(tmp_path):
+    api, led = AmbiguousApi(504, appears_after=3), tmp_path / "l.jsonl"
+    info = cloud.create(api, cfg(), led, sleep=lambda s: None, now=lambda: T0)
+    assert info["droplet_id"] == 42 and info["ip"]
+    created = [e for e in L.read(led) if e["event"] == L.CREATED]
+    assert created[-1]["droplet_id"] == 42
+    assert len([c for c in api.calls if c[0] == "POST"]) == 1        # it did not POST twice
+
+
+def test_a_listing_that_fails_during_resolution_does_not_resolve_anything(tmp_path):
+    class Flaky(AmbiguousApi):
+        def get(self, path):
+            if path.startswith("/droplets?tag_name") and self.listings >= 1:
+                self.listings += 1
+                return 500, {}
+            return super().get(path)
+    api, led = Flaky(0), tmp_path / "l.jsonl"
+    with pytest.raises(SystemExit) as exc:
+        cloud.create(api, cfg(), led, sleep=lambda s: None, now=lambda: T0)
+    assert "listing errors" in str(exc.value) and L.open_interval(L.read(led)) is not None
+
+
+def test_a_re_create_is_refused_while_the_previous_one_is_unresolved(tmp_path):
+    led = tmp_path / "l.jsonl"
+    with pytest.raises(SystemExit):
+        cloud.create(AmbiguousApi(0), cfg(), led, sleep=lambda s: None, now=lambda: T0)
+    api = FakeApi()
+    with pytest.raises(SystemExit) as exc:
+        cloud.create(api, cfg(), led, sleep=lambda s: None, now=lambda: T0 + 200)
+    assert "open interval" in str(exc.value) and mutations(api) == []
+
+
+def test_never_two_droplets_create_refuses_when_one_is_already_tagged(tmp_path):
+    api = FakeApi(tagged=[droplet()])
+    with pytest.raises(SystemExit) as exc:
+        cloud.create(api, cfg(), tmp_path / "l.jsonl", sleep=lambda s: None, now=lambda: T0)
+    assert "Never two droplets" in str(exc.value) and mutations(api) == []
+    assert not (tmp_path / "l.jsonl").exists()
+
+
+def test_create_refuses_when_it_cannot_list_the_tag(tmp_path):
+    class Blind(FakeApi):
+        def get(self, path):
+            return (0, {"error": "network"}) if path.startswith("/droplets?tag_name") else super().get(path)
+    api = Blind()
+    with pytest.raises(SystemExit):
+        cloud.create(api, cfg(), tmp_path / "l.jsonl", sleep=lambda s: None, now=lambda: T0)
+    assert mutations(api) == []
+
+
+def test_a_pending_create_is_not_written_off_by_reconcile_for_ten_minutes(tmp_path):
+    led = ledger_with(tmp_path, (L.CREATED, T0, {"price_per_hour": 2.46, "droplet_id": None,
+                                                "pending": True}))
+    assert cloud.reconcile([], led, T0 + 300) is False
+    assert cloud.reconcile([], led, T0 + 601) is True
+
+
+# ═══ destroy: verified three ways ═══════════════════════════════════════════════════
+
+def recorded(tmp_path, *ids):
+    events = [(L.CREATED, T0, {"price_per_hour": 2.46, "droplet_id": i}) for i in ids[:1]]
+    return ledger_with(tmp_path, *events)
+
+
+def test_destroy_gets_every_droplet_id_the_ledger_recorded_and_expects_404(tmp_path):
+    api = FakeApi(tagged=[droplet()])
+    led = recorded(tmp_path, 42)
+    assert cloud.destroy(api, "smol-ladder", led, sleep=lambda s: None, now=lambda: T0 + HOUR)
+    assert ("GET", "/droplets/42", None) in api.calls
+    assert L.read(led)[-1]["checked_ids"] == [42]
+
+
+def test_a_droplet_that_lost_its_tag_but_still_answers_200_is_deleted_by_id_and_not_verified_yet(tmp_path):
+    class Untagged(FakeApi):
+        """The tag listing is empty (the tag is gone) but id 42 still exists until deleted by id."""
+        def get(self, path):
+            if path.startswith("/droplets?tag_name"):
+                self.calls.append(("GET", path, None)); return 200, {"droplets": []}
+            if path == "/droplets/42":
+                self.calls.append(("GET", path, None))
+                return (404, {}) if ("DELETE", "/droplets/42", None) in self.calls else (200, {"droplet": {"id": 42}})
+            return super().get(path)
+    api, led = Untagged(), recorded(tmp_path, 42)
+    assert cloud.destroy(api, "smol-ladder", led, sleep=lambda s: None, now=lambda: T0 + HOUR)
+    assert ("DELETE", "/droplets/42", None) in api.calls
+
+
+def test_destroy_is_unverified_while_a_recorded_id_still_answers(tmp_path):
+    class Stuck(FakeApi):
+        def get(self, path):
+            if path.startswith("/droplets?tag_name"):
+                return 200, {"droplets": []}
+            if path == "/droplets/42":
+                return 200, {"droplet": {"id": 42}}
+            return super().get(path)
+    led = recorded(tmp_path, 42)
+    assert cloud.destroy(Stuck(), "smol-ladder", led, sleep=lambda s: None, checks=3,
+                         now=lambda: T0) is False
+    assert L.open_interval(L.read(led)) is not None
+
+
+def test_a_5xx_on_the_id_check_is_not_a_verification(tmp_path):
+    class Flaky(FakeApi):
+        def get(self, path):
+            return (503, {}) if path == "/droplets/42" else super().get(path)
+    led = recorded(tmp_path, 42)
+    assert cloud.destroy(Flaky(tagged=[]), "smol-ladder", led, sleep=lambda s: None, checks=2,
+                         now=lambda: T0) is False
+
+
+def test_an_untagged_gpu_droplet_that_is_not_ours_is_reported_loudly_and_never_deleted(tmp_path, capsys):
+    api = FakeApi(tagged=[droplet()])
+    api.account_extra = [{"id": 999, "name": "someone-elses", "size_slug": "gpu-mi300x1-192gb",
+                          "status": "active", "tags": []},
+                         {"id": 998, "name": "web", "size_slug": "s-1vcpu-1gb", "status": "active"}]
+    led = recorded(tmp_path, 42)
+    assert cloud.destroy(api, "smol-ladder", led, sleep=lambda s: None, now=lambda: T0 + HOUR)
+    out = capsys.readouterr().out
+    assert "UNTAGGED GPU DROPLET" in out and "999" in out and "NOT touched" in out
+    assert [c for c in mutations(api)] == [("DELETE", "/droplets?tag_name=smol-ladder", None)]
+    note = next(e for e in L.read(led) if "UNEXPECTED" in e.get("text", ""))
+    assert {d["id"] for d in note["droplets"]} == {999, 998}
+    assert L.read(led)[-1]["event"] == L.DESTROYED
+
+
+def test_a_failed_account_listing_is_reported_but_does_not_undo_a_verified_destroy(tmp_path, capsys):
+    class NoAudit(FakeApi):
+        def get(self, path):
+            return (500, {}) if path.startswith("/droplets?per_page") else super().get(path)
+    led = recorded(tmp_path, 42)
+    assert cloud.destroy(NoAudit(tagged=[droplet()]), "smol-ladder", led, sleep=lambda s: None,
+                         now=lambda: T0 + HOUR)
+    assert "could not audit" in capsys.readouterr().out

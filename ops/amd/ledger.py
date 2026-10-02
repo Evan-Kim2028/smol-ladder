@@ -127,6 +127,12 @@ def open_interval(events: list[dict]) -> dict | None:
     return live
 
 
+def droplet_ids(events: list[dict]) -> set:
+    """Every droplet id this ledger ever recorded: what a destroy must see answer 404."""
+    return {e["droplet_id"] for e in events
+            if e.get("event") in (CREATED, READY) and e.get("droplet_id") is not None}
+
+
 def session_start(events: list[dict]) -> float:
     starts = [float(e["ts"]) for e in events if e.get("event") == SESSION]
     return starts[-1] if starts else 0.0
