@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +84,20 @@ def effective_total_cap(cap: float) -> float:
 
 
 ARMS = ("A", "B", "AB")           # trained in this session
+# One suffix on every Hub repo this session writes. Session 1's repos (smol-ladder-sft-{a,b,ab})
+# hold invalid adapters and must never be reused. common.sh's amd_hub_name has the same names.
+DEFAULT_SESSION = "s2"
+HUB_BASE_NAMES = {"A": "smol-ladder-sft-a", "B": "smol-ladder-sft-b", "AB": "smol-ladder-sft-ab",
+                  "artifacts": "smol-ladder-runs"}
+
+
+def session() -> str:
+    return os.environ.get("AMD_SESSION") or DEFAULT_SESSION
+
+
+def hub_name(key: str, sess: str | None = None) -> str:
+    """The Hub repo name (without namespace) of an arm ("A", "B", "AB") or of the logs dataset."""
+    return f"{HUB_BASE_NAMES[key]}-{sess or session()}"
 BASE_MODEL = "Qwen/Qwen3.5-2B"
 VLLM_MIN = "0.16.2"
 SERVE_PORT = 8000

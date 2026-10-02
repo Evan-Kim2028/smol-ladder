@@ -50,11 +50,11 @@ amd_log "finished arms copied: ${FINISHED[*]:-none}; checksums in $AMD_REMOTE_LO
 
 if (( PUSH )); then
   "$PY" "$AMD_REMOTE_ROOT/ops/amd/push_artifacts.py" \
-    --repo "$AMD_HUB_NAMESPACE/$AMD_HUB_ARTIFACTS" --log-dir "$AMD_REMOTE_LOG" \
+    --repo "$AMD_HUB_NAMESPACE/$(amd_hub_name artifacts)" --log-dir "$AMD_REMOTE_LOG" \
     || amd_log "WARNING: the log push failed; re-run before destroying"
   if (( ${#FINISHED[@]} )); then
     REPOS=()
-    for arm in "${FINISHED[@]}"; do REPOS+=("$(amd_arm_hub_repo "$arm")"); done
+    for arm in "${FINISHED[@]}"; do REPOS+=("$(amd_arm_hub_repo "$arm")=$(amd_arm_dir "$arm")/adapter_model.safetensors"); done
     "$PY" "$AMD_REMOTE_ROOT/ops/amd/push_artifacts.py" --verify "${REPOS[@]}" \
       || { amd_log "FAIL: an adapter is not readable on the Hub; do NOT destroy yet"; exit 1; }
   fi

@@ -119,22 +119,7 @@ while :; do
   amd_wait_gpu_room "$AMD_GPU_FREE_MIN"
 done
 
-# ── finish: prove the adapter is whole, mark it, push it ─────────────────────────
-"$PY" - "$OUT" "$HUB_REPO" <<'PYFIN'
-import sys
-from pathlib import Path
-from huggingface_hub import HfApi
-from ops.amd.resume import ADAPTER, DONE, HUB_DONE, safetensors_ok
-
-out, repo = Path(sys.argv[1]), sys.argv[2]
-assert (out / "adapter_config.json").exists() and safetensors_ok(out / ADAPTER), "adapter missing or truncated"
-(out / DONE).write_text("done\n")
-api = HfApi()
-api.upload_file(path_or_fileobj=str(out / ADAPTER), path_in_repo=ADAPTER, repo_id=repo)
-api.upload_file(path_or_fileobj=str(out / "adapter_config.json"), path_in_repo="adapter_config.json", repo_id=repo)
-# Last, and only after both files: the marker that says THIS is the final adapter and not an
-# intermediate checkpoint the trainer pushed. A fresh droplet skips the arm on seeing it.
-api.upload_file(path_or_fileobj=b"done\n", path_in_repo=HUB_DONE, repo_id=repo)
-print("final adapter pushed to", repo)
-PYFIN
+# ── finish: prove the adapter is whole, push it, verify the upload, then mark it ─
+# `.done` is written LAST, only after the Hub's copy was read back and matched (resume.finalize).
+"$PY" -m ops.amd.resume finalize --out "$OUT" --repo "$HUB_REPO"
 amd_log "arm $ARM done: adapter at $OUT, log $LOG"

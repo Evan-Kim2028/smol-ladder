@@ -142,6 +142,30 @@ def status(out: Path, repo: str = "", hub=None) -> dict:
     return {"state": "fresh", "step": None, "pruned": pruned}
 
 
+def finalize(out: Path, repo: str, api) -> None:
+    """Prove the adapter is whole, put it on the Hub, VERIFY the upload, and only then mark it done.
+
+    The marker order is the point. `.done` used to be written first, so a crash (or a failed
+    upload) between the marker and the Hub left an arm that every later step treated as finished
+    with its only copy on a disk that is about to vanish. Now: adapter files up, the Hub's sha256 of
+    the adapter compared with the local file's, `final.done` (carrying that sha256) up, and the
+    local `.done` last. `api` is an HfApi (a stub in the tests)."""
+    from ops.amd.merge_adapter import sha256_file
+    adapter, config = out / ADAPTER, out / "adapter_config.json"
+    if not (config.exists() and safetensors_ok(adapter)):
+        raise SystemExit(f"{out}: adapter missing or truncated; not uploading, not marking done")
+    local = sha256_file(adapter)
+    api.upload_file(path_or_fileobj=str(adapter), path_in_repo=ADAPTER, repo_id=repo)
+    api.upload_file(path_or_fileobj=str(config), path_in_repo="adapter_config.json", repo_id=repo)
+    remote = api.get_paths_info(repo, [ADAPTER], repo_type="model")[0].lfs.sha256
+    if remote != local:
+        raise SystemExit(f"the Hub's {ADAPTER} in {repo} does not match the local file (sha256 "
+                         f"{remote} vs {local}): not marking {out} done")
+    api.upload_file(path_or_fileobj=f"{local}\n".encode(), path_in_repo=HUB_DONE, repo_id=repo)
+    (out / DONE).write_text("done\n")
+    print("final adapter pushed and verified:", repo)
+
+
 def verdict(killed_at: int, log_text: str) -> dict:
     """Did the second run resume from the checkpoint the first one left, and not from zero?
     `train/sft_lora.py` prints `resuming from <path>/checkpoint-<step>` when it does."""
@@ -179,6 +203,9 @@ def main() -> int:
     s = sub.add_parser("status")
     s.add_argument("--out", required=True, type=Path)
     s.add_argument("--repo", default="")
+    f = sub.add_parser("finalize")
+    f.add_argument("--out", required=True, type=Path)
+    f.add_argument("--repo", required=True)
     v = sub.add_parser("verdict")
     v.add_argument("--killed-at", type=int, required=True)
     v.add_argument("--log", required=True, type=Path)
@@ -187,6 +214,10 @@ def main() -> int:
     if args.cmd == "status":
         res = status(args.out, args.repo, RealHub() if args.repo else None)
         print(json.dumps(res))
+        return 0
+    if args.cmd == "finalize":
+        from huggingface_hub import HfApi
+        finalize(args.out, args.repo, HfApi())
         return 0
     res = verdict(args.killed_at, args.log.read_text(errors="replace"))
     if args.out:

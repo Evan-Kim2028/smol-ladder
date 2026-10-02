@@ -34,10 +34,24 @@ AMD_EFFECTIVE_BATCH="${AMD_EFFECTIVE_BATCH:-8}"
 
 # ── the Hub: the only copy of anything that outlives the droplet ─────────────────
 AMD_HUB_NAMESPACE="${AMD_HUB_NAMESPACE:-}"
-AMD_HUB_ADAPTER_A="${AMD_HUB_ADAPTER_A:-smol-ladder-sft-a}"
-AMD_HUB_ADAPTER_B="${AMD_HUB_ADAPTER_B:-smol-ladder-sft-b}"
-AMD_HUB_ADAPTER_AB="${AMD_HUB_ADAPTER_AB:-smol-ladder-sft-ab}"
-AMD_HUB_ARTIFACTS="${AMD_HUB_ARTIFACTS:-smol-ladder-runs}"
+# Every Hub repo this session writes carries ONE suffix. Session 1's repos
+# (smol-ladder-sft-{a,b,ab}) hold INVALID adapters; reusing those names would let a stale adapter
+# pass for a trained one, so session 2's are smol-ladder-sft-a-s2 and so on. plan.py has the same
+# names (hub_name) and stage.py writes AMD_SESSION into remote.env so both sides agree; a test keeps
+# the two in step. Change the variable, never the names.
+AMD_SESSION="${AMD_SESSION:-s2}"
+export AMD_SESSION
+# amd_hub_name <A|B|AB|artifacts>: the repo name (without the namespace), from AMD_SESSION at call time
+# (remote.env is loaded after this file is sourced).
+amd_hub_name() {
+  case "$1" in
+    A)         printf 'smol-ladder-sft-a-%s\n' "$AMD_SESSION" ;;
+    B)         printf 'smol-ladder-sft-b-%s\n' "$AMD_SESSION" ;;
+    AB)        printf 'smol-ladder-sft-ab-%s\n' "$AMD_SESSION" ;;
+    artifacts) printf 'smol-ladder-runs-%s\n' "$AMD_SESSION" ;;
+    *) amd_die "unknown hub name '$1'" ;;
+  esac
+}
 
 # ── serving ──────────────────────────────────────────────────────────────────────
 # One vLLM process per model, each serving a MERGED checkpoint (LoRA serving does not work for this
@@ -94,10 +108,8 @@ amd_arm_dir() { printf '%s/runs/sft_%s\n' "$AMD_REMOTE_ROOT" "$(amd_lower "$1")"
 amd_arm_hub_repo() {
   local ns="${AMD_HUB_NAMESPACE:?AMD_HUB_NAMESPACE is not set (remote.env)}"
   case "$1" in
-    A)  printf '%s/%s\n' "$ns" "$AMD_HUB_ADAPTER_A" ;;
-    B)  printf '%s/%s\n' "$ns" "$AMD_HUB_ADAPTER_B" ;;
-    AB) printf '%s/%s\n' "$ns" "$AMD_HUB_ADAPTER_AB" ;;
-    *)  amd_die "unknown arm '$1' (want A, B or AB)" ;;
+    A|B|AB) printf '%s/%s\n' "$ns" "$(amd_hub_name "$1")" ;;
+    *)      amd_die "unknown arm '$1' (want A, B or AB)" ;;
   esac
 }
 

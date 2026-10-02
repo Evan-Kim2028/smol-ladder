@@ -80,12 +80,11 @@ login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
 api = HfApi()
 ns = os.environ["AMD_HUB_NAMESPACE"]
 print("HF user", api.whoami()["name"])
-for name in (os.environ.get("AMD_HUB_ADAPTER_A", "smol-ladder-sft-a"),
-             os.environ.get("AMD_HUB_ADAPTER_B", "smol-ladder-sft-b"),
-             os.environ.get("AMD_HUB_ADAPTER_AB", "smol-ladder-sft-ab")):
+session = os.environ.get("AMD_SESSION", "s2")      # common.sh's amd_hub_name, ops/amd/plan.py's hub_name
+for name in (f"smol-ladder-sft-a-{session}", f"smol-ladder-sft-b-{session}", f"smol-ladder-sft-ab-{session}"):
     api.create_repo(f"{ns}/{name}", repo_type="model", private=True, exist_ok=True)
     assert api.model_info(f"{ns}/{name}").private, f"{ns}/{name} is not private"
-ds = f"{ns}/{os.environ.get('AMD_HUB_ARTIFACTS', 'smol-ladder-runs')}"
+ds = f"{ns}/smol-ladder-runs-{session}"
 api.create_repo(ds, repo_type="dataset", private=True, exist_ok=True)
 # exist_ok=True leaves a PRE-EXISTING repo as it was, public or not: assert, as for the models.
 assert api.dataset_info(ds).private, f"{ds} is not private"

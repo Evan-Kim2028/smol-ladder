@@ -74,7 +74,7 @@ check "adapter Hub repos are private" "$PY" -c "
 import os
 from huggingface_hub import HfApi
 ns = os.environ['AMD_HUB_NAMESPACE']
-for n in ('$AMD_HUB_ADAPTER_A', '$AMD_HUB_ADAPTER_B', '$AMD_HUB_ADAPTER_AB'):
+for n in ('$(amd_hub_name A)', '$(amd_hub_name B)', '$(amd_hub_name AB)'):
     assert HfApi().model_info(f'{ns}/{n}').private"
 if (( CRITICAL_FAILS > 0 )); then
   amd_log "checklist FAILED ($CRITICAL_FAILS): stopping before any GPU time is spent on the benchmark"

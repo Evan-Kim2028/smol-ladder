@@ -35,6 +35,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from ops.amd import plan as P  # noqa: E402
 from ops.amd.doapi import load_dotenv  # noqa: E402
 
 REQUIRED_IN_COMMIT = ("train/sft_lora.py", "train/format.py", "smol_ladder/upstream.py",
@@ -219,7 +220,7 @@ def resolve_namespace(explicit: str = "") -> str:
                          f"up from HF_TOKEN ({exc})")
 
 
-def write_remote_env(out: Path, namespace: str) -> None:
+def write_remote_env(out: Path, namespace: str, session: str = "") -> None:
     token = os.environ.get("HF_TOKEN", "")
     if not token:
         raise SystemExit("HF_TOKEN is not set (repo .env). Without it nothing can be pushed, and "
@@ -227,7 +228,8 @@ def write_remote_env(out: Path, namespace: str) -> None:
     path = out / "remote.env"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
-        fh.write(f"HF_TOKEN={token}\nAMD_HUB_NAMESPACE={namespace}\n")
+        fh.write(f"HF_TOKEN={token}\nAMD_HUB_NAMESPACE={namespace}\n"
+                 f"AMD_SESSION={session or P.session()}\n")
     os.chmod(path, 0o600)
 
 

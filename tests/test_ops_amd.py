@@ -1033,6 +1033,7 @@ def fake_trainer(tmp_path):
     stub.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         case "$*" in
+          *"ops.amd.resume finalize"*) echo x >> "{rec}.finalize" ;;
           *ops.amd.resume*) echo x >> "{rec}.status"
                             echo "{{\\"state\\": \\"${{STUB_STATE:-fresh}}\\", \\"step\\": null}}" ;;
           *mem_get_info*) echo "${{STUB_FREE:-0.97}}" ;;
@@ -1064,7 +1065,7 @@ def test_run_sft_trains_arm_a_from_the_export_directory_with_resume_and_a_privat
     root = fake_trainer[0]["AMD_REMOTE_ROOT"]
     assert argv[:2] == ["-m", "ops.amd.sft_run"]
     assert argv[argv.index("--data") + 1] == f"{root}/data/train/sft_upstream"
-    assert argv[argv.index("--hub-model-id") + 1] == "ns/smol-ladder-sft-a" and "--resume" in argv
+    assert argv[argv.index("--hub-model-id") + 1] == "ns/smol-ladder-sft-a-s2" and "--resume" in argv
     assert argv[argv.index("--protocol") + 1] == "bash" and argv[argv.index("--precision") + 1] == "bf16"
     assert argv[argv.index("--max-length") + 1] == "8192"
 
@@ -1086,7 +1087,7 @@ def test_run_sft_without_a_measurement_still_never_trains_at_batch_one_and_keeps
 def test_run_sft_arm_b_trains_on_the_single_file(fake_trainer):
     argv = run_sft(fake_trainer, "--arm", "B")
     assert argv[argv.index("--data") + 1].endswith("data/train/ja3_sft_v2.jsonl")
-    assert argv[argv.index("--hub-model-id") + 1] == "ns/smol-ladder-sft-b"
+    assert argv[argv.index("--hub-model-id") + 1] == "ns/smol-ladder-sft-b-s2"
 
 
 def test_run_sft_arm_ab_is_the_concatenation_of_a_and_b_with_a_val_set(fake_trainer):
@@ -1614,15 +1615,26 @@ def make_runs(root: Path, tags, n=2):
             (d / "result.json").write_text(json.dumps({"agent_status": "exit 0", "reward": 1.0}))
 
 
+FINAL_FILES = ["adapter_config.json", "adapter_model.safetensors", "final.done"]
+
+
+def local_final_adapters(logs: Path) -> str:
+    """Final adapters for A, B and AB under logs/adapters (all the same bytes); returns their sha256."""
+    for arm in ("A", "B", "AB"):
+        (logs / "adapters" / arm).mkdir(parents=True, exist_ok=True)
+        write_safetensors(logs / "adapters" / arm / "adapter_model.safetensors")
+    return stage.sha256_file(logs / "adapters" / "A" / "adapter_model.safetensors")
+
+
 def test_verify_sync_passes_when_adapters_checksums_and_runs_are_all_present(tmp_path, capsys):
     c = cfg(local_logs=str(tmp_path / "logs"), limit=2, samples=1)
-    (tmp_path / "logs" / "adapters" / "A").mkdir(parents=True)
+    sha = local_final_adapters(tmp_path / "logs")
     f = tmp_path / "logs" / "adapters" / "A" / "adapter_model.safetensors"
-    f.write_bytes(b"abc")
     (tmp_path / "logs" / "SHA256SUMS.artifacts").write_text(f"{stage.sha256_file(f)}  adapters/A/adapter_model.safetensors\n")
     make_runs(tmp_path / "runs", P.expected_trials(c))
-    hub = lambda repo: ["adapter_config.json", "adapter_model.safetensors"]  # noqa: E731
-    assert driver.verify_sync(c, hub_files=hub, runs_root=tmp_path / "runs", namespace="ns") is True
+    hub = lambda repo: FINAL_FILES  # noqa: E731
+    assert driver.verify_sync(c, hub_files=hub, hub_sha256=lambda r, n: sha, runs_root=tmp_path / "runs",
+                              namespace="ns") is True
 
 
 def test_verify_sync_fails_if_an_adapter_is_not_readable_on_the_hub(tmp_path):
@@ -1630,7 +1642,7 @@ def test_verify_sync_fails_if_an_adapter_is_not_readable_on_the_hub(tmp_path):
     (tmp_path / "logs").mkdir()
     (tmp_path / "logs" / "SHA256SUMS.artifacts").write_text("")
     make_runs(tmp_path / "runs", P.expected_trials(c))
-    assert driver.verify_sync(c, hub_files=lambda r: [], runs_root=tmp_path / "runs",
+    assert driver.verify_sync(c, hub_files=lambda r: [], hub_sha256=lambda r, n: "", runs_root=tmp_path / "runs",
                               namespace="ns") is False
 
 
@@ -1640,8 +1652,10 @@ def test_verify_sync_fails_on_a_checksum_mismatch_and_on_a_missing_run_tag(tmp_p
     (tmp_path / "logs" / "adapters" / "x").write_bytes(b"changed")
     (tmp_path / "logs" / "SHA256SUMS.artifacts").write_text("0" * 64 + "  adapters/x\n")
     assert driver.sha_check(tmp_path / "logs") == ["adapters/x"]
-    hub = lambda repo: ["adapter_config.json", "adapter_model.safetensors"]  # noqa: E731
-    assert driver.verify_sync(c, hub_files=hub, runs_root=tmp_path / "no-runs", namespace="ns") is False
+    hub = lambda repo: FINAL_FILES  # noqa: E731
+    sha = local_final_adapters(tmp_path / "logs")
+    assert driver.verify_sync(c, hub_files=hub, hub_sha256=lambda r, n: sha, runs_root=tmp_path / "no-runs",
+                              namespace="ns") is False
 
 
 # ═══ staging, everything before the droplet exists ══════════════════════════════════
@@ -2923,7 +2937,7 @@ def test_sync_back_still_pushes_the_logs_when_no_arm_has_finished(sync_env):
     out = run_sync(sync_env, "--push-hub", "--arms", "A,B")
     assert out.returncode == 0, out.stderr
     calls = rec.read_text()
-    assert "push_artifacts.py --repo ns/smol-ladder-runs" in calls and "--verify" not in calls
+    assert "push_artifacts.py --repo ns/smol-ladder-runs-s2" in calls and "--verify" not in calls
 
 
 def test_sync_back_copies_a_finished_arm_checksums_it_and_verifies_only_that_arm_on_the_hub(sync_env):
@@ -2937,7 +2951,8 @@ def test_sync_back_copies_a_finished_arm_checksums_it_and_verifies_only_that_arm
     sums = (log / "SHA256SUMS.artifacts").read_text()
     assert "adapters/A/adapter_model.safetensors" in sums and "adapters/B" not in sums
     verify = [l for l in rec.read_text().splitlines() if "--verify" in l]
-    assert verify == [f"{root}/ops/amd/push_artifacts.py --verify ns/smol-ladder-sft-a"]
+    assert verify == [f"{root}/ops/amd/push_artifacts.py --verify "
+                      f"ns/smol-ladder-sft-a-s2={root}/runs/sft_a/adapter_model.safetensors"]
 
 
 # ═══ bootstrap first contact ════════════════════════════════════════════════════════
@@ -3126,10 +3141,9 @@ def test_an_unreadable_hub_repo_never_skips_an_arm(tmp_path):
     assert resume.status(tmp_path / "d", "ns/sft-a", Broken(None, tmp_path))["state"] == "fresh"
 
 
-def test_the_final_marker_is_uploaded_last_by_run_sft():
+def test_run_sft_hands_the_finish_to_the_verified_finalize_step():
     text = (OPS / "run_sft.sh").read_text()
-    order = [text.index(s) for s in ('path_in_repo=ADAPTER', 'path_in_repo="adapter_config.json"', "path_in_repo=HUB_DONE")]
-    assert order == sorted(order)
+    assert "ops.amd.resume finalize" in text and "(out / DONE).write_text" not in text
 
 
 # ═══ verify-sync wants 90% of the trials, not one file ══════════════════════════════
@@ -3141,8 +3155,10 @@ def verified(tmp_path, n_files, limit=10, samples=1, ran=None, hub_ok=True):
     runs = tmp_path / "runs"
     for tag in P.expected_trials(c):
         make_runs(runs, [tag], n=n_files)
-    hub = (lambda r: ["adapter_config.json", "adapter_model.safetensors"]) if hub_ok else (lambda r: [])
-    return driver.verify_sync(c, hub_files=hub, runs_root=runs, namespace="ns", ran=ran)
+    sha = local_final_adapters(tmp_path / "logs")
+    hub = (lambda r: FINAL_FILES) if hub_ok else (lambda r: [])
+    return driver.verify_sync(c, hub_files=hub, hub_sha256=lambda r, n: sha, runs_root=runs, namespace="ns",
+                              ran=ran)
 
 
 def test_a_run_tag_with_a_single_result_no_longer_passes(tmp_path):
@@ -3189,8 +3205,10 @@ def test_a_harness_failure_is_not_a_trial_so_a_tag_of_timeouts_does_not_pass(tmp
     (tmp_path / "logs" / "SHA256SUMS.artifacts").write_text("")
     for tag in P.expected_trials(c):
         shutil.copytree(tmp_path / "runs" / "t", tmp_path / "runs" / tag)
-    hub = lambda r: ["adapter_config.json", "adapter_model.safetensors"]  # noqa: E731
-    assert driver.verify_sync(c, hub_files=hub, runs_root=tmp_path / "runs", namespace="ns") is False
+    hub = lambda r: FINAL_FILES  # noqa: E731
+    sha = local_final_adapters(tmp_path / "logs")
+    assert driver.verify_sync(c, hub_files=hub, hub_sha256=lambda r, n: sha, runs_root=tmp_path / "runs",
+                              namespace="ns") is False
 
 
 def test_verify_after_an_l1_only_evaluation_does_not_demand_the_control_or_hint_rungs(tmp_path):
@@ -4448,3 +4466,118 @@ def test_engines_are_started_in_order_and_the_next_one_waits_for_the_previous_re
     out = run_serve(serve_env, "--wait", "--arms", "A,B", "--hub", HUB_R)
     assert [t[0] for t in starts(serve_env)] == ["8000", "8001", "8002", "8004"]
     assert out.stdout.count("READY_AFTER_S=") == 4
+
+
+
+# ═══ H2: names carry the session; .done only after a verified upload; verify compares sha256 ═══
+
+class FinalApi:
+    """A stub of the HfApi calls `resume.finalize` makes. `corrupt` makes the Hub report another sha."""
+
+    def __init__(self, corrupt=False):
+        self.uploads, self.corrupt = [], corrupt
+
+    def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
+        self.uploads.append(path_in_repo)
+        if path_in_repo == resume.ADAPTER:
+            self.sha = stage.sha256_file(Path(path_or_fileobj))
+
+    def get_paths_info(self, repo, paths, repo_type="model"):
+        sha = "0" * 64 if self.corrupt else self.sha
+        return [type("F", (), {"lfs": type("L", (), {"sha256": sha})()})()]
+
+
+def finished_arm_dir(tmp_path) -> Path:
+    out = tmp_path / "sft_a"
+    out.mkdir()
+    write_safetensors(out / resume.ADAPTER)
+    (out / "adapter_config.json").write_text("{}")
+    return out
+
+
+def test_done_is_written_only_after_the_upload_was_verified_and_the_marker_goes_up_last(tmp_path):
+    out, api = finished_arm_dir(tmp_path), FinalApi()
+    resume.finalize(out, "ns/sft-a-s2", api)
+    assert api.uploads == [resume.ADAPTER, "adapter_config.json", resume.HUB_DONE]
+    assert (out / resume.DONE).exists()
+
+
+def test_a_hub_copy_that_does_not_match_leaves_no_done_and_no_final_marker(tmp_path):
+    out, api = finished_arm_dir(tmp_path), FinalApi(corrupt=True)
+    with pytest.raises(SystemExit, match="does not match"):
+        resume.finalize(out, "ns/sft-a-s2", api)
+    assert not (out / resume.DONE).exists() and resume.HUB_DONE not in api.uploads
+
+
+def test_a_truncated_adapter_is_never_uploaded_or_marked_done(tmp_path):
+    out, api = finished_arm_dir(tmp_path), FinalApi()
+    write_safetensors(out / resume.ADAPTER, truncate=4)
+    with pytest.raises(SystemExit):
+        resume.finalize(out, "ns/sft-a-s2", api)
+    assert api.uploads == [] and not (out / resume.DONE).exists()
+
+
+def test_hub_repo_names_carry_the_session_and_are_the_same_in_python_and_shell(tmp_path):
+    assert [P.hub_name(k) for k in ("A", "B", "AB", "artifacts")] == [
+        "smol-ladder-sft-a-s2", "smol-ladder-sft-b-s2", "smol-ladder-sft-ab-s2", "smol-ladder-runs-s2"]
+    for session in ("s2", "s3"):
+        sh = subprocess.run(["bash", "-c", f'source "{OPS}/common.sh"; for k in A B AB artifacts; do amd_hub_name $k; done'],
+                            env={**os.environ, "AMD_SESSION": session}, capture_output=True, text=True)
+        assert sh.stdout.split() == [P.hub_name(k, session) for k in ("A", "B", "AB", "artifacts")]
+    assert not any(n in (OPS / "common.sh").read_text() for n in ('AMD_HUB_ADAPTER_A="', 'AMD_HUB_ARTIFACTS="'))
+
+
+def test_the_session_variable_reaches_the_droplet_through_remote_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "t")
+    monkeypatch.setenv("AMD_SESSION", "s7")
+    stage.write_remote_env(tmp_path, "ns")
+    assert "AMD_SESSION=s7" in (tmp_path / "remote.env").read_text()
+    monkeypatch.delenv("AMD_SESSION")
+    stage.write_remote_env(tmp_path, "ns")
+    assert "AMD_SESSION=s2" in (tmp_path / "remote.env").read_text()
+
+
+def test_driver_and_setup_use_the_suffixed_names():
+    c = cfg()
+    assert driver.hub_repos(c, "ns")["A"] == "ns/smol-ladder-sft-a-s2"
+    setup = (OPS / "container_setup.sh").read_text()
+    assert "smol-ladder-sft-a-{session}" in setup and "smol-ladder-runs-{session}" in setup
+
+
+class VerifyApi:
+    def __init__(self, files, sha, final_sha=None):
+        self.files, self.sha, self.final_sha = files, sha, final_sha
+
+    def list_repo_files(self, repo): return list(self.files)
+
+    def get_paths_info(self, repo, paths, repo_type="model"):
+        return [type("F", (), {"lfs": type("L", (), {"sha256": self.sha})()})()]
+
+
+def test_push_artifacts_verify_needs_the_final_marker_and_the_local_adapters_sha(tmp_path):
+    from ops.amd import push_artifacts as PA
+    f = tmp_path / "adapter_model.safetensors"
+    write_safetensors(f)
+    sha = stage.sha256_file(f)
+    ok = VerifyApi(["adapter_config.json", "adapter_model.safetensors", resume.HUB_DONE], sha)
+    assert PA.verify(ok, {"ns/a": f}) == []
+    no_marker = VerifyApi(["adapter_config.json", "adapter_model.safetensors"], sha)
+    assert PA.verify(no_marker, {"ns/a": f}) == ["ns/a"]
+    stale = VerifyApi(["adapter_config.json", "adapter_model.safetensors", resume.HUB_DONE], "1" * 64)
+    assert PA.verify(stale, {"ns/a": f}) == ["ns/a"]
+
+
+def test_verify_sync_compares_the_hub_adapter_with_the_local_final_adapter(tmp_path):
+    c = cfg(local_logs=str(tmp_path / "logs"), limit=2, samples=1, arms=("A",))
+    f = tmp_path / "logs" / "adapters" / "A" / "adapter_model.safetensors"
+    f.parent.mkdir(parents=True)
+    write_safetensors(f)
+    (tmp_path / "logs" / "SHA256SUMS.artifacts").write_text(
+        f"{stage.sha256_file(f)}  adapters/A/adapter_model.safetensors\n")
+    make_runs(tmp_path / "runs", P.expected_trials(c))
+    files = ["adapter_config.json", "adapter_model.safetensors", resume.HUB_DONE]
+    good = lambda repo: files  # noqa: E731
+    kw = dict(runs_root=tmp_path / "runs", namespace="ns")
+    assert driver.verify_sync(c, hub_files=good, hub_sha256=lambda repo, name: stage.sha256_file(f), **kw) is True
+    assert driver.verify_sync(c, hub_files=good, hub_sha256=lambda repo, name: "2" * 64, **kw) is False
+    assert driver.verify_sync(c, hub_files=lambda r: files[:2], hub_sha256=lambda repo, name: stage.sha256_file(f), **kw) is False

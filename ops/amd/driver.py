@@ -1035,8 +1035,7 @@ def ran_steps(events: list[dict]) -> set[str]:
 
 
 def hub_repos(cfg: P.Config, namespace: str) -> dict[str, str]:
-    base = {"A": "smol-ladder-sft-a", "B": "smol-ladder-sft-b", "AB": "smol-ladder-sft-ab"}
-    return {a: f"{namespace}/{base[a]}" for a in P.ARMS if a in cfg.arms}
+    return {a: f"{namespace}/{P.hub_name(a)}" for a in P.ARMS if a in cfg.arms}
 
 
 TRIAL_FLOOR = 0.9     # a run tag must hold at least this fraction of the trials it was asked for
@@ -1073,11 +1072,15 @@ def required_trials(cfg: P.Config, ran: set[str] | None = None) -> dict[str, tup
 
 
 def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
-                namespace: str | None = None, ran: set[str] | None = None) -> bool:
+                namespace: str | None = None, ran: set[str] | None = None,
+                hub_sha256=None) -> bool:
     """After the sync, before the destroy: is everything that matters somewhere that is not the droplet?
 
-    1. every adapter is readable on the Hub (`hub_files(repo)` lists a repo's files; injected so a
-       test needs no network),
+    1. every adapter on the Hub is the FINAL one (the `final.done` marker is there) and is byte for
+       byte the adapter pulled to the laptop: `hub_sha256(repo, filename)` against the sha256 of
+       logs/amd/adapters/<arm>/adapter_model.safetensors (both injected, so a test needs no
+       network). Two files existing at the repo root proves nothing: a checkpoint's adapter, or a
+       previous session's invalid one, has the same names,
     2. the droplet's own checksum list matches the copies pulled to logs/amd/,
     3. every run tag that was evaluated holds at least 90% of the trials it was asked for, as CLEAN
        results (harness failures do not count), in the laptop's results tree (the laptop wrote
@@ -1090,15 +1093,28 @@ def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
         from huggingface_hub import HfApi
         from ops.amd.stage import resolve_namespace
         ns = ns or resolve_namespace()
-        hub_files = HfApi().list_repo_files
+        api = HfApi()
+        hub_files = api.list_repo_files
+        if hub_sha256 is None:
+            hub_sha256 = lambda repo, name: api.get_paths_info(repo, [name])[0].lfs.sha256  # noqa: E731
+    if hub_sha256 is None:
+        raise SystemExit("verify_sync needs hub_sha256 when hub_files is given")
+    from ops.amd.stage import sha256_file
     for arm, repo in hub_repos(cfg, ns or "<namespace>").items():
+        local = Path(cfg.local_logs) / "adapters" / arm / "adapter_model.safetensors"
         try:
             files = set(hub_files(repo))
+            have = {"adapter_config.json", "adapter_model.safetensors", "final.done"} <= files
+            remote = hub_sha256(repo, "adapter_model.safetensors") if have else ""
+            same = have and local.exists() and remote == sha256_file(local)
+            why = ("" if same else "the final.done marker or an adapter file is missing on the Hub" if not have
+                   else f"no local final adapter at {local}" if not local.exists()
+                   else "the Hub's adapter is NOT the local final adapter (sha256 differs)")
         except Exception as exc:  # noqa: BLE001 - any failure to read means "not verified"
-            files, _ = set(), print(f"  hub {repo}: {exc}")
-        good = {"adapter_config.json", "adapter_model.safetensors"} <= files
-        print(f"  {'PASS' if good else 'FAIL'}  adapter {arm} readable on the Hub ({repo})")
-        ok &= good
+            same, why = False, str(exc)
+        print(f"  {'PASS' if same else 'FAIL'}  adapter {arm} on the Hub is the final adapter ({repo})"
+              + ("" if same else f": {why}"))
+        ok &= same
     bad = sha_check(Path(cfg.local_logs))
     print(f"  {'PASS' if not bad else 'FAIL'}  droplet checksums match local copies"
           + (f": {bad}" if bad else ""))

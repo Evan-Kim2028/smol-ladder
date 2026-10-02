@@ -1,7 +1,7 @@
 """Push the droplet's logs and measurements to the private Hub dataset repo, and verify adapters.
 
-    python ops/amd/push_artifacts.py --repo ns/smol-ladder-runs --log-dir /var/log/smol-ladder
-    python ops/amd/push_artifacts.py --verify ns/smol-ladder-sft-a ns/smol-ladder-sft-b
+    python ops/amd/push_artifacts.py --repo ns/smol-ladder-runs-s2 --log-dir /var/log/smol-ladder
+    python ops/amd/push_artifacts.py --verify ns/smol-ladder-sft-a-s2=runs/sft_a/adapter_model.safetensors
 
 Runs on the teardown path, possibly while racing a shutdown, so it is written to be re-runnable: a
 file the Hub already has at the same size is skipped. Adapters and checkpoints do not go through
@@ -9,8 +9,8 @@ here: the trainer pushes those to each arm's own private model repo (hub_strateg
 and run_sft.sh pushes the final adapter, so this only carries what the trainer does not: logs,
 the smoke's measurements, the checksum list.
 
-`--verify` is the check that matters before a destroy: each named model repo must list both
-adapter files. A push that returned success but wrote nothing readable is invisible until the
+`--verify` is the check that matters before a destroy: each named model repo must hold the FINAL
+adapter (final.done marker, sha256 equal to the local file's), not merely two files named like it. A push that returned success but wrote nothing readable is invisible until the
 adapter is needed, which is on a droplet that no longer exists.
 """
 
@@ -53,15 +53,29 @@ def push(api, repo: str, log_dir: Path) -> int:
     return n
 
 
-def verify(api, repos: list[str]) -> list[str]:
-    """Repos that do NOT list both adapter files."""
+def sha256_of(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify(api, adapters: dict[str, Path]) -> list[str]:
+    """Repos whose Hub adapter is not THE final one: `adapters` maps repo -> the local final
+    adapter file. A repo passes only with both adapter files, the `final.done` marker (pushed last,
+    after a verified upload) and a root adapter whose sha256 equals the local file's. Two files
+    alone prove nothing: a checkpoint's adapter, or an earlier session's invalid one, has them too."""
     bad = []
-    for repo in repos:
+    for repo, local in adapters.items():
         try:
             files = set(api.list_repo_files(repo))
-        except Exception:  # noqa: BLE001
-            files = set()
-        if not {"adapter_config.json", "adapter_model.safetensors"} <= files:
+            ok = {"adapter_config.json", "adapter_model.safetensors", "final.done"} <= files
+            ok = ok and api.get_paths_info(repo, ["adapter_model.safetensors"])[0].lfs.sha256 == sha256_of(local)
+        except Exception:  # noqa: BLE001 - unreadable means unverified
+            ok = False
+        if not ok:
             bad.append(repo)
     return bad
 
@@ -71,15 +85,17 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", help="private dataset repo for logs")
     ap.add_argument("--log-dir", type=Path, default=Path("/var/log/smol-ladder"))
-    ap.add_argument("--verify", nargs="*", default=[], help="model repos that must hold an adapter")
+    ap.add_argument("--verify", nargs="*", default=[],
+                    help="REPO=LOCAL_ADAPTER_FILE pairs: each repo must hold that final adapter")
     args = ap.parse_args()
     from huggingface_hub import HfApi
     api = HfApi()
     if args.repo:
         print(f"uploaded {push(api, args.repo, args.log_dir)} log files to {args.repo}")
     if args.verify:
-        bad = verify(api, args.verify)
-        for repo in args.verify:
+        pairs = dict(spec.split("=", 1) for spec in args.verify)
+        bad = verify(api, {repo: Path(local) for repo, local in pairs.items()})
+        for repo in pairs:
             print(f"  {'FAIL' if repo in bad else 'PASS'}  adapter readable on the Hub: {repo}")
         return 1 if bad else 0
     return 0
