@@ -229,6 +229,9 @@ def ports(cfg: Config) -> list[int]:
 
 # ── ssh / scp ─────────────────────────────────────────────────────────────────────
 
+CONTAINER = "smol"          # common.sh's AMD_CONTAINER; a test keeps the two in step
+
+
 def ssh_opts(cfg: Config) -> list[str]:
     # Host keys are deliberately NOT remembered. The droplet is ephemeral and reached by the IP the
     # API just returned over TLS; providers reuse addresses, so a second session's droplet at an
@@ -255,7 +258,9 @@ def ssh(cfg: Config, remote: list[str]) -> Cmd:
 
 
 def remote_script(cfg: Config, script: str, *args: str) -> Cmd:
-    return ssh(cfg, ["bash", f"{cfg.remote_root}/ops/amd/{script}", *args])
+    # Every droplet step runs inside the long-lived container (entrypoint.sh starts it); the
+    # paths are bind-mounted identically. Secrets are read from remote_root/.env, never passed.
+    return ssh(cfg, ["docker", "exec", CONTAINER, "bash", f"{cfg.remote_root}/ops/amd/{script}", *args])
 
 
 def scp_up(cfg: Config) -> Cmd:
@@ -631,8 +636,8 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
                       "stage dir to the droplet (tens of MB)"))
     steps.append(Step("bootstrap", "bootstrap", "droplet", [ssh(cfg, [
         "bash", f"{cfg.remote_stage}/entrypoint.sh"])], secs("bootstrap") * 0.9,
-        "ONE non-interactive command: verify sums, unpack, venv over the image's torch, "
-        "training deps, HF login, model download, arm the watchdog"))
+        "ONE non-interactive command: verify sums, unpack, stop jupyter, start the `smol` container, "
+        "venv over the image's torch, training deps, HF login, model download, arm the watchdog"))
 
     steps.append(Step("smoke", "smoke-checks", "droplet", [remote_script(
         cfg, "smoke.sh", "--max-length", str(cfg.max_length),

@@ -114,7 +114,7 @@ def add_common(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--workers", type=int, default=12)
     g.add_argument("--no-base", action="store_true", help="skip the base-model control")
     g.add_argument("--no-program-control", action="store_true")
-    g.add_argument("--serve-mode", choices=["lora", "merged"], default="lora")
+    g.add_argument("--serve-mode", choices=["lora", "merged"], default="merged")
     g = ap.add_argument_group("where")
     g.add_argument("--host", default="", help="droplet IP (default: from the ledger)")
     g.add_argument("--identity", default="")

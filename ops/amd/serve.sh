@@ -25,6 +25,8 @@
 #   --host 127.0.0.1                         NOT 0.0.0.0: an unauthenticated model server on a
 #                                            public IP is an open GPU; the laptop reaches it
 #                                            through ssh -L
+# `--tokenizer` is always the base's: a merged model is saved by the training venv's transformers 5,
+# whose tokenizer files vLLM's transformers 4.x cannot read.
 # `HIP_VISIBLE_DEVICES`, not `CUDA_VISIBLE_DEVICES`, is the ROCm spelling, and one GPU needs neither.
 #
 # The server is started detached (setsid + nohup), so this script returns once it is up and the
@@ -117,7 +119,7 @@ fi
 start_server() { # start_server <port> <model path> <served name> <gpu util> [lora args...]
   local port="$1" model="$2" name="$3" util="$4"; shift 4
   setsid nohup "$SYSPY" -m vllm.entrypoints.openai.api_server \
-    --model "$model" --served-model-name "$name" --host 127.0.0.1 --port "$port" \
+    --model "$model" --tokenizer "$AMD_BASE_MODEL" --served-model-name "$name" --host 127.0.0.1 --port "$port" \
     --dtype bfloat16 --max-model-len "$AMD_MAX_MODEL_LEN" --gpu-memory-utilization "$util" \
     --enable-auto-tool-choice --tool-call-parser "$AMD_TOOL_PARSER" \
     --default-chat-template-kwargs '{"enable_thinking": false}' "$@" \

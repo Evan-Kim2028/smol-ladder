@@ -311,11 +311,23 @@ reason the probe server is stopped before training. Do not leave the droplet idl
 
 ## 8. vLLM image layout (an unknown that decides the first minutes)
 
-`entrypoint.sh` looks for a host python that imports both `torch` and `vllm`
-(`python3`, `/opt/venv`, `/opt/conda`, ...). AMD's older quick-start images ran their stack inside a
-docker container (`docker exec -it rocm bash`); if this one does, no host python has vLLM, the
-entrypoint prints the containers it can see, and stops. That costs about $0.7. The fix is the PyTorch
-image with the container, or `docker run` of the vLLM image with the mounts above.
+Measured on the live droplet: the host python has no torch or vLLM; they live in docker images
+(`rocm:latest`, `vllm/vllm-openai-rocm:v0.17.1`, same torch 2.9.1 / vllm 0.17.1 / transformers 4.57.6)
+and a `rocm` jupyter container holds the GPU. So `entrypoint.sh` (host) stops `rocm`, starts ONE
+long-lived container `smol` from the vLLM image (`--network host`, `/dev/kfd` + `/dev/dri`,
+`--ipc host`, `--restart no`, `sleep infinity`) with `/opt/smol-ladder`, the stage dir,
+`/var/log/smol-ladder` and an HF cache (`/var/cache/smol-hf`) mounted at the same paths, then runs
+`container_setup.sh` in it. Every plan step is `ssh ... docker exec smol bash .../<script>`; only the
+watchdog (poweroff, host `pgrep`) stays on the host and calls `sync_back.sh` through `docker exec`.
+Setup installs jq/procps with apt and a venv (`--system-site-packages`) holding transformers 5,
+trl and peft, all under a constraints file pinning the image's torch, torchvision, torchaudio,
+triton and vllm. The system transformers 4.57.6 cannot read Qwen3.5 and vLLM requires `<5`, hence
+the venv. Re-running `entrypoint.sh` is idempotent (a running `smol` on the right image is kept).
+
+Measured there: vLLM 0.17.1 with `--enable-lora` crashes at cuda-graph warmup for Qwen3.5
+(`IndexError` in `set_lora`), and with `--enforce-eager` fails to load a peft all-linear adapter
+(size mismatch on the fused linear-attention projections). So the default is `--serve-mode merged`
+(merge, then serve each model; probe tool calls verified). The 3-step LoRA smoke trained fine.
 
 ## 9. Teardown checklist
 
@@ -335,7 +347,7 @@ Ranked by how likely each is to fail on the real instance; none can be verified 
 
 1. **Where vLLM lives on the image** (host python vs a container). Fails at `bootstrap`, about $0.7.
 2. **LoRA serving for Qwen3.5 on vLLM 0.17.1** (a multimodal architecture with gated-delta-net
-   projections). The probe exercises it before any arm trains; the fallback is `--serve-mode merged`.
+   projections). The probe exercises it before any arm trains; `--serve-mode merged` is the default.
 3. **The training stack installing cleanly** over the image's torch: transformers >= 5.17, trl >= 1.13
    and peft >= 0.21 resolving against a `torch==2.10.0` constraint, and the `.pth` layering exposing the
    image's torch to the venv.

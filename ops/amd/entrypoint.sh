@@ -9,12 +9,12 @@
 #
 #   1. refuse early if this is not an AMD GPU image (/dev/kfd)
 #   2. verify the staged tarballs against SHA256SUMS, unpack code and both SFT sets
-#   3. find the image's python (the one that has torch AND vLLM) and check it sees the GPU
-#   4. a venv layered over it with ONLY the pure-python training deps; torch is never touched
-#   5. HF login, private Hub repos created, the base model downloaded once
-#   6. arm the on-droplet watchdog
+#   3. stop the image's jupyter container, start ONE long-lived container (`smol`) with the GPU
+#   4. container_setup.sh inside it (docker exec): jq/procps, a venv over the image's torch with
+#      the training deps (torch/vllm/triton pinned by constraint), HF login, private repos, model
+#   5. arm the on-droplet watchdog (host side: it needs poweroff)
 #
-# There is no clone and no GitHub: the code is the pinned commit's `git archive`. The `train`
+# torch and vLLM live in the image, not on the host python. There is no clone and no GitHub: the code is the pinned commit's `git archive`. The `train`
 # extra in pyproject.toml is NOT installed: it pins CUDA torch wheels and bitsandbytes, which on
 # this hardware would replace the image's ROCm torch with one that cannot see the GPU.
 
@@ -23,7 +23,6 @@ set -euo pipefail
 STAGE="${AMD_STAGE_DIR:-/var/tmp/smol-ladder-stage}"
 ROOT="${AMD_REMOTE_ROOT:-/opt/smol-ladder}"
 LOGDIR="${AMD_REMOTE_LOG:-/var/log/smol-ladder}"
-VENV="$ROOT/.venv"
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 export DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
@@ -57,91 +56,11 @@ amd_load_env "$ROOT/.env"
 [[ -n "${HF_TOKEN:-}" ]] || die "HF_TOKEN missing from remote.env: the Hub is the only copy that outlives the droplet"
 [[ -n "${AMD_HUB_NAMESPACE:-}" ]] || die "AMD_HUB_NAMESPACE missing from remote.env"
 
-# ── 1b. apt: only what is missing ────────────────────────────────────────────────
-MISSING=()
-for pkg in curl jq ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || MISSING+=("$pkg"); done
-if (( ${#MISSING[@]} )); then
-  log "apt-get install ${MISSING[*]}"
-  amd_apt update -qq && amd_apt install -y -qq "${MISSING[@]}"
-fi
+# ── 3. the container ─────────────────────────────────────────────────────────────
+amd_container_up
+amd_in_container bash "$ROOT/ops/amd/container_setup.sh"
 
-# ── 3. the image's python: the one that has torch AND vllm ───────────────────────
-SYSPY=""
-for cand in python3 python /opt/venv/bin/python /opt/conda/bin/python /usr/local/bin/python3 \
-            /root/venv/bin/python /opt/rocm/venv/bin/python; do
-  command -v "$cand" >/dev/null 2>&1 || continue
-  if "$cand" -c 'import torch, vllm' >/dev/null 2>&1; then SYSPY="$(command -v "$cand")"; break; fi
-done
-if [[ -z "$SYSPY" ]]; then
-  log "no host python imports both torch and vllm. Docker containers on this host:"
-  docker ps -a --format '  {{.Names}}  {{.Image}}  {{.Status}}' 2>&1 | head -5 >&2 || true
-  die "vLLM is not on the host python (it may live in a container). See docs/AMD_RUNBOOK.md, 'vLLM image layout'."
-fi
-printf '%s\n' "$SYSPY" > "$ROOT/.syspy"
-"$SYSPY" - <<'PYCHK' || die "the image's torch cannot see the GPU"
-import sys, torch, vllm
-from packaging.version import Version
-print("torch", torch.__version__, "hip", getattr(torch.version, "hip", None), "gpu", torch.cuda.is_available())
-print("vllm", vllm.__version__)
-if not torch.cuda.is_available():
-    sys.exit(1)
-print("device", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
-sys.exit(0 if Version(vllm.__version__) >= Version("0.16.2") else 2)
-PYCHK
-log "image python: $SYSPY"
-
-# ── 4. the training venv, layered over the image ─────────────────────────────────
-# A venv made from a venv python does not inherit the parent's packages, so the image's
-# site-packages are added by a .pth file instead. It comes AFTER the venv's own directory, so a
-# newer transformers/peft/trl in the venv wins and vLLM, which runs on the image python, is
-# never affected.
-if [[ ! -x "$VENV/bin/python" ]]; then
-  "$SYSPY" -m venv "$VENV" 2>/dev/null || { amd_apt install -y -qq python3-venv && "$SYSPY" -m venv "$VENV"; }
-fi
-# The directory the image's torch is actually installed in (<site-packages>/torch/__init__.py), not
-# getsitepackages()[0], which on some images is a different directory than the one holding torch.
-SITE_PARENT="$("$SYSPY" -c 'import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))')"
-SITE_VENV="$("$VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
-printf '%s\n' "$SITE_PARENT" > "$SITE_VENV/zz-image-site.pth"
-TORCH_V="$("$SYSPY" -c 'import torch; print(torch.__version__.split("+")[0])')"
-printf 'torch==%s\n' "$TORCH_V" > "$LOGDIR/constraints.txt"
-if ! "$VENV/bin/python" -c 'import trl, peft, transformers, accelerate, datasets' >/dev/null 2>&1; then
-  log "installing the training stack (torch pinned at $TORCH_V by constraint)"
-  "$VENV/bin/python" -m pip install -q -c "$LOGDIR/constraints.txt" \
-    "transformers>=5.17" "trl>=1.13" "peft>=0.21" "accelerate>=1.0" "datasets>=5.0" huggingface_hub \
-    || die "pip could not install the training stack without replacing the image's torch"
-fi
-"$VENV/bin/python" - <<'PYV' | tee -a "$LOGDIR/versions.log"
-import torch, transformers, peft, trl, accelerate, datasets
-print("venv sees torch", torch.__version__, "transformers", transformers.__version__,
-      "peft", peft.__version__, "trl", trl.__version__)
-assert torch.cuda.is_available(), "the venv's torch is not the image's ROCm torch"
-PYV
-
-# ── 5. HF: login, private repos, the base model ──────────────────────────────────
-# The repos are created private HERE, before training: the Trainer would create a missing repo
-# with the account default, which can be public, and arm B is our own traces.
-"$VENV/bin/python" - <<'PYHF'
-import os
-from huggingface_hub import HfApi, snapshot_download, login
-login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
-api = HfApi()
-ns = os.environ["AMD_HUB_NAMESPACE"]
-print("HF user", api.whoami()["name"])
-for name in (os.environ.get("AMD_HUB_ADAPTER_A", "smol-ladder-sft-a"),
-             os.environ.get("AMD_HUB_ADAPTER_B", "smol-ladder-sft-b"),
-             os.environ.get("AMD_HUB_ADAPTER_AB", "smol-ladder-sft-ab")):
-    api.create_repo(f"{ns}/{name}", repo_type="model", private=True, exist_ok=True)
-    assert api.model_info(f"{ns}/{name}").private, f"{ns}/{name} is not private"
-ds = f"{ns}/{os.environ.get('AMD_HUB_ARTIFACTS', 'smol-ladder-runs')}"
-api.create_repo(ds, repo_type="dataset", private=True, exist_ok=True)
-# exist_ok=True leaves a PRE-EXISTING repo as it was, public or not: assert, as for the models.
-assert api.dataset_info(ds).private, f"{ds} is not private"
-path = snapshot_download(os.environ.get("AMD_BASE_MODEL", "Qwen/Qwen3.5-2B"))
-print("base model at", path)
-PYHF
-
-# ── 6. the on-droplet watchdog ───────────────────────────────────────────────────
+# ── 5. the on-droplet watchdog ───────────────────────────────────────────────────
 if ! pgrep -f 'ops/amd/watchdog.sh' >/dev/null; then
   # setsid + </dev/null: the ssh session that runs this script ends, and a watchdog that is still
   # attached to its terminal gets SIGHUP and dies with it, or holds the ssh channel open.

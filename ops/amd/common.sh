@@ -12,6 +12,15 @@ AMD_STAGE_DIR="${AMD_STAGE_DIR:-/var/tmp/smol-ladder-stage}"
 AMD_DATA_ROOT="${AMD_DATA_ROOT:-$AMD_REMOTE_ROOT/data}"
 AMD_VENV="${AMD_VENV:-$AMD_REMOTE_ROOT/.venv}"
 
+# ── the container: torch and vLLM live in an image, not on the host ──────────────
+# ONE long-lived container runs every droplet-side step, with the same paths bind-mounted, so a
+# script behaves the same inside it as the layout in this file says. Host-only: the watchdog,
+# rocm-smi, poweroff. The image's jupyter container is stopped so nothing else holds the GPU.
+AMD_CONTAINER="${AMD_CONTAINER:-smol}"
+AMD_IMAGE="${AMD_IMAGE:-vllm/vllm-openai-rocm:v0.17.1}"   # already on disk; never pulled
+AMD_HF_CACHE="${AMD_HF_CACHE:-/var/cache/smol-hf}"         # host disk, mounted as the container's HF cache
+AMD_STOP_CONTAINERS="${AMD_STOP_CONTAINERS:-rocm}"
+
 # ── models, data, training ───────────────────────────────────────────────────────
 AMD_BASE_MODEL="${AMD_BASE_MODEL:-Qwen/Qwen3.5-2B}"
 AMD_MAX_LENGTH="${AMD_MAX_LENGTH:-8192}"
@@ -123,3 +132,28 @@ amd_apt() {
   done
   return 1
 }
+
+# ── host side: the container ─────────────────────────────────────────────────────
+# Idempotent: a running container on the right image is kept; anything else is replaced.
+amd_container_up() {
+  local c
+  for c in $AMD_STOP_CONTAINERS; do docker stop "$c" >/dev/null 2>&1 || true; done
+  if [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$AMD_CONTAINER" 2>/dev/null || true)" == "true $AMD_IMAGE" ]]; then
+    amd_log "container $AMD_CONTAINER already running"; return 0
+  fi
+  docker rm -f "$AMD_CONTAINER" >/dev/null 2>&1 || true
+  mkdir -p "$AMD_HF_CACHE" "$AMD_REMOTE_LOG" "$AMD_REMOTE_ROOT"
+  docker image inspect "$AMD_IMAGE" >/dev/null 2>&1 || amd_die "image $AMD_IMAGE is not on this host (no pulls here)"
+  # --network host: vLLM on 127.0.0.1:8000 is what the laptop's ssh -L reaches. --init reaps the
+  # detached servers. seccomp=unconfined + SYS_PTRACE + video/render are what ROCm wants.
+  docker run -d --name "$AMD_CONTAINER" --restart no --init --network host --ipc host \
+    --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+    --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+    -v "$AMD_REMOTE_ROOT:$AMD_REMOTE_ROOT" -v "$AMD_STAGE_DIR:$AMD_STAGE_DIR" \
+    -v "$AMD_REMOTE_LOG:$AMD_REMOTE_LOG" -v "$AMD_HF_CACHE:/root/.cache/huggingface" \
+    -w "$AMD_REMOTE_ROOT" --entrypoint sleep "$AMD_IMAGE" infinity >/dev/null
+  amd_log "container $AMD_CONTAINER started from $AMD_IMAGE"
+}
+
+# Run a command in the container. Secrets are never passed here: scripts read $AMD_REMOTE_ROOT/.env.
+amd_in_container() { docker exec "$AMD_CONTAINER" "$@"; }

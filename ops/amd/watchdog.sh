@@ -80,7 +80,8 @@ tick() {
   amd_log "FIRING: $reason"
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$reason" >> "$AMD_REMOTE_LOG/watchdog.trips"
   if (( DRY )); then amd_log "dry run: would push to the Hub and power off"; return 1; fi
-  bash "$(dirname "${BASH_SOURCE[0]}")/sync_back.sh" --push-hub || amd_log "final push failed"
+  # sync_back needs torch/hf (the container); the poweroff below needs the host
+  amd_in_container bash "$AMD_REMOTE_ROOT/ops/amd/sync_back.sh" --push-hub || amd_log "final push failed"
   amd_log "powering off: the laptop's deadman.py destroys a droplet found powered off"
   shutdown -h now || amd_log "shutdown failed"
   return 1

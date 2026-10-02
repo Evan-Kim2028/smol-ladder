@@ -161,7 +161,7 @@ def test_the_default_image_is_the_vllm_one_and_the_reason_is_in_the_source():
 def test_the_vllm_floor_is_the_one_qwen35_needs():
     assert P.VLLM_MIN == "0.16.2"
     assert "0.16.2" in (OPS / "smoke.sh").read_text()
-    assert "0.16.2" in (OPS / "entrypoint.sh").read_text()
+    assert "0.16.2" in (OPS / "container_setup.sh").read_text()
 
 
 def test_the_default_budgets_are_35_for_the_session_and_90_in_total():
@@ -1583,8 +1583,9 @@ def test_no_script_runs_the_train_extra_which_would_replace_the_images_torch():
 
 
 def test_the_entrypoint_installs_the_training_stack_under_a_torch_constraint():
-    text = (OPS / "entrypoint.sh").read_text()
-    assert 'torch==%s' in text and "-c " in text and "pip install" in text
+    text = (OPS / "container_setup.sh").read_text()
+    assert '"torch", "torchvision", "torchaudio", "triton", "vllm"' in text
+    assert "-c \"$LOGDIR/constraints.txt\"" in text and "--system-site-packages" in text
 
 
 def test_the_server_is_never_bound_to_a_public_interface():
@@ -1594,7 +1595,7 @@ def test_the_server_is_never_bound_to_a_public_interface():
 
 
 def test_the_hub_repos_are_created_private_before_training():
-    text = (OPS / "entrypoint.sh").read_text()
+    text = (OPS / "container_setup.sh").read_text()
     assert "private=True" in text and "assert api.model_info" in text
 
 
@@ -2430,8 +2431,8 @@ def test_the_plan_stops_the_probe_server_after_the_probe_eval_and_before_the_go_
     n = names(steps)
     assert n.index("probe-eval") < n.index("stop-probe-server") < n.index("go-no-go") < n.index("sft-A")
     stop = steps[n.index("stop-probe-server")]
-    assert stop.cmds[0].argv[-2:] == (f"{cfg().remote_root}/ops/amd/serve.sh", "--stop") or \
-        list(stop.cmds[0].argv[-3:]) == ["bash", f"{cfg().remote_root}/ops/amd/serve.sh", "--stop"]
+    assert list(stop.cmds[0].argv[-3:]) == ["bash", f"{cfg().remote_root}/ops/amd/serve.sh", "--stop"]
+    assert stop.cmds[0].argv[-6:-3] == ("docker", "exec", "smol")
     assert stop.reserve is False      # never refused by the budget gate: it only ever saves money
 
 
@@ -2584,29 +2585,28 @@ def test_apt_runs_under_a_lock_timeout_and_a_bounded_retry(tmp_path):
 
 
 def test_the_entrypoint_uses_the_bounded_apt_helper_everywhere():
-    text = (OPS / "entrypoint.sh").read_text()
+    text = (OPS / "container_setup.sh").read_text()
     code = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
     assert not any(re.search(r"(^|[;&|]\s*)apt-get ", l) for l in code)
-    assert sum("amd_apt" in l for l in code) == 2     # the package install and python3-venv
+    assert sum("amd_apt" in l for l in code) == 1     # the package install
 
 
-def test_the_pth_layering_derives_the_site_dir_from_where_torch_is_installed():
-    text = (OPS / "entrypoint.sh").read_text()
-    assert "dirname(os.path.dirname(torch.__file__))" in text
-    assert 'SITE_PARENT="$("$SYSPY" -c \'import site' not in text
-
-
-def test_the_pth_expression_on_a_fake_site_packages(tmp_path):
-    sp = tmp_path / "lib" / "python3.12" / "site-packages"
-    (sp / "torch").mkdir(parents=True)
-    (sp / "torch" / "__init__.py").write_text("")
-    out = subprocess.run([sys.executable, "-c", "import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))"],
-                         env={"PATH": os.environ["PATH"], "PYTHONPATH": str(sp)}, capture_output=True, text=True)
-    assert out.stdout.strip() == str(sp)
+def test_droplet_steps_run_in_the_smol_container_and_the_names_agree():
+    steps = plan_for()
+    smoke = steps[names(steps).index("smoke-checks")].cmds[0].argv
+    i = smoke.index("docker")
+    assert smoke[i:i + 4] == ("docker", "exec", P.CONTAINER, "bash")
+    common = (OPS / "common.sh").read_text()
+    assert f'AMD_CONTAINER="${{AMD_CONTAINER:-{P.CONTAINER}}}"' in common
+    assert "--network host" in common and "--device /dev/kfd" in common and "--restart no" in common
+    entry = (OPS / "entrypoint.sh").read_text()
+    assert "amd_container_up" in entry and "amd_in_container" in entry and "watchdog.sh\" --arm" in entry
+    assert "docker" not in (OPS / "smoke.sh").read_text()      # the steps themselves are container-agnostic
+    assert "amd_in_container" in (OPS / "watchdog.sh").read_text()   # push in the container, poweroff on the host
 
 
 def test_the_dataset_repo_is_asserted_private_even_when_it_pre_exists():
-    assert "api.dataset_info(ds).private" in (OPS / "entrypoint.sh").read_text()
+    assert "api.dataset_info(ds).private" in (OPS / "container_setup.sh").read_text()
     assert "dataset_info(repo).private" in (OPS / "push_artifacts.py").read_text()
 
 
