@@ -772,7 +772,8 @@ def serve_cmd(cfg: Config, *, gate: bool = False) -> Cmd:
     exits non-zero if one is not."""
     args = ["--wait", "--verify"]
     arms = [] if gate else [a for a in ARMS if a in cfg.arms]
-    args += ["--arms", ",".join(arms)]
+    if arms:   # an empty argument does not survive ssh's re-splitting, and serve.sh defaults to none
+        args += ["--arms", ",".join(arms)]
     for name, repo in cfg.eval_only:
         if gate and name != GATE_ARM:
             continue

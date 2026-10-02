@@ -1800,7 +1800,7 @@ def test_the_dry_run_prints_the_cost_table_first_then_every_command_in_order(tmp
     out = run_driver(tmp_path, "dry-run").stdout
     assert out.index("## costed plan") < out.index("## the whole session")
     markers = ["stage.py", "driver.py preflight", "deadman.py", "driver.py create", "READY_$(whoami)",
-               "scp -r", "entrypoint.sh", "smoke.sh", "serve.sh --wait --verify --arms ''",
+               "scp -r", "entrypoint.sh", "smoke.sh", "serve.sh --wait --verify --hub",
                "--hub R=AdithyaSK/smoldataenvs-sft-2b-v0:8004", "tunnel", "--limit 60",
                "serve.sh --stop", "driver.py gate-decide", "driver.py project",
                "run_sft.sh --arm A", "run_sft.sh --arm B", "run_sft.sh --arm AB",
