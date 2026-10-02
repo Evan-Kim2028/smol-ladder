@@ -63,6 +63,7 @@ amd_hub_name() {
     AB)        printf 'smol-ladder-sft-ab-%s\n' "$AMD_SESSION" ;;
     B3)        printf 'smol-ladder-sft-b3-%s\n' "$AMD_SESSION" ;;
     B4)        printf 'smol-ladder-sft-b4-%s\n' "$AMD_SESSION" ;;
+    B5)        printf 'smol-ladder-sft-b5-%s\n' "$AMD_SESSION" ;;
     artifacts) printf 'smol-ladder-runs-%s\n' "$AMD_SESSION" ;;
     *) amd_die "unknown hub name '$1'" ;;
   esac
@@ -135,8 +136,8 @@ amd_arm_dir() { printf '%s/runs/sft_%s\n' "$AMD_REMOTE_ROOT" "$(amd_lower "$1")"
 amd_arm_hub_repo() {
   local ns="${AMD_HUB_NAMESPACE:?AMD_HUB_NAMESPACE is not set (remote.env)}"
   case "$1" in
-    A|B|AB|B3|B4) printf '%s/%s\n' "$ns" "$(amd_hub_name "$1")" ;;
-    *)      amd_die "unknown arm '$1' (want A, B, AB, B3 or B4)" ;;
+    A|B|AB|B3|B4|B5) printf '%s/%s\n' "$ns" "$(amd_hub_name "$1")" ;;
+    *)      amd_die "unknown arm '$1' (want A, B, AB, B3, B4 or B5)" ;;
   esac
 }
 
@@ -157,7 +158,8 @@ amd_port() {
     B)    printf '%s\n' "$((AMD_VLLM_PORT + 2))" ;;
     AB)   printf '%s\n' "$((AMD_VLLM_PORT + 3))" ;;
     B3)   printf '%s\n' "$((AMD_VLLM_PORT + 5))" ;;
-    B4)   printf '%s\n' "$((AMD_VLLM_PORT + 6))" ;;   # +4 is the released adapter's (--hub R=...:8004)
+    B4)   printf '%s\n' "$((AMD_VLLM_PORT + 6))" ;;
+    B5)   printf '%s\n' "$((AMD_VLLM_PORT + 7))" ;;   # +4 is the released adapter's (--hub R=...:8004)
     *)    amd_die "no fixed port for '$1'" ;;
   esac
 }
