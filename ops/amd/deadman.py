@@ -239,8 +239,8 @@ def main() -> None:
                                        f"(hard limit ${HARD_TOTAL_LIMIT:g})")
     print(f"deadman armed: deadline {time.strftime('%H:%M:%S', time.localtime(deadline))} "
           f"({args.deadline_minutes:g} min), session cap ${args.budget:g}, total cap "
-          f"${args.total_cap:g} (hard limit ${HARD_TOTAL_LIMIT:g}), tag '{args.tag}', heartbeat "
-          f"{L.heartbeat_path(ledger_path)}", flush=True)
+          f"${args.total_cap:g} (hard limit ${HARD_TOTAL_LIMIT:g}), tag '{args.tag}', pid "
+          f"{os.getpid()}, heartbeat {L.heartbeat_path(ledger_path)}", flush=True)
     sys.exit(watch(api, tag=args.tag, ledger_path=ledger_path, deadline=deadline,
                    session_cap=args.budget, total_cap=args.total_cap, price=args.price,
                    poll=args.poll_seconds, once=args.once, dry_run=args.dry_run,

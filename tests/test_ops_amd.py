@@ -2947,3 +2947,52 @@ def test_status_prints_droplet_uptime_dollars_remaining_caps_and_the_hard_limit(
 def test_status_says_loudly_when_there_is_no_live_deadman_and_how_to_start_one(tmp_path, capsys):
     out = status_text(tmp_path, capsys, with_heartbeat=False)
     assert "NO LIVE DEADMAN" in out and "setsid nohup python ops/amd/deadman.py" in out
+
+
+# ═══ the runbook matches the fixes ══════════════════════════════════════════════════
+
+def test_the_runbook_quotes_the_l1_only_total_and_each_increment_the_driver_computes():
+    text = runbook()
+    rows = P.projection(P.Config(), tokens_from_data(), P.Measured())
+    st = P.staged_dollars(rows, P.PRICE_MI350X)
+    m = re.search(r"Stop after L1: \$([\d.]+)\. L2-L4 add \$([\d.]+)\. The control adds \$([\d.]+)\.", text)
+    assert m, "the runbook has no parseable L1-only line"
+    assert [float(x) for x in m.groups()] == pytest.approx(
+        [st["l1_only"], st["hints"], st["control"]], abs=0.006)
+
+
+def test_the_runbook_table_rows_are_the_rows_the_driver_prints():
+    text = runbook()
+    for stage in (P.ROW_SERVE, P.ROW_L1, P.ROW_HINTS, P.ROW_CONTROL):
+        assert f"| {stage} |" in text, stage
+    assert "serve + evaluate (4 models)" not in text
+
+
+def test_the_runbook_states_the_hard_limit_the_detached_start_and_the_rearm_rule():
+    text = runbook()
+    assert "$95 HARD limit" in text and "HEARTBEAT FRESH" in text
+    assert "setsid nohup python ops/amd/deadman.py" in text and "< /dev/null &" in text
+    assert "**Re-arm it before any further create.**" in text or "RE-ARM before any further create" in text
+    assert "--stage L1" in text and "--stage rest" in text and "stop-probe-server" in text
+    assert "final.done" in text and "at least 90%" in text
+
+
+def test_the_runbook_command_block_runs_the_deadman_before_create_and_L1_before_the_hint_rungs():
+    text = runbook()
+    block = text[text.index("```sh", text.index("## 4.")):]
+    block = block[:block.index("```", 6)]
+    order = ["deadman.py", "driver.py status", "driver.py create", "driver.py smoke",
+             "driver.py train", "driver.py serve", "eval --stage L1", "eval --stage rest",
+             "driver.py sync", "driver.py destroy"]
+    pos = [block.index(c) for c in order]
+    assert pos == sorted(pos), dict(zip(order, pos))
+
+
+def test_every_command_the_runbook_block_shows_is_one_the_driver_parses(tmp_path):
+    text = runbook()
+    block = text[text.index("```sh", text.index("## 4.")):]
+    block = block[:block.index("```", 6)]
+    for m in re.finditer(r"driver\.py (eval --stage \w+|status|plan|dry-run)", block):
+        argv = m.group(1).split()
+        out = run_driver(tmp_path, *argv)
+        assert "invalid choice" not in out.stderr and "unrecognized" not in out.stderr, m.group(0)
