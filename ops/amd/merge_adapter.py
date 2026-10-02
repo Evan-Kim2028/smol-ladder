@@ -336,8 +336,12 @@ def merge(base: str, adapter_dir: Path, out_dir: Path) -> dict:
     return rep
 
 
-def check(out_dir: Path) -> list[str]:
-    """Why `out_dir` may not be served; empty means it holds a passing merge of the files it has now."""
+def check(out_dir: Path, adapter_dir: Path | None = None) -> list[str]:
+    """Why `out_dir` may not be served; empty means it holds a passing merge of the files it has now.
+
+    With `adapter_dir`, also that the merge was made FROM that adapter: the report's adapter_sha256
+    must equal the adapter file's, or a retrained adapter would be served as the old merge.
+    """
     out_dir = Path(out_dir)
     try:
         rep = json.loads((out_dir / REPORT).read_text())
@@ -353,20 +357,30 @@ def check(out_dir: Path) -> list[str]:
         why.append("the weight files the loader reads are not the ones the report was written for")
     if stray_weight_files(out_dir):
         why.append(f"weight files the index does not name: {stray_weight_files(out_dir)}")
+    if adapter_dir is not None:
+        try:
+            current = sha256_file(Path(adapter_dir) / "adapter_model.safetensors")
+        except OSError as exc:
+            why.append(f"cannot read the adapter to compare the merge with: {exc}")
+        else:
+            if rep.get("adapter_sha256") != current:
+                why.append(f"{REPORT} was written from a different adapter (sha256 "
+                           f"{str(rep.get('adapter_sha256'))[:12]}, the adapter now is {current[:12]})")
     return why
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base")
-    ap.add_argument("--adapter")
+    ap.add_argument("--adapter", help="the adapter directory to merge; with --check, the one the "
+                                      "merge must have been made from (its sha256 is compared)")
     ap.add_argument("--out")
     ap.add_argument("--check", metavar="DIR", help="verify an existing merged directory and exit")
     ap.add_argument("--label", help="with --check: the served model's name, for the MERGE_OK line "
                                     "the driver reads (it wires the report into the evaluation guard)")
     args = ap.parse_args(argv)
     if args.check:
-        why = check(Path(args.check))
+        why = check(Path(args.check), Path(args.adapter) if args.adapter else None)
         for w in why:
             print(f"merge check FAILED: {w}", file=sys.stderr)
         if not why:

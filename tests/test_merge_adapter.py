@@ -247,3 +247,26 @@ def test_bf16_rounding_is_round_to_nearest_even():
     x = np.array([0.1234567, -3.5, 1e-3], np.float32)
     back = M.decode(M.encode(x, "BF16"), "BF16", x.shape)
     np.testing.assert_allclose(back, x, rtol=2 ** -8)
+
+
+def test_check_refuses_a_merge_made_from_a_different_adapter_than_the_one_given(env):
+    # a retrained adapter must not be served as the old merge
+    tmp, base_dir, base = env
+    make_adapter(tmp / "ad", base, TARGETS)
+    out = tmp / "out"
+    assert M.main(["--base", str(base_dir), "--adapter", str(tmp / "ad"), "--out", str(out)]) == 0
+    assert M.check(out, tmp / "ad") == []
+    make_adapter(tmp / "retrained", base, TARGETS)             # same shapes, new weights
+    why = M.check(out, tmp / "retrained")
+    assert why and "different adapter" in why[0]
+    assert M.main(["--check", str(out), "--adapter", str(tmp / "retrained")]) == 1
+    assert M.main(["--check", str(out), "--adapter", str(tmp / "ad")]) == 0
+    assert M.check(out) == []                                   # without an adapter, as before
+
+
+def test_check_refuses_when_the_adapter_to_compare_with_is_unreadable(env):
+    tmp, base_dir, base = env
+    make_adapter(tmp / "ad", base, TARGETS)
+    out = tmp / "out"
+    assert M.main(["--base", str(base_dir), "--adapter", str(tmp / "ad"), "--out", str(out)]) == 0
+    assert M.check(out, tmp / "nowhere")
