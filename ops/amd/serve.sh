@@ -10,7 +10,7 @@
 # Why merged, one process per model: LoRA serving does not work for Qwen3.5 on the image's vLLM
 # 0.17.1 (it crashes at cuda-graph warmup, and with --enforce-eager it cannot load a peft
 # all-linear adapter), so every adapter is merged (merge_adapter.py) and the merged model is served
-# as an ordinary one. Five 2B engines fit one card at AMD_SERVER_UTIL of it each. They share the GPU,
+# as an ordinary one. Five 2B engines fit one card (see AMD_KV_CACHE_GIB). They share the GPU,
 # so each is slower than it would be alone, which the plan's trials-per-minute accounts for.
 #
 # Models and ports (the laptop's tunnel and harness use the same table, plan.py's port_order):
@@ -26,8 +26,9 @@
 #      the base's own weights over the merged ones, so three adapters were evaluated as the base)
 #      refuses to serve. `MERGE_OK model=... modules_applied=... tensors_changed=...` is printed
 #      per adapter; the driver wires it into the evaluation guard
-#   3. servers are started together; each is waited for, and one that DIES during startup is
-#      restarted once after waiting for the GPU memory again (AMD_START_TRIES)
+#   3. servers are started ONE AT A TIME (with --wait): each is READY before the next starts, each
+#      has the same explicit KV-cache budget (AMD_KV_CACHE_GIB) and prefix caching on; one that
+#      DIES during startup is restarted once after waiting for the GPU memory again (AMD_START_TRIES)
 #   4. with --verify, each adapter's tool calls and its temperature-0 output on a fixed training
 #      prompt against the base's are checked (probe_tools.py): identical output means the adapter
 #      is not applied. `ADAPTER_CHECK model=... differs=... tool_calls_ok=...` is printed and the
@@ -100,20 +101,31 @@ cd "$AMD_REMOTE_ROOT"
 
 # adapter_dir <arm>: where a trained arm's adapter is, fetching it from the Hub if the disk has none
 # (the reclaim case: the adapter survived, the disk did not).
-hub_download() { # hub_download <repo>: the adapter's two files, from the Hub
-  "$AMD_VENV/bin/python" - "$1" <<'PYDL'
+hub_download() { # hub_download <repo> [revision]: the adapter's files and the final marker, from the Hub
+  "$AMD_VENV/bin/python" - "$1" "${2:-}" <<'PYDL'
 import sys
 from huggingface_hub import snapshot_download
-print(snapshot_download(sys.argv[1], allow_patterns=["adapter_config.json", "adapter_model.safetensors"]))
+print(snapshot_download(sys.argv[1], revision=sys.argv[2] or None,
+                        allow_patterns=["adapter_config.json", "adapter_model.safetensors", "final.done"]))
 PYDL
 }
+# A trained arm's adapter is served only when it is FINISHED. While an arm trains, the Trainer copies
+# every checkpoint's adapter files into the arm's output directory (and pushes them to the Hub
+# root), so the two adapter files alone prove nothing: the local marker `.done` (written by
+# run_sft.sh after the Hub upload was verified) or, from the Hub, `final.done` (pushed last).
 adapter_dir() {
-  local arm="$1" dir
+  local arm="$1" dir hub
   dir="$(amd_arm_dir "$arm")"
-  if [[ -f "$dir/adapter_config.json" && -f "$dir/adapter_model.safetensors" ]]; then
+  if [[ -f "$dir/.done" && -f "$dir/adapter_config.json" && -f "$dir/adapter_model.safetensors" ]]; then
     printf '%s\n' "$dir"; return 0
   fi
-  hub_download "$(amd_arm_hub_repo "$arm")"
+  if [[ -f "$dir/adapter_model.safetensors" ]]; then
+    amd_log "arm $arm: $dir has adapter files but no .done: an unfinished run's checkpoint, not served from disk"
+  fi
+  hub="$(hub_download "$(amd_arm_hub_repo "$arm")")" || return 1
+  [[ -f "$hub/final.done" && -f "$hub/adapter_model.safetensors" ]] || {
+    amd_log "arm $arm: the Hub repo has no final.done: its adapter is a checkpoint or stale, not served"; return 1; }
+  printf '%s\n' "$hub"
 }
 
 BASE="$(amd_served_name base)"
@@ -137,12 +149,13 @@ for k in "${!NAMES[@]}"; do
   # A merged directory is served only with a passing merge_report.json for the weight files it
   # holds now. One that fails the check (no report, a no-op merge, files changed since) is
   # re-merged, and the merge exits non-zero if it still is not a real one.
-  if ! "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" >/dev/null 2>&1; then
+  # ...and only a merge made FROM this adapter: the report's adapter sha256 must equal the adapter's.
+  if ! "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" --adapter "${SRCS[$k]}" >/dev/null 2>&1; then
     "$AMD_VENV/bin/python" ops/amd/merge_adapter.py \
       --base "$AMD_BASE_MODEL" --adapter "${SRCS[$k]}" --out "$merged" \
       || amd_die "merging ${NAMES[$k]} failed its checks (see merge_report.json in $merged); not serving it"
   fi
-  "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" --label "${NAMES[$k]}" \
+  "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" --adapter "${SRCS[$k]}" --label "${NAMES[$k]}" \
     || amd_die "refusing to serve $merged: no passing merge_report.json"
 done
 
@@ -152,12 +165,32 @@ M_PORTS=("$PORT" "${PORTS[@]}")
 M_PATHS=("$AMD_BASE_MODEL" "${MERGED[@]}")
 declare -A PIDS=()
 
+# Memory per engine. Session 1 started five engines at once with --gpu-memory-utilization 0.17 and the
+# KV caches came out at 3 to 35 GiB, because each engine sized its cache from what the others had
+# taken by then. Engines now start ONE AT A TIME with an explicit, equal KV budget
+# (--kv-cache-memory-bytes, which vLLM 0.17 documents as ignoring gpu_memory_utilization):
+# AMD_KV_CACHE_GIB per engine; 0 falls back to equal --gpu-memory-utilization shares.
+kv_args() {
+  if (( AMD_KV_CACHE_GIB > 0 )); then
+    printf '%s\n' "--kv-cache-memory-bytes" "$((AMD_KV_CACHE_GIB * 1024 * 1024 * 1024))"
+  else
+    printf '%s\n' "--gpu-memory-utilization" "$AMD_SERVER_UTIL"
+  fi
+}
+# Prefix caching: Qwen3.5 is a hybrid (gated delta net) model, which vLLM's recipe serves with
+# --enable-prefix-caching (its 'align' mamba mode, marked experimental). Session 1's hit rate was
+# 0%, so every turn re-prefilled the conversation. AMD_PREFIX_ARGS="" turns it off; an engine that
+# fails to start with it, and whose log names prefix caching or the mamba cache, is retried without.
+declare -A NO_PREFIX=()
+
 start_model() { # start_model <index>
-  local i="$1" port="${M_PORTS[$1]}"
+  local i="$1" port="${M_PORTS[$1]}" kv=() prefix=()
+  mapfile -t kv < <(kv_args)
+  if [[ -z "${NO_PREFIX[$i]:-}" && -n "$AMD_PREFIX_ARGS" ]]; then read -r -a prefix <<< "$AMD_PREFIX_ARGS"; fi
   setsid nohup "$SYSPY" -m vllm.entrypoints.openai.api_server \
     --model "${M_PATHS[$i]}" --tokenizer "$AMD_BASE_MODEL" --served-model-name "${M_NAMES[$i]}" \
     --host 127.0.0.1 --port "$port" \
-    --dtype bfloat16 --max-model-len "$AMD_MAX_MODEL_LEN" --gpu-memory-utilization "$AMD_SERVER_UTIL" \
+    --dtype bfloat16 --max-model-len "$AMD_MAX_MODEL_LEN" "${kv[@]}" "${prefix[@]}" \
     --enable-auto-tool-choice --tool-call-parser "$AMD_TOOL_PARSER" \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     >"$AMD_REMOTE_LOG/vllm_$port.log" 2>&1 < /dev/null &
@@ -200,16 +233,23 @@ bring_up() { # bring_up <index>: wait for it; if it died or hung, wait for the G
       amd_die "${M_NAMES[$i]} on :${M_PORTS[$i]} did not start after $attempt attempts (see $AMD_REMOTE_LOG/vllm_${M_PORTS[$i]}.log)"
     fi
     kill -9 "${PIDS[$i]}" 2>/dev/null || true
+    if [[ -n "$AMD_PREFIX_ARGS" && -z "${NO_PREFIX[$i]:-}" ]] \
+        && grep -qiE 'prefix.cach|mamba.cache' "$AMD_REMOTE_LOG/vllm_${M_PORTS[$i]}.log" 2>/dev/null; then
+      NO_PREFIX[$i]=1
+      amd_log "WARNING: ${M_NAMES[$i]} failed with prefix caching named in its log: restarting WITHOUT it (every turn will re-prefill)"
+    fi
     amd_log "restarting ${M_NAMES[$i]} (attempt $((attempt + 1)) of $AMD_START_TRIES) once the card has room"
     amd_wait_gpu_room "$(awk -v u="$AMD_SERVER_UTIL" 'BEGIN { printf "%.2f", u + 0.03 }')"
     start_model "$i"
   done
 }
 
-for i in "${!M_NAMES[@]}"; do start_model "$i"; done
-if (( WAIT )); then
-  for i in "${!M_NAMES[@]}"; do bring_up "$i"; done
-fi
+# One at a time: with --wait each engine is READY before the next starts. Without --wait there is
+# nothing to wait on, so they are launched back to back.
+for i in "${!M_NAMES[@]}"; do
+  start_model "$i"
+  if (( WAIT )); then bring_up "$i"; fi
+done
 
 if (( WAIT && VERIFY )); then
   # Each adapter's tool calls, then its temperature-0 output on a fixed training prompt against the

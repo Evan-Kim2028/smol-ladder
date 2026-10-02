@@ -806,6 +806,7 @@ def serve_env(tmp_path):
     base = TM.make_base(base_dir)
     for arm in ("a", "b", "ab"):
         TM.make_adapter(root / "runs" / f"sft_{arm}", base, TM.TARGETS)
+        (root / "runs" / f"sft_{arm}" / ".done").write_text("done\n")     # a FINISHED arm
     TM.make_adapter(tmp_path / "hub_r", base, TM.TARGETS)
     (root / "data/train/sft_upstream").mkdir(parents=True)
     (root / "data/train/sft_upstream/train.jsonl").write_text("{}\n")
@@ -910,10 +911,10 @@ def test_serve_sh_sets_the_tool_call_parser_the_non_thinking_template_loopback_a
     assert argv[argv.index("--tool-call-parser") + 1] == "qwen3_coder"
     assert json.loads(argv[argv.index("--default-chat-template-kwargs") + 1]) == {"enable_thinking": False}
     assert {a for i, a in enumerate(argv) if argv[i - 1] == "--host"} == {"127.0.0.1"}
-    assert argv[argv.index("--gpu-memory-utilization") + 1] == "0.17"
+    assert argv[argv.index("--kv-cache-memory-bytes") + 1] == str(24 * 1024 ** 3)
+    assert "--gpu-memory-utilization" not in argv and "--enable-prefix-caching" in argv
     assert argv[argv.index("--dtype") + 1] == "bfloat16"
     assert {a for i, a in enumerate(argv) if argv[i - 1] == "--tokenizer"} == {serve_env["env"]["AMD_BASE_MODEL"]}
-    assert 5 * 0.17 < 0.9      # five engines leave room for what sits outside the fraction
 
 
 def test_the_tool_call_parser_can_be_switched_without_editing_the_script(serve_env):
@@ -985,6 +986,7 @@ def test_serve_merged_refuses_an_adapter_whose_merge_is_a_no_op_and_starts_no_se
     a = serve_env["root"] / "runs" / "sft_a"
     shutil.rmtree(a)
     TM.make_adapter(a, TM.make_base(serve_env["tmp"] / "other"), TM.TARGETS, zero_b=True)
+    (a / ".done").write_text("done\n")
     out = run_serve(serve_env, "--wait", "--arms", "A", "--hub", HUB_R, check=False)
     assert out.returncode != 0 and "failed its checks" in out.stderr and "no-op" in out.stderr
     assert starts(serve_env) == []
@@ -4372,3 +4374,77 @@ def test_the_runbook_defaults_match_the_code():
     assert "`--ckpt-steps` (default 50)" in text and "`--train-attempts` (default 3)" in text
     assert "0.17 of the GPU" in text and "ports 8000-8004" in text or "8000-8004" in text
     assert "eval --stage sample2" in text and "--eval-only" in text
+
+
+# ═══ serve.sh: only finished adapters, only merges made from them, one engine at a time ═══
+
+def test_a_trained_arms_adapter_on_disk_without_done_is_a_checkpoint_and_is_not_served(serve_env):
+    (serve_env["root"] / "runs" / "sft_a" / ".done").unlink()      # mid-training: files copied, no marker
+    out = run_serve(serve_env, "--wait", "--arms", "A", "--hub", HUB_R, check=False)
+    assert out.returncode != 0 and "no .done" in out.stderr
+    assert ("8001", "amd-a-2b") not in starts(serve_env)
+
+
+def test_the_hub_fallback_needs_the_final_marker_in_the_downloaded_repo(serve_env):
+    (serve_env["root"] / "runs" / "sft_a" / ".done").unlink()
+    hub_dir = serve_env["tmp"] / "hub_r"                          # what the stub download returns
+    out = run_serve(serve_env, "--wait", "--arms", "A", extra_env={}, check=False)
+    assert out.returncode != 0 and "no final.done" in out.stderr
+    (hub_dir / "final.done").write_text("done\n")
+    run_serve(serve_env, "--wait", "--arms", "A")
+    assert ("8001", "amd-a-2b") in starts(serve_env)
+
+
+def test_a_merge_made_from_an_older_adapter_is_redone_not_served(serve_env):
+    import test_merge_adapter as TM
+    run_serve(serve_env, "--wait", "--arms", "A")
+    merged = serve_env["root"] / "runs" / "merged_amd-a-2b"
+    before = json.loads((merged / "merge_report.json").read_text())["adapter_sha256"]
+    base = TM.make_base(serve_env["tmp"] / "tinybase2")
+    shutil.rmtree(serve_env["root"] / "runs" / "sft_a")
+    TM.make_adapter(serve_env["root"] / "runs" / "sft_a", base, TM.TARGETS)   # "retrained"
+    (serve_env["root"] / "runs" / "sft_a" / ".done").write_text("done\n")
+    run_serve(serve_env, "--wait", "--arms", "A")
+    after = json.loads((merged / "merge_report.json").read_text())["adapter_sha256"]
+    assert before != after
+
+
+def test_the_serve_script_starts_an_engine_only_after_the_previous_one_is_up():
+    text = (OPS / "serve.sh").read_text()
+    loop = text[text.index('for i in "${!M_NAMES[@]}"; do\n  start_model'):]
+    assert loop.index("start_model") < loop.index("bring_up") < loop.index("done")
+    assert 'for i in "${!M_NAMES[@]}"; do bring_up' not in text
+
+
+def test_the_kv_budget_is_equal_explicit_and_can_fall_back_to_equal_gpu_shares(serve_env):
+    rec = record_argv(serve_env)
+    run_serve(serve_env, "--arms", "A", "--hub", HUB_R, extra_env={"AMD_KV_CACHE_GIB": "0", "AMD_PREFIX_ARGS": ""})
+    argv = rec.read_text().splitlines()
+    assert argv.count("--gpu-memory-utilization") >= 1 and "--kv-cache-memory-bytes" not in argv
+    assert "--enable-prefix-caching" not in argv
+
+
+def test_an_engine_that_fails_naming_prefix_caching_is_restarted_without_it(serve_env):
+    stub = Path((serve_env["root"] / ".syspy").read_text().strip())
+    log = serve_env["tmp"] / "log"
+    stub.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        port=""; name=""; prefix=0
+        while [[ $# -gt 0 ]]; do
+          case "$1" in --port) port="$2";; --served-model-name) name="$2";; --enable-prefix-caching) prefix=1;; esac; shift
+        done
+        echo "$port $name prefix=$prefix" >> "{serve_env['started']}"
+        if [[ "$prefix" == 1 && "$port" == 8000 ]]; then echo "mamba cache mode align unsupported" >&2; exit 1; fi
+        echo "$name" > "{serve_env['tmp']}/stubs/up.$port"
+        exec sleep 6
+        """))
+    out = run_serve(serve_env, "--wait", "--arms", "", "--hub", HUB_R)
+    assert "WITHOUT it" in out.stderr
+    lines = serve_env["started"].read_text().splitlines()
+    assert [ln for ln in lines if ln.startswith("8000")] == ["8000 amd-base-2b prefix=1", "8000 amd-base-2b prefix=0"]
+
+
+def test_engines_are_started_in_order_and_the_next_one_waits_for_the_previous_ready_line(serve_env):
+    out = run_serve(serve_env, "--wait", "--arms", "A,B", "--hub", HUB_R)
+    assert [t[0] for t in starts(serve_env)] == ["8000", "8001", "8002", "8004"]
+    assert out.stdout.count("READY_AFTER_S=") == 4
