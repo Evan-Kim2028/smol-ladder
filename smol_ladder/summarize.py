@@ -709,12 +709,12 @@ def headroom_curve(runs: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
 
 def summarise(split: str, runs: dict[str, dict[str, list[dict]]],
               has_reference: Callable[[str], bool], allow_mixed: bool = False,
-              record: dict | None = None) -> dict:
+              record: dict | None = None, exclude_ids: set[str] | None = None) -> dict:
     """The whole report, as a dict. `summarise` asserts nothing; this asserts the partition."""
     mixed = check_prompts(runs, allow_mixed, record)
     hist = partition(runs, has_reference)
     assert sum(hist.values()) == len(runs), (hist, len(runs))
-    return {
+    report = {
         "split": split,
         "tasks": len(runs),
         "mixed_prompts": mixed,
@@ -732,12 +732,27 @@ def summarise(split: str, runs: dict[str, dict[str, list[dict]]],
         "ceiling": ceiling(runs),
         "headroom_curve": headroom_curve(runs),
     }
+    if exclude_ids:
+        # The same measurement over the tasks NOT in `exclude_ids` (for arm A: the test tasks whose
+        # notebook is in its training set, ops/amd/overlap.py), so the held-out number is its own table.
+        kept = {t: r for t, r in runs.items() if t not in exclude_ids}
+        report["without_listed"] = {"excluded_tasks": len(runs) - len(kept), "tasks": len(kept),
+                                    "rungs": rung_stats(kept)}
+    return report
 
 
 def _rows_for(split: str) -> tuple[list[dict], Callable[[str], bool]]:
     rows, _ = source_for(split)
     by_id = {r["task_id"]: r for r in rows}
     return rows, lambda task: task in by_id and read_source(by_id[task], split) is not None
+
+
+def _default_exclusions(split: str) -> set[str]:
+    """The test split's overlap-with-arm-A list, committed beside the AMD code."""
+    path = Path(__file__).resolve().parent.parent / "ops" / "amd" / "overlap_with_arm_a.json"
+    if split != "test" or not path.exists():
+        return set()
+    return set(json.loads(path.read_text())["ids"])
 
 
 def _pct(value: float) -> str:
@@ -762,6 +777,19 @@ def _print(report: dict) -> None:
               f"  [{_pct(low)}, {_pct(high)}]  "
               f"{block['trials_scored']}/{block['trials']} trials scored, "
               f"{block['tasks']} tasks, {block['harness_failures']} harness failures")
+
+    block = report.get("without_listed")
+    if block:
+        print()
+        print(f"the same, WITHOUT the {block['excluded_tasks']} tasks whose notebook is in arm A's "
+              f"training set ({block['tasks']} tasks left; the held-out table)")
+        for rung in ALL:
+            row = block["rungs"][rung]
+            if not row["tasks"]:
+                continue
+            low, high = row["ci95"]
+            print(f"  {rung:<10} {_pct(row['mean_pass_probability'])}  [{_pct(low)}, {_pct(high)}]  "
+                  f"{row['trials_scored']}/{row['trials']} trials scored, {row['tasks']} tasks")
 
     print()
     print("monotonicity: tasks whose pass probability fell as information was added")
@@ -884,6 +912,9 @@ def main() -> None:
                          "report to data/runs/<tag>/summary_<split>.json. Omit it for the legacy "
                          "data/runs/<split>/ tree.")
     ap.add_argument("--out", type=Path, help="where to write the JSON report")
+    ap.add_argument("--no-overlap-table", action="store_true",
+                    help="skip the second table without the test tasks whose notebook is in arm A's "
+                         "training set (ops/amd/overlap_with_arm_a.json; test split only)")
     ap.add_argument("--allow-mixed", action="store_true",
                     help="pool results in one rung that have different prompt hashes, and record "
                          "in the report that they were pooled")
@@ -904,7 +935,8 @@ def main() -> None:
           f"{f'  run tag={args.run_tag}' if args.run_tag else ''}")
 
     try:
-        report = summarise(args.split, runs, reference_at_launch, args.allow_mixed, record)
+        report = summarise(args.split, runs, reference_at_launch, args.allow_mixed, record,
+                           None if args.no_overlap_table else _default_exclusions(args.split))
     except MixedPrompts as e:
         raise SystemExit(f"refusing to pool results from different prompts: {e}")
     report["source_tasks"] = total
