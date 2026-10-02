@@ -88,7 +88,7 @@ if (( CRITICAL_FAILS > 0 )); then
 fi
 
 amd_log "=== B. SFT throughput on the real base, ${BENCH_SECONDS}s at batch ${BENCH_BATCHES[*]} ==="
-"$PY" ops/amd/bench.py run --out "$AMD_REMOTE_LOG/bench.json" --seconds "$BENCH_SECONDS" \
+MODEL="$(amd_base_path)" "$PY" ops/amd/bench.py run --out "$AMD_REMOTE_LOG/bench.json" --seconds "$BENCH_SECONDS" \
   --max-length "$AMD_MAX_LENGTH" --batches "${BENCH_BATCHES[@]}" || { amd_log "benchmark produced nothing trainable"; \
   "$PY" ops/amd/bench.py finalize --checks "$CHECKS" --bench "$AMD_REMOTE_LOG/bench.json" --out "$AMD_REMOTE_LOG/measurements.json"; exit 3; }
 

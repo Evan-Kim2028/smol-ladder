@@ -95,7 +95,8 @@ ds = f"{ns}/smol-ladder-runs-{session}"
 api.create_repo(ds, repo_type="dataset", private=True, exist_ok=True)
 # exist_ok=True leaves a PRE-EXISTING repo as it was, public or not: assert, as for the models.
 assert api.dataset_info(ds).private, f"{ds} is not private"
-path = snapshot_download(os.environ.get("AMD_BASE_MODEL", "Qwen/Qwen3.5-2B"))
+path = snapshot_download(os.environ.get("AMD_BASE_MODEL", "Qwen/Qwen3.5-2B"),
+                     revision=os.environ["AMD_BASE_REVISION"])
 print("base model at", path)
 PYHF
 

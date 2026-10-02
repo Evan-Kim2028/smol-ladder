@@ -4656,3 +4656,66 @@ def test_harness_processes_run_the_repo_venv_python_directly_not_five_uv_runs():
         for c in cmds:
             assert c.argv[0] == str(REPO_ROOT / ".venv" / "bin" / "python") and "uv" not in c.argv[:2]
             assert c.argv[1:3] == ("-m", "smol_ladder.run_ladder")
+
+
+# ═══ LOW: always unpack the staged data; pin the Hub revisions of the base and of R ═══
+
+def test_the_entrypoint_unpacks_the_staged_data_every_time():
+    text = (OPS / "entrypoint.sh").read_text()
+    assert 'tar -xzf "$STAGE/sft_a.tar.gz"' in text and 'tar -xzf "$STAGE/sft_b.tar.gz"' in text
+    assert "[[ -s" not in text.split("# ── 2.")[1].split("cp \"$STAGE/tokens.json\"")[0].replace(
+        '[[ -s "$ROOT/data/train/$f" ]] || die', "")
+
+
+def test_the_entrypoint_replaces_stale_staged_data(tmp_path):
+    """Run just the unpack lines against a stale tree."""
+    import tarfile
+    stage_dir, root = tmp_path / "stage", tmp_path / "root"
+    (root / "data/train/sft_upstream").mkdir(parents=True)
+    stage_dir.mkdir()
+    (root / "data/train/sft_upstream/train.jsonl").write_text("OLD\n")
+    src = tmp_path / "src/sft_upstream"
+    src.mkdir(parents=True)
+    (src / "train.jsonl").write_text("NEW\n")
+    with tarfile.open(stage_dir / "sft_a.tar.gz", "w:gz") as t:
+        t.add(src, arcname="sft_upstream")
+    lines = [ln for ln in (OPS / "entrypoint.sh").read_text().splitlines() if "sft_a.tar.gz" in ln and ln.startswith("tar")]
+    subprocess.run(["bash", "-c", f'STAGE="{stage_dir}"; ROOT="{root}"; {lines[0]}'], check=True)
+    assert (root / "data/train/sft_upstream/train.jsonl").read_text() == "NEW\n"
+
+
+PINNED = {"Qwen/Qwen3.5-2B": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+          "AdithyaSK/smoldataenvs-sft-2b-v0": "19e64721085d859f9f93e85e0400c12097bfbfef"}
+
+
+def test_the_hub_revisions_of_the_base_and_the_released_adapter_are_pinned_in_every_download():
+    common = (OPS / "common.sh").read_text()
+    assert PINNED["Qwen/Qwen3.5-2B"] in common and PINNED["AdithyaSK/smoldataenvs-sft-2b-v0"] in common
+    assert "revision=os.environ[\"AMD_BASE_REVISION\"]" in (OPS / "container_setup.sh").read_text()
+    serve = (OPS / "serve.sh").read_text()
+    assert 'hub_download "$repo" "$rev"' in serve and "AMD_HUB_R_REVISION" in serve
+    assert "--base \"$BASE_PATH\"" in serve and '"$AMD_BASE_MODEL" ' not in serve.split("BASE_PATH=")[1]
+    assert "amd_base_path" in (OPS / "run_sft.sh").read_text()
+    assert "amd_base_path" in (OPS / "resume_check.sh").read_text()
+
+
+def test_amd_base_path_downloads_the_pinned_revision_and_uses_a_local_directory_as_it_is(tmp_path):
+    rec = tmp_path / "args.txt"
+    venv = tmp_path / "venv/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/usr/bin/env bash\ncat > /dev/null\necho "$@" > "{rec}"\necho /snap/dir\n')
+    (venv / "python").chmod(0o755)
+    env = {**os.environ, "AMD_VENV": str(tmp_path / "venv")}
+    run = lambda model: subprocess.run(["bash", "-c", f'source "{OPS}/common.sh"; amd_base_path'],  # noqa: E731
+                                       env={**env, "AMD_BASE_MODEL": model}, capture_output=True, text=True)
+    out = run("Qwen/Qwen3.5-2B")
+    assert out.stdout.strip() == "/snap/dir"
+    assert rec.read_text().split() == ["-", "Qwen/Qwen3.5-2B", PINNED["Qwen/Qwen3.5-2B"]]
+    assert run(str(tmp_path)).stdout.strip() == str(tmp_path)
+
+
+def test_serve_downloads_the_released_adapter_at_its_pinned_revision(serve_env):
+    stub = Path(serve_env["env"]["AMD_VENV"]) / "bin" / "python"
+    run_serve(serve_env, "--wait", "--arms", "", "--hub", HUB_R)
+    assert PINNED["AdithyaSK/smoldataenvs-sft-2b-v0"] in serve_env["downloads"].read_text()
+    assert stub.exists()

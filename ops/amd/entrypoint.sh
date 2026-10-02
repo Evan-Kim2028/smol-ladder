@@ -41,8 +41,10 @@ if [[ "$(cat "$ROOT/.amd-commit" 2>/dev/null || true)" != "$COMMIT" ]]; then
   printf '%s\n' "$COMMIT" > "$ROOT/.amd-commit"
 fi
 mkdir -p "$ROOT/data/train" "$ROOT/runs"
-[[ -s "$ROOT/data/train/sft_upstream/train.jsonl" ]] || tar -xzf "$STAGE/sft_a.tar.gz" -C "$ROOT/data/train"
-[[ -s "$ROOT/data/train/ja3_sft_v2.jsonl" ]] || tar -xzf "$STAGE/sft_b.tar.gz" -C "$ROOT/data/train"
+# Always unpack the staged data (its checksums were verified above): "the files exist" would keep
+# an older session's rows on a droplet that was re-bootstrapped with newer ones.
+tar -xzf "$STAGE/sft_a.tar.gz" -C "$ROOT/data/train"
+tar -xzf "$STAGE/sft_b.tar.gz" -C "$ROOT/data/train"
 for f in sft_upstream/train.jsonl sft_upstream/val.jsonl ja3_sft_v2.jsonl; do
   [[ -s "$ROOT/data/train/$f" ]] || die "missing $ROOT/data/train/$f after unpacking"
 done

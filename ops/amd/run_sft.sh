@@ -87,7 +87,7 @@ BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-$(( AMD_EFFECTIVE_BATCH / BATCH ))}"
 (( ACCUM >= 1 )) || ACCUM=1
 
-CMD=("$PY" -m ops.amd.sft_run --save-steps "$SAVE_STEPS" --data "$DATA" --model "$AMD_BASE_MODEL" --out "$OUT"
+CMD=("$PY" -m ops.amd.sft_run --save-steps "$SAVE_STEPS" --data "$DATA" --model "$(amd_base_path)" --out "$OUT"
      --protocol bash --max-length "$AMD_MAX_LENGTH" --seed "$AMD_SEED" --precision bf16
      --batch-size "$BATCH" --grad-accum "$ACCUM" --hub-model-id "$HUB_REPO" --resume)
 (( MAX_STEPS > 0 )) && CMD+=(--max-steps "$MAX_STEPS")

@@ -38,7 +38,7 @@ DATA="$AMD_DATA_ROOT/train/sft_upstream/train.jsonl"
 [[ -f "$DATA" ]] || amd_die "no arm A rows at $DATA; run entrypoint.sh first"
 rm -rf "$RUN"; mkdir -p "$RUN"
 
-CMD=("$PY" -m train.sft_lora --data "$DATA" --model "$AMD_BASE_MODEL" --out "$RUN"
+CMD=("$PY" -m train.sft_lora --data "$DATA" --model "$(amd_base_path)" --out "$RUN"
      --protocol bash --max-length "$AMD_MAX_LENGTH" --seed "$AMD_SEED" --precision bf16
      --batch-size 2 --grad-accum 1 --max-steps "$STEPS" --logging-steps 2)
 

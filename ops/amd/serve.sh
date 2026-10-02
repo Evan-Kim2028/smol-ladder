@@ -129,6 +129,7 @@ adapter_dir() {
 }
 
 BASE="$(amd_served_name base)"
+BASE_PATH="$(amd_base_path)"       # the pinned revision of the base, as a directory
 NAMES=(); SRCS=(); PORTS=()
 for arm in ${ARMS//,/ }; do
   src="$(adapter_dir "$arm")" || amd_die "arm $arm has no adapter on disk or on the Hub"
@@ -137,7 +138,8 @@ done
 for spec in "${HUBS[@]}"; do   # NAME=owner/repo:PORT
   name="${spec%%=*}"; rest="${spec#*=}"; repo="${rest%:*}"; port="${rest##*:}"
   [[ "$spec" == *=*:* && "$port" =~ ^[0-9]+$ ]] || amd_die "--hub wants NAME=owner/repo:PORT, got '$spec'"
-  src="$(hub_download "$repo")" || amd_die "could not download $repo from the Hub"
+  rev=""; if [[ "$repo" == "$AMD_HUB_R" ]]; then rev="$AMD_HUB_R_REVISION"; fi   # the released adapter, pinned
+  src="$(hub_download "$repo" "$rev")" || amd_die "could not download $repo from the Hub"
   NAMES+=("$(amd_served_name "$name")"); PORTS+=("$port"); SRCS+=("$src")
 done
 
@@ -152,7 +154,7 @@ for k in "${!NAMES[@]}"; do
   # ...and only a merge made FROM this adapter: the report's adapter sha256 must equal the adapter's.
   if ! "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" --adapter "${SRCS[$k]}" >/dev/null 2>&1; then
     "$AMD_VENV/bin/python" ops/amd/merge_adapter.py \
-      --base "$AMD_BASE_MODEL" --adapter "${SRCS[$k]}" --out "$merged" \
+      --base "$BASE_PATH" --adapter "${SRCS[$k]}" --out "$merged" \
       || amd_die "merging ${NAMES[$k]} failed its checks (see merge_report.json in $merged); not serving it"
   fi
   "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" --adapter "${SRCS[$k]}" --label "${NAMES[$k]}" \
@@ -162,7 +164,7 @@ done
 # Models: index 0 is the base, then the adapters in the order given.
 M_NAMES=("$BASE" "${NAMES[@]}")
 M_PORTS=("$PORT" "${PORTS[@]}")
-M_PATHS=("$AMD_BASE_MODEL" "${MERGED[@]}")
+M_PATHS=("$BASE_PATH" "${MERGED[@]}")
 declare -A PIDS=()
 
 # Memory per engine. Session 1 started five engines at once with --gpu-memory-utilization 0.17 and the
@@ -188,7 +190,7 @@ start_model() { # start_model <index>
   mapfile -t kv < <(kv_args)
   if [[ -z "${NO_PREFIX[$i]:-}" && -n "$AMD_PREFIX_ARGS" ]]; then read -r -a prefix <<< "$AMD_PREFIX_ARGS"; fi
   setsid nohup "$SYSPY" -m vllm.entrypoints.openai.api_server \
-    --model "${M_PATHS[$i]}" --tokenizer "$AMD_BASE_MODEL" --served-model-name "${M_NAMES[$i]}" \
+    --model "${M_PATHS[$i]}" --tokenizer "$BASE_PATH" --served-model-name "${M_NAMES[$i]}" \
     --host 127.0.0.1 --port "$port" \
     --dtype bfloat16 --max-model-len "$AMD_MAX_MODEL_LEN" "${kv[@]}" "${prefix[@]}" \
     --enable-auto-tool-choice --tool-call-parser "$AMD_TOOL_PARSER" \

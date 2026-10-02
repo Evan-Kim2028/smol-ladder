@@ -23,6 +23,11 @@ AMD_STOP_CONTAINERS="${AMD_STOP_CONTAINERS:-rocm}"
 
 # ── models, data, training ───────────────────────────────────────────────────────
 AMD_BASE_MODEL="${AMD_BASE_MODEL:-Qwen/Qwen3.5-2B}"
+# Hub revisions, pinned (read-only API call, 2026-10-02): a model repo can change under a name, and
+# a base that moved between session 1 and this one would make "the same recipe" a different one.
+# Everything that downloads a model passes the revision; override only on purpose.
+AMD_BASE_REVISION="${AMD_BASE_REVISION:-15852e8c16360a2fea060d615a32b45270f8a8fc}"        # Qwen/Qwen3.5-2B
+AMD_HUB_R_REVISION="${AMD_HUB_R_REVISION:-19e64721085d859f9f93e85e0400c12097bfbfef}"      # AdithyaSK/smoldataenvs-sft-2b-v0
 AMD_MAX_LENGTH="${AMD_MAX_LENGTH:-8192}"
 AMD_SEED="${AMD_SEED:-42}"
 # The training stack, EXACTLY as session 1 ran it (logs/amd/droplet-logs/versions.log; datasets from the
@@ -106,6 +111,17 @@ amd_load_env() {
 # The python that owns torch and vLLM (the image's). Recorded by the entrypoint.
 amd_syspy() {
   if [[ -f "$AMD_REMOTE_ROOT/.syspy" ]]; then cat "$AMD_REMOTE_ROOT/.syspy"; else command -v python3; fi
+}
+
+# The base model as a local directory at the pinned revision (a cache hit after container_setup.sh).
+# A local directory in AMD_BASE_MODEL (the tests, an offline run) is used as it is.
+amd_base_path() {
+  if [[ -d "$AMD_BASE_MODEL" ]]; then printf '%s\n' "$AMD_BASE_MODEL"; return 0; fi
+  "$AMD_VENV/bin/python" - "$AMD_BASE_MODEL" "$AMD_BASE_REVISION" <<'PYBASE'
+import sys
+from huggingface_hub import snapshot_download
+print(snapshot_download(sys.argv[1], revision=sys.argv[2]))
+PYBASE
 }
 
 amd_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
