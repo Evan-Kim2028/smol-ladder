@@ -3138,3 +3138,132 @@ def test_adapter_check_flags_identical_output_and_reports_agreement(tmp_path, mo
     assert res["differs"] and res["adapter_agreement"] == 1.0 and res["base_agreement"] < 1.0
     outs["adapter"] = outs["base"]
     assert probe_tools.adapter_check(1, "adapter", 1, "base", rows)["differs"] is False
+
+
+# ═══ the gate decision, as pure functions ════════════════════════════════════════════════
+
+from ops.amd import gate as G  # noqa: E402
+
+
+def result(reward=1.0, status="exit 0", stop="model_stopped", pred="1"):
+    return {"agent_status": status, "reward": reward, "stop_reason": stop, "prediction": pred}
+
+
+def tag_dir(root: Path, tag: str, results: dict, split="test"):
+    """results: task id -> result dict, written the way the harness lays them out (sample 0, L1)."""
+    for task, res in results.items():
+        d = root / tag / split / task / "L1"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "result.json").write_text(json.dumps(res))
+
+
+def stats(arm, results, n=None):
+    ids = [f"t{i}" for i in range(n if n is not None else len(results))]
+    return G.stats_for(arm, {f"t{i}": r for i, r in enumerate(results)}, ids)
+
+
+def decide(base, adapter, **over):
+    kw = dict(adapter_name="R", differs=True, tool_calls_ok=True, merge_ok=True, margin=0.05,
+              max_failures=3)
+    kw.update(over)
+    return G.decide(base, adapter, **kw)
+
+
+def mixed(n_pass, n, **kw):
+    return [result(1.0 if i < n_pass else 0.0, **kw) for i in range(n)]
+
+
+def test_the_gate_is_go_when_the_stack_is_healthy_and_the_released_adapter_beats_the_base():
+    d = decide(stats("base", mixed(10, 60)), stats("R", mixed(30, 60)))
+    assert d.go and not d.needs_accept and not d.hard_failures
+    assert "### GATE: GO" in d.lines[-1]
+
+
+def test_harness_failures_above_the_tolerance_are_a_hard_no_go_that_accept_gate_cannot_override():
+    bad = mixed(30, 55) + [result(status="timeout")] * 5
+    d = decide(stats("base", mixed(10, 60)), stats("R", bad), accepted=True)
+    assert not d.go and not d.needs_accept and "R: 5 harness failures of 60" in d.hard_failures[0]
+    ok = mixed(30, 57) + [result(status="timeout")] * 3          # exactly the tolerance
+    assert decide(stats("base", mixed(10, 60)), stats("R", ok)).go
+
+
+def test_a_trial_that_was_never_written_counts_as_a_failure_not_as_a_smaller_sample():
+    # R produced 40 of 60 results: a sweep that died, which looks like "40 trials, all fine" if only
+    # the files that exist are counted
+    ids = [f"t{i}" for i in range(60)]
+    r_results = {f"t{i}": result() for i in range(40)}
+    d = decide(stats("base", mixed(10, 60)), G.stats_for("R", r_results, ids))
+    assert not d.go and any("20 harness failures" in h for h in d.hard_failures)
+
+
+def test_an_adapter_that_is_identical_to_the_base_is_a_no_go_even_with_accept_gate():
+    d = decide(stats("base", mixed(10, 60)), stats("R", mixed(30, 60)), differs=False, accepted=True)
+    assert not d.go and not d.needs_accept
+    assert any("differs from the base's: FAILED" in h for h in d.hard_failures)
+    assert any("not measured" in h for h in decide(stats("base", mixed(1, 60)), stats("R", mixed(30, 60)),
+                                                   differs=None).hard_failures)
+
+
+def test_a_merge_report_that_did_not_pass_or_no_tool_call_is_a_no_go():
+    base, ad = stats("base", mixed(10, 60)), stats("R", mixed(30, 60))
+    assert any("merge report" in h for h in decide(base, ad, merge_ok=False).hard_failures)
+    assert any("tool call" in h for h in decide(base, ad, tool_calls_ok=False).hard_failures)
+
+
+def test_a_rate_below_base_plus_margin_prints_the_comparison_and_needs_accept_gate():
+    base, ad = stats("base", mixed(20, 60)), stats("R", mixed(22, 60))     # +3.3 points, margin 5
+    d = decide(base, ad)
+    assert not d.go and d.needs_accept and not d.hard_failures
+    text = "\n".join(d.lines)
+    assert "pass rate: base 0.333, R 0.367" in text and "required +0.050" in text
+    assert "paired on 60 tasks" in text and "exact sign test" in text
+    assert "--accept-gate" in d.lines[-1]
+    ok = decide(base, ad, accepted=True)
+    assert ok.go and ok.accepted and "ACCEPTED" in ok.lines[-1]
+
+
+def test_the_paired_comparison_counts_each_cell_and_the_exact_sign_test():
+    base = stats("base", [result(1), result(1), result(0), result(0), result(1)])
+    other = stats("R", [result(1), result(0), result(1), result(1), result(1)])
+    p = G.paired(base, other)
+    assert (p["both"], p["only_base"], p["only_other"], p["neither"]) == (2, 1, 2, 0)
+    assert p["p_value"] == pytest.approx(1.0)                  # 1 vs 2 discordant pairs: no evidence
+    wide = G.paired(stats("b", [result(0)] * 12), stats("o", [result(1)] * 12))
+    assert wide["only_other"] == 12 and wide["p_value"] == pytest.approx(2 / 2 ** 12)
+    assert G.paired(stats("b", []), stats("o", []))["p_value"] == 1.0
+
+
+def test_harness_failures_are_left_out_of_the_paired_rates_not_counted_as_model_failures():
+    base = stats("base", [result(1), result(status="timeout"), result(0)])
+    other = stats("R", [result(1), result(1), result(1)])
+    p = G.paired(base, other)
+    assert p["tasks"] == 2 and p["base_rate"] == 0.5 and p["other_rate"] == 1.0
+
+
+def test_the_stop_reason_histograms_show_each_models_share_of_the_three_endings_that_matter():
+    ad = stats("R", [result(stop="answer_submitted")] * 3 + [result(stop="max_turns", pred="")] * 5
+               + [result(stop="context_exhausted", pred="")] * 2)
+    base = stats("base", [result(stop="model_stopped")] * 4 + [result(stop="max_turns", pred="")] * 6)
+    d = decide(stats("base", mixed(1, 10)), ad, max_failures=0)
+    text = "\n".join(d.lines)
+    assert "answer_submitted 3 (30%)" in text and "max_turns 5 (50%)" in text
+    assert "context_exhausted 2 (20%)" in text and "ended with an answer 3 (30%)" in text
+    assert "WARNING: R runs out of turns in at least half its trials" in text
+    assert ad.stop_histogram() == {"answer_submitted": 3, "max_turns": 5, "context_exhausted": 2}
+    assert base.ended_with_answer() == 4
+
+
+def test_the_gate_reads_sample_zero_of_l1_for_a_task_subset_only(tmp_path):
+    root = tmp_path / "runs"
+    tag_dir(root, "x", {"t0": result(), "t1": result(0.0), "t2": result()})
+    d = root / "x" / "test" / "t0" / "L1" / "s1"
+    d.mkdir()
+    (d / "result.json").write_text(json.dumps(result(0.0)))         # sample 1 is not the gate's
+    (root / "x" / "test" / "t0" / "L2").mkdir()
+    (root / "x" / "test" / "t0" / "L2" / "result.json").write_text("{}")
+    got = G.read_results(root, "x", "test", task_ids={"t0", "t1"})
+    assert set(got) == {"t0", "t1"} and G.passed(got["t0"]) and not G.passed(got["t1"])
+    assert G.task_ids_present(root, ["x", "y"], "test") == ["t0", "t1", "t2"]
+    (root / "x" / "test" / "t3" / "L1").mkdir(parents=True)
+    (root / "x" / "test" / "t3" / "L1" / "result.json").write_text("{not json")
+    assert G.is_clean(G.read_results(root, "x", "test")["t3"]) is False
