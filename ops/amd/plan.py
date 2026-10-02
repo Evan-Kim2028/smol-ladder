@@ -227,7 +227,15 @@ def ports(cfg: Config) -> list[int]:
 # ── ssh / scp ─────────────────────────────────────────────────────────────────────
 
 def ssh_opts(cfg: Config) -> list[str]:
-    opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+    # Host keys are deliberately NOT remembered. The droplet is ephemeral and reached by the IP the
+    # API just returned over TLS; providers reuse addresses, so a second session's droplet at an
+    # old IP has a new key and `accept-new` would refuse it ("REMOTE HOST IDENTIFICATION HAS
+    # CHANGED") at the worst moment, while a remembered key would only ever protect a machine that
+    # no longer exists. Authentication is by OUR key, which the droplet cannot forge; the secrets
+    # it receives (the HF token) are scoped to this session. UserKnownHostsFile=/dev/null also
+    # keeps the laptop's real known_hosts out of it.
+    opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=6"]
     if cfg.identity:
@@ -550,6 +558,16 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
         "POST /v2/droplets, then poll GET until active and record the IP in the ledger",
         api=f"POST https://api.digitalocean.com/v2/droplets  {json.dumps(body)}"))
 
+    stage_parts = cfg.remote_stage.strip("/").split("/")
+    if not cfg.remote_stage.startswith("/") or len(stage_parts) < 2 or ".." in stage_parts:
+        raise ValueError(f"remote_stage {cfg.remote_stage!r} is not a safe path to rm -rf")
+    steps.append(Step("bootstrap", "wait-ssh", "laptop", [ssh(cfg, ["true"])], 0.0,
+                      "poll until sshd answers (a droplet is 'active' before it takes logins), "
+                      "retrying for up to 10 minutes", billed=False))
+    steps.append(Step("bootstrap", "clean-stage", "droplet", [ssh(cfg, [
+        "rm", "-rf", "--", cfg.remote_stage])], 0.0,
+        "remove any earlier copy of the stage dir: scp -r onto an existing directory nests the "
+        "upload one level down, and the entry script would verify a stale copy", billed=False))
     steps.append(Step("bootstrap", "upload", "laptop", [scp_up(cfg)], secs("bootstrap") * 0.1,
                       "stage dir to the droplet (tens of MB)"))
     steps.append(Step("bootstrap", "bootstrap", "droplet", [ssh(cfg, [
@@ -577,6 +595,11 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
     steps.append(Step("smoke", "probe-eval", "laptop", [probe_cmd(cfg)],
                       secs("smoke: serve + 20-task probe") * 0.5,
                       "20 tasks of L1 under --agent bash: measures seconds per trial"))
+    steps.append(Step("smoke", "stop-probe-server", "droplet", [remote_script(
+        cfg, "serve.sh", "--stop")], 15.0,
+        "STOP the probe vLLM: it holds ~85% of the GPU, the benchmark chose its batch size on an "
+        "empty card, and a live server counts as work for the idle watchdog. run_sft.sh stops it "
+        "again and asserts the memory is free before any arm trains", reserve=False))
     steps.append(Step("smoke", "go-no-go", "laptop", [Cmd((
         "python", "ops/amd/driver.py", "project", "--budget", f"{cfg.budget:g}"))], 0.0,
         "measured projection for A, B, A+B and the evaluation; STOPS unless it fits the budget",

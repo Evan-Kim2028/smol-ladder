@@ -69,6 +69,16 @@ stop_servers() {
     done < "$PIDFILE"
     rm -f "$PIDFILE"
   fi
+  # Stragglers: a server whose pidfile is gone (an earlier run, a lost log directory) still holds
+  # the card. Sweep by command line, then wait until none is left.
+  local i
+  pkill -f 'vllm\.entrypoints\.openai\.api_server' 2>/dev/null || true
+  for ((i = 0; i < 20; i++)); do
+    pgrep -f 'vllm\.entrypoints\.openai\.api_server' >/dev/null 2>&1 || return 0
+    if (( i == 10 )); then pkill -9 -f 'vllm\.entrypoints\.openai\.api_server' 2>/dev/null || true; fi
+    sleep 2
+  done
+  amd_log "WARNING: a vLLM process is still alive after the stop"
 }
 if (( STOP )); then stop_servers; amd_log "servers stopped"; exit 0; fi
 [[ -n "$MODE" ]] || amd_die "give --all or --probe (or --stop)"

@@ -28,6 +28,10 @@ from pathlib import Path
 DONE = ".done"
 CKPT = re.compile(r"^checkpoint-(\d+)$")
 ADAPTER = "adapter_model.safetensors"
+# Pushed by run_sft.sh LAST, after the adapter and its config: "this is the final adapter". The
+# adapter files alone prove nothing, because hub_strategy="every_save" also leaves a checkpoint's
+# model files in the repo.
+HUB_DONE = "final.done"
 # Files a resumable checkpoint must have. rng_state is written last by the trainer, so its
 # presence means the directory was finished; any of the other three missing means it was not.
 REQUIRED = ("trainer_state.json", ADAPTER, "optimizer.pt", "scheduler.pt")
@@ -106,11 +110,26 @@ def restore_from_hub(out: Path, repo: str, hub) -> int | None:
     return step
 
 
+def hub_final(repo: str, hub) -> bool:
+    """Is the FINAL adapter (not a checkpoint) already in the Hub repo? Any failure to read the
+    repo means "no": training an arm again is the safe error, skipping one is not."""
+    try:
+        files = set(hub.list_files(repo))
+    except Exception:  # noqa: BLE001
+        return False
+    return {HUB_DONE, ADAPTER, "adapter_config.json"} <= files
+
+
 def status(out: Path, repo: str = "", hub=None) -> dict:
-    """One of: done | resume-local | resume-hub | fresh, after pruning and restoring."""
+    """One of: done | resume-local | resume-hub | fresh, after pruning and restoring.
+
+    `done` also covers a FRESH droplet whose arm finished on an earlier one: the final adapter is on
+    the Hub, so training it again would spend an hour to reproduce what is already safe."""
     out.mkdir(parents=True, exist_ok=True)
     if adapter_finished(out):
         return {"state": "done", "step": None}
+    if repo and hub is not None and hub_final(repo, hub):
+        return {"state": "done", "step": None, "source": "hub"}
     pruned = prune_incomplete(out)
     local = [c for c in checkpoints(out)]
     if local:

@@ -37,6 +37,8 @@ AMD_VLLM_WAIT_S="${AMD_VLLM_WAIT_S:-900}"
 AMD_MAX_MODEL_LEN="${AMD_MAX_MODEL_LEN:-16384}"
 # One server for four models: the base is 4.6 GB and an adapter is ~90 MB, so the rest of the
 # card is KV cache, which is what makes four concurrent sweeps fast.
+# That 85% is why the probe server MUST be stopped before any arm trains (the plan has an explicit
+# stop step and run_sft.sh stops it again and then asserts the memory is free).
 AMD_GPU_UTIL="${AMD_GPU_UTIL:-0.85}"
 # qwen3_coder is what the vLLM Qwen3.5 recipe names. If the smoke probe reports raw <tool_call> text,
 # switch the parser here (for example `hermes`) without editing the script.
@@ -83,4 +85,41 @@ amd_served_name() {
     A|B|AB) printf 'amd-%s-2b\n' "$(amd_lower "$1")" ;;
     *) amd_die "unknown model '$1'" ;;
   esac
+}
+
+# ── GPU memory must be free before an arm trains ────────────────────────────────
+# The smoke's probe server holds ~85% of the card (AMD_GPU_UTIL) and the benchmark picked its batch
+# size on an EMPTY card: training beside a live server would run on ~15% of the memory with a batch
+# size nobody measured, and a live vLLM also counts as "work" for the idle watchdog.
+AMD_GPU_FREE_MIN="${AMD_GPU_FREE_MIN:-0.90}"      # fraction of the card that must be free
+
+amd_gpu_free_fraction() {
+  "$AMD_VENV/bin/python" -c 'import torch; free, total = torch.cuda.mem_get_info(); print(free / total)'
+}
+
+amd_assert_gpu_free() {
+  local tries="${AMD_GPU_FREE_TRIES:-12}" i frac=""
+  for ((i = 1; i <= tries; i++)); do
+    frac="$(amd_gpu_free_fraction 2>/dev/null || true)"
+    if [[ -n "$frac" ]] && awk -v f="$frac" -v m="$AMD_GPU_FREE_MIN" 'BEGIN { exit !(f >= m) }'; then
+      amd_log "GPU memory is free (${frac} of the card >= ${AMD_GPU_FREE_MIN})"
+      return 0
+    fi
+    amd_log "GPU memory not free yet (free fraction '${frac:-unreadable}', need ${AMD_GPU_FREE_MIN}); try $i/$tries"
+    sleep "${AMD_GPU_FREE_SLEEP:-5}"
+  done
+  pgrep -af 'vllm|sft_lora' >&2 || true
+  amd_die "GPU memory is not free (free fraction '${frac:-unreadable}', need ${AMD_GPU_FREE_MIN}): something still holds the card. Refusing to train beside it."
+}
+
+# apt-get with a lock timeout and a bounded retry. A fresh image runs unattended-upgrades and
+# cloud-init in the first minutes, and under `set -e` a plain apt-get dies on the dpkg lock.
+amd_apt() {
+  local n tries="${AMD_APT_TRIES:-5}"
+  for ((n = 1; n <= tries; n++)); do
+    if apt-get -o DPkg::Lock::Timeout="${AMD_APT_LOCK_S:-180}" "$@"; then return 0; fi
+    amd_log "apt-get $* failed (attempt $n/$tries)"
+    sleep "${AMD_APT_SLEEP:-10}"
+  done
+  return 1
 }

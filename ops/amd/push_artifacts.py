@@ -39,6 +39,9 @@ def already_there(api, repo: str, name: str, size: int) -> bool:
 
 def push(api, repo: str, log_dir: Path) -> int:
     api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+    # exist_ok leaves a pre-existing repo as it was; logs of our own traces must not go to a public one.
+    if not api.dataset_info(repo).private:
+        raise SystemExit(f"{repo} is not private: refusing to push logs to it")
     n = 0
     for path in wanted(log_dir):
         name = str(path.relative_to(log_dir))

@@ -62,7 +62,7 @@ MISSING=()
 for pkg in curl jq ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || MISSING+=("$pkg"); done
 if (( ${#MISSING[@]} )); then
   log "apt-get install ${MISSING[*]}"
-  apt-get update -qq && apt-get install -y -qq "${MISSING[@]}"
+  amd_apt update -qq && amd_apt install -y -qq "${MISSING[@]}"
 fi
 
 # ── 3. the image's python: the one that has torch AND vllm ───────────────────────
@@ -96,9 +96,11 @@ log "image python: $SYSPY"
 # newer transformers/peft/trl in the venv wins and vLLM, which runs on the image python, is
 # never affected.
 if [[ ! -x "$VENV/bin/python" ]]; then
-  "$SYSPY" -m venv "$VENV" 2>/dev/null || { apt-get install -y -qq python3-venv && "$SYSPY" -m venv "$VENV"; }
+  "$SYSPY" -m venv "$VENV" 2>/dev/null || { amd_apt install -y -qq python3-venv && "$SYSPY" -m venv "$VENV"; }
 fi
-SITE_PARENT="$("$SYSPY" -c 'import site; print(site.getsitepackages()[0])')"
+# The directory the image's torch is actually installed in (<site-packages>/torch/__init__.py), not
+# getsitepackages()[0], which on some images is a different directory than the one holding torch.
+SITE_PARENT="$("$SYSPY" -c 'import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))')"
 SITE_VENV="$("$VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
 printf '%s\n' "$SITE_PARENT" > "$SITE_VENV/zz-image-site.pth"
 TORCH_V="$("$SYSPY" -c 'import torch; print(torch.__version__.split("+")[0])')"
@@ -131,15 +133,19 @@ for name in (os.environ.get("AMD_HUB_ADAPTER_A", "smol-ladder-sft-a"),
              os.environ.get("AMD_HUB_ADAPTER_AB", "smol-ladder-sft-ab")):
     api.create_repo(f"{ns}/{name}", repo_type="model", private=True, exist_ok=True)
     assert api.model_info(f"{ns}/{name}").private, f"{ns}/{name} is not private"
-api.create_repo(f"{ns}/{os.environ.get('AMD_HUB_ARTIFACTS', 'smol-ladder-runs')}",
-                repo_type="dataset", private=True, exist_ok=True)
+ds = f"{ns}/{os.environ.get('AMD_HUB_ARTIFACTS', 'smol-ladder-runs')}"
+api.create_repo(ds, repo_type="dataset", private=True, exist_ok=True)
+# exist_ok=True leaves a PRE-EXISTING repo as it was, public or not: assert, as for the models.
+assert api.dataset_info(ds).private, f"{ds} is not private"
 path = snapshot_download(os.environ.get("AMD_BASE_MODEL", "Qwen/Qwen3.5-2B"))
 print("base model at", path)
 PYHF
 
 # ── 6. the on-droplet watchdog ───────────────────────────────────────────────────
 if ! pgrep -f 'ops/amd/watchdog.sh' >/dev/null; then
-  nohup bash "$ROOT/ops/amd/watchdog.sh" --arm >>"$LOGDIR/watchdog.log" 2>&1 &
+  # setsid + </dev/null: the ssh session that runs this script ends, and a watchdog that is still
+  # attached to its terminal gets SIGHUP and dies with it, or holds the ssh channel open.
+  setsid nohup bash "$ROOT/ops/amd/watchdog.sh" --arm >>"$LOGDIR/watchdog.log" 2>&1 </dev/null &
   log "watchdog armed (pid $!)"
 fi
 log "entrypoint complete at $COMMIT. Next: bash $ROOT/ops/amd/smoke.sh"

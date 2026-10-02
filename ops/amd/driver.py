@@ -525,6 +525,11 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
             code = do_create(cfg, api, new_session)
         elif step.name == "destroy":
             code = 0 if cloud.destroy(api, cfg.tag, ledger) else 1
+        elif step.name == "wait-ssh":
+            code = wait_for_ssh(cfg)
+        elif step.name == "upload":
+            check_stage_for_upload(cfg)
+            code, out = run_cmd(step.cmds[0], cfg.host, timeout=P.step_timeout(step))
         elif step.name == "go-no-go":
             code = 0 if cmd_project(cfg, L.read(ledger)) else 3
         elif step.name == "verify-sync":
@@ -542,6 +547,9 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
         wall = time.time() - t0
         L.append(ledger, L.STEP_END, step=step.name, code=code, seconds=round(wall, 1),
                  projected_seconds=step.seconds)
+        if step.name == "bootstrap" and code == 0:
+            # The HF token has done its job (it is on the droplet now); it must not sit in /tmp.
+            Path(cfg.stage_dir, "remote.env").unlink(missing_ok=True)
         if step.name == "smoke-pull" and code == 0:
             data = json.loads(Path(cfg.local_logs, "measurements.json").read_text())
             L.append(ledger, L.MEASURED, **parse_measurements(data))
@@ -639,6 +647,38 @@ def go(cfg: P.Config, steps: list[P.Step], api, now=time.time) -> int:
                     best_effort_sync(cfg, steps)
                 run_steps(cfg, [s for s in steps if s.name in ("tunnel-down", "destroy")], api)
     return 0
+
+
+SSH_WAIT_S = 600.0
+
+
+def wait_for_ssh(cfg: P.Config, runner=None, sleep=time.sleep, clock=time.monotonic,
+                 limit: float = SSH_WAIT_S, interval: float = 10.0) -> int:
+    """A droplet is `active` in the API before sshd takes logins, so the first scp would fail on a
+    perfectly healthy machine. Poll a trivial command until it works, up to `limit` seconds."""
+    runner = runner or run_cmd
+    cmd = P.ssh(cfg, ["true"])
+    start = clock()
+    attempt = 0
+    while True:
+        attempt += 1
+        code, _ = runner(cmd, cfg.host, timeout=30.0)
+        if code == 0:
+            print(f"  sshd answered on attempt {attempt}")
+            return 0
+        if clock() - start >= limit:
+            print(f"  sshd did not answer within {limit:.0f}s ({attempt} attempts)")
+            return 1
+        print(f"  sshd not ready (attempt {attempt}); retrying in {interval:.0f}s")
+        sleep(interval)
+
+
+def check_stage_for_upload(cfg: P.Config) -> None:
+    stage = Path(cfg.stage_dir)
+    if not (stage / "remote.env").exists():
+        raise SystemExit(f"{stage}/remote.env is missing. It is deleted after every successful "
+                         "bootstrap on purpose (it holds the HF token). Re-run `ops/amd/stage.py` "
+                         "(free) and upload again.")
 
 
 def do_create(cfg: P.Config, api, new_session: bool = False) -> int:

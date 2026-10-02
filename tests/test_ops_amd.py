@@ -416,8 +416,9 @@ def test_the_deadline_is_bounded_by_what_the_budget_buys():
 
 def test_the_session_runs_in_the_order_the_reviewer_runs_it():
     n = names(plan_for())
-    order = ["stage-inputs", "preflight", "deadman", "create", "upload", "bootstrap",
-             "smoke-checks", "smoke-pull", "probe-serve", "probe-tunnel", "probe-eval", "go-no-go",
+    order = ["stage-inputs", "preflight", "deadman", "create", "wait-ssh", "clean-stage", "upload",
+             "bootstrap", "smoke-checks", "smoke-pull", "probe-serve", "probe-tunnel", "probe-eval",
+             "stop-probe-server", "go-no-go",
              "sft-A", "sft-B", "sft-AB", "serve", "tunnel", "eval-L1", "eval-L2", "eval-L3",
              "eval-L4", "eval-control", "sync-droplet", "sync-pull", "verify-sync", "tunnel-down",
              "destroy"]
@@ -604,6 +605,13 @@ def test_the_tunnel_binds_loopback_fails_fast_and_uses_a_control_socket():
     assert list(P.tunnel_down(cfg()).argv[-3:-1]) == ["-O", "exit"]
 
 
+def test_ssh_does_not_remember_host_keys_of_an_ephemeral_droplet_and_says_why():
+    a = P.ssh(cfg(), ["true"]).argv
+    assert "StrictHostKeyChecking=no" in a and "UserKnownHostsFile=/dev/null" in a
+    assert "accept-new" not in " ".join(a)
+    assert "ephemeral" in inspect_source(P.ssh_opts) and "reuse" in inspect_source(P.ssh_opts)
+
+
 def test_ssh_is_batch_mode_and_keepalive_so_a_bad_key_fails_instead_of_hanging():
     a = P.ssh(cfg(), ["true"]).argv
     assert "BatchMode=yes" in a and "ServerAliveInterval=30" in a
@@ -612,6 +620,18 @@ def test_ssh_is_batch_mode_and_keepalive_so_a_bad_key_fails_instead_of_hanging()
 
 
 # ═══ the multi-LoRA serve command: run the real script against a stub python ═══════
+
+def stub_process_tools(tmp_path) -> tuple[Path, Path]:
+    """pgrep that finds nothing and a pkill that only records its arguments: the scripts under test
+    sweep for vLLM by command line, and a test must never touch a real process."""
+    bin_dir, kills = tmp_path / "stubbin", tmp_path / "kills.txt"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "pgrep").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (bin_dir / "pkill").write_text(f'#!/usr/bin/env bash\necho "$*" >> "{kills}"\nexit 1\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    return bin_dir, kills
+
 
 @pytest.fixture
 def fake_remote(tmp_path):
@@ -628,8 +648,9 @@ def fake_remote(tmp_path):
     stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{rec}"\n')
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
     (root / ".syspy").write_text(str(stub) + "\n")
-    env = {"PATH": os.environ["PATH"], "AMD_REMOTE_ROOT": str(root), "AMD_REMOTE_LOG": str(log),
-           "AMD_HUB_NAMESPACE": "ns", "HOME": str(tmp_path)}
+    bin_dir, _ = stub_process_tools(tmp_path)
+    env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "AMD_REMOTE_ROOT": str(root),
+           "AMD_REMOTE_LOG": str(log), "AMD_HUB_NAMESPACE": "ns", "HOME": str(tmp_path)}
     return env, rec
 
 
@@ -720,13 +741,16 @@ def fake_trainer(tmp_path):
         #!/usr/bin/env bash
         case "$*" in
           *ops.amd.resume*) echo "{{\\"state\\": \\"${{STUB_STATE:-fresh}}\\", \\"step\\": null}}" ;;
+          *mem_get_info*) echo "${{STUB_FREE:-0.97}}" ;;
           *train.sft_lora*) printf '%s\\n' "$@" > "{rec}" ;;
           *) cat > /dev/null ;;
         esac
         """))
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-    env = {"PATH": os.environ["PATH"], "AMD_REMOTE_ROOT": str(root), "AMD_REMOTE_LOG": str(log),
-           "AMD_VENV": str(venv), "AMD_HUB_NAMESPACE": "ns", "HOME": str(tmp_path)}
+    bin_dir, _ = stub_process_tools(tmp_path)
+    env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "AMD_REMOTE_ROOT": str(root),
+           "AMD_REMOTE_LOG": str(log), "AMD_VENV": str(venv), "AMD_HUB_NAMESPACE": "ns",
+           "HOME": str(tmp_path), "AMD_GPU_FREE_SLEEP": "0", "AMD_GPU_FREE_TRIES": "2"}
     return env, rec, root, log
 
 
@@ -2391,3 +2415,277 @@ def test_the_driver_main_installs_the_handlers():
 def inspect_source(fn) -> str:
     import inspect
     return inspect.getsource(fn)
+
+
+# ═══ the probe server must be gone before an arm trains ═════════════════════════════
+
+def test_the_plan_stops_the_probe_server_after_the_probe_eval_and_before_the_go_no_go():
+    steps = plan_for()
+    n = names(steps)
+    assert n.index("probe-eval") < n.index("stop-probe-server") < n.index("go-no-go") < n.index("sft-A")
+    stop = steps[n.index("stop-probe-server")]
+    assert stop.cmds[0].argv[-2:] == (f"{cfg().remote_root}/ops/amd/serve.sh", "--stop") or \
+        list(stop.cmds[0].argv[-3:]) == ["bash", f"{cfg().remote_root}/ops/amd/serve.sh", "--stop"]
+    assert stop.reserve is False      # never refused by the budget gate: it only ever saves money
+
+
+def test_run_sft_stops_any_server_first_and_refuses_to_train_on_a_busy_gpu(fake_trainer, tmp_path):
+    env, rec, _, _ = fake_trainer
+    kills = tmp_path / "kills.txt"
+    out = subprocess.run(["bash", str(OPS / "run_sft.sh"), "--arm", "A"], capture_output=True,
+                         text=True, timeout=60, env={**env, "STUB_FREE": "0.15"})
+    assert out.returncode != 0 and "GPU memory is not free" in out.stderr
+    assert not rec.exists()                      # the trainer never started
+    assert "vllm" in kills.read_text()           # but the sweep for a live server did run first
+
+
+def test_run_sft_trains_when_the_gpu_is_free_and_says_so(fake_trainer):
+    argv = run_sft(fake_trainer, "--arm", "A")
+    assert argv[:2] == ["-m", "train.sft_lora"]
+
+
+def test_run_sft_on_a_finished_arm_does_not_need_a_free_gpu(fake_trainer):
+    env, rec, _, _ = fake_trainer
+    out = subprocess.run(["bash", str(OPS / "run_sft.sh"), "--arm", "A"], capture_output=True,
+                         text=True, timeout=60, env={**env, "STUB_STATE": "done", "STUB_FREE": "0.1"})
+    assert out.returncode == 0 and "already finished" in out.stderr
+
+
+def test_serve_stop_sweeps_stragglers_by_command_line_not_only_by_pidfile(fake_remote, tmp_path):
+    env, _ = fake_remote
+    out = subprocess.run(["bash", str(OPS / "serve.sh"), "--stop"], env=env, capture_output=True,
+                         text=True, timeout=60)
+    assert out.returncode == 0 and "servers stopped" in out.stderr
+    assert "vllm" in (tmp_path / "kills.txt").read_text()
+
+
+def test_the_watchdog_does_not_count_a_server_the_plan_has_stopped_as_work():
+    # Documented in the plan: the idle trip counts vLLM as work, which is why it must be stopped.
+    assert "vllm" in (OPS / "watchdog.sh").read_text()
+    assert "stop-probe-server" in names(plan_for())
+
+
+# ═══ sync_back.sh: runs for real, in a temp dir, with stubs ═════════════════════════
+
+@pytest.fixture
+def sync_env(tmp_path):
+    root, log, venv = tmp_path / "root", tmp_path / "log", tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    root.mkdir()
+    log.mkdir()
+    (root / "tokens.json").write_text("{}")
+    rec = tmp_path / "py.txt"
+    stub = venv / "bin" / "python"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{rec}"\n')
+    stub.chmod(0o755)
+    env = {"PATH": os.environ["PATH"], "AMD_REMOTE_ROOT": str(root), "AMD_REMOTE_LOG": str(log),
+           "AMD_VENV": str(venv), "AMD_HUB_NAMESPACE": "ns", "HOME": str(tmp_path)}
+    return env, root, log, rec
+
+
+def run_sync(sync_env, *args):
+    env, *_ = sync_env
+    return subprocess.run(["bash", str(OPS / "sync_back.sh"), *args], env=env, capture_output=True,
+                          text=True, timeout=60)
+
+
+def test_sync_back_succeeds_when_no_arm_has_finished_and_adapters_does_not_exist(sync_env):
+    _, root, log, _ = sync_env
+    assert not (log / "adapters").exists()
+    out = run_sync(sync_env, "--arms", "A,B,AB")
+    assert out.returncode == 0, out.stderr
+    assert "finished arms copied: none" in out.stderr and "sync complete" in out.stderr
+    assert (log / "SHA256SUMS.artifacts").exists() and (log / "SHA256SUMS.artifacts").read_text() == ""
+    assert (log / "tokens.json").exists()           # the logs still come home
+
+
+def test_sync_back_still_pushes_the_logs_when_no_arm_has_finished(sync_env):
+    _, _, _, rec = sync_env
+    out = run_sync(sync_env, "--push-hub", "--arms", "A,B")
+    assert out.returncode == 0, out.stderr
+    calls = rec.read_text()
+    assert "push_artifacts.py --repo ns/smol-ladder-runs" in calls and "--verify" not in calls
+
+
+def test_sync_back_copies_a_finished_arm_checksums_it_and_verifies_only_that_arm_on_the_hub(sync_env):
+    _, root, log, rec = sync_env
+    arm = root / "runs" / "sft_a"
+    arm.mkdir(parents=True)
+    for f in ("adapter_config.json", "adapter_model.safetensors", ".done"):
+        (arm / f).write_text("x")
+    out = run_sync(sync_env, "--push-hub", "--arms", "A,B,AB")
+    assert out.returncode == 0, out.stderr
+    sums = (log / "SHA256SUMS.artifacts").read_text()
+    assert "adapters/A/adapter_model.safetensors" in sums and "adapters/B" not in sums
+    verify = [l for l in rec.read_text().splitlines() if "--verify" in l]
+    assert verify == [f"{root}/ops/amd/push_artifacts.py --verify ns/smol-ladder-sft-a"]
+
+
+# ═══ bootstrap first contact ════════════════════════════════════════════════════════
+
+def test_the_upload_is_idempotent_the_stage_dir_is_removed_first_and_waits_for_sshd():
+    steps = plan_for()
+    n = names(steps)
+    assert n.index("create") < n.index("wait-ssh") < n.index("clean-stage") < n.index("upload") < n.index("bootstrap")
+    clean = steps[n.index("clean-stage")].cmds[0].argv
+    up = steps[n.index("upload")].cmds[0].argv
+    assert list(clean[-4:]) == ["rm", "-rf", "--", cfg().remote_stage]
+    assert up[-1].endswith(f":{cfg().remote_stage}")          # the same path the rm cleared
+
+
+def test_a_remote_stage_that_is_not_a_safe_rm_target_is_refused_when_planning():
+    for bad in ("/", "/tmp", "relative/path", "/var/../etc"):
+        with pytest.raises(ValueError):
+            plan_for(cfg(remote_stage=bad))
+
+
+def test_wait_for_ssh_retries_until_sshd_answers():
+    c, tries, naps = cfg(), [], []
+
+    def runner(cmd, host, timeout=None):
+        tries.append(timeout)
+        return (255, "") if len(tries) < 4 else (0, "")
+    assert driver.wait_for_ssh(c, runner=runner, sleep=naps.append, clock=lambda: 0.0) == 0
+    assert len(tries) == 4 and naps == [10.0] * 3 and all(t == 30.0 for t in tries)
+
+
+def test_wait_for_ssh_gives_up_after_its_limit():
+    clock = Clock(0.0)
+    code = driver.wait_for_ssh(cfg(), runner=lambda *a, **k: (255, ""), sleep=clock.sleep,
+                               clock=clock, limit=100.0)
+    assert code == 1 and clock.t >= 100.0
+
+
+# ═══ entrypoint.sh ══════════════════════════════════════════════════════════════════
+
+def test_apt_runs_under_a_lock_timeout_and_a_bounded_retry(tmp_path):
+    bin_dir, count = tmp_path / "bin", tmp_path / "count"
+    bin_dir.mkdir()
+    (bin_dir / "apt-get").write_text(f'#!/usr/bin/env bash\necho "$*" >> "{count}"\n'
+                                     f'[[ $(wc -l < "{count}") -ge 3 ]]\n')
+    (bin_dir / "apt-get").chmod(0o755)
+    env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "AMD_APT_SLEEP": "0"}
+    ok = subprocess.run(["bash", "-c", f"source {OPS}/common.sh; amd_apt install -y curl"],
+                        env=env, capture_output=True, text=True, timeout=30)
+    assert ok.returncode == 0                                # succeeded on the third attempt
+    first = count.read_text().splitlines()[0]
+    assert "DPkg::Lock::Timeout=180" in first and "install -y curl" in first
+    count.write_text("x\n" * 0)
+    (bin_dir / "apt-get").write_text(f'#!/usr/bin/env bash\necho "$*" >> "{count}"\nexit 100\n')
+    bad = subprocess.run(["bash", "-c", f"source {OPS}/common.sh; amd_apt update"],
+                         env={**env, "AMD_APT_TRIES": "4"}, capture_output=True, text=True, timeout=30)
+    assert bad.returncode != 0 and len(count.read_text().splitlines()) == 4     # bounded
+
+
+def test_the_entrypoint_uses_the_bounded_apt_helper_everywhere():
+    text = (OPS / "entrypoint.sh").read_text()
+    code = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+    assert not any(re.search(r"(^|[;&|]\s*)apt-get ", l) for l in code)
+    assert sum("amd_apt" in l for l in code) == 2     # the package install and python3-venv
+
+
+def test_the_pth_layering_derives_the_site_dir_from_where_torch_is_installed():
+    text = (OPS / "entrypoint.sh").read_text()
+    assert "dirname(os.path.dirname(torch.__file__))" in text
+    assert 'SITE_PARENT="$("$SYSPY" -c \'import site' not in text
+
+
+def test_the_pth_expression_on_a_fake_site_packages(tmp_path):
+    sp = tmp_path / "lib" / "python3.12" / "site-packages"
+    (sp / "torch").mkdir(parents=True)
+    (sp / "torch" / "__init__.py").write_text("")
+    out = subprocess.run([sys.executable, "-c", "import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))"],
+                         env={"PATH": os.environ["PATH"], "PYTHONPATH": str(sp)}, capture_output=True, text=True)
+    assert out.stdout.strip() == str(sp)
+
+
+def test_the_dataset_repo_is_asserted_private_even_when_it_pre_exists():
+    assert "api.dataset_info(ds).private" in (OPS / "entrypoint.sh").read_text()
+    assert "dataset_info(repo).private" in (OPS / "push_artifacts.py").read_text()
+
+
+def test_push_refuses_a_public_pre_existing_dataset_repo(tmp_path):
+    from ops.amd import push_artifacts
+
+    class Api:
+        def create_repo(self, *a, **k): pass
+        def dataset_info(self, repo): return type("I", (), {"private": False})()
+    with pytest.raises(SystemExit, match="not private"):
+        push_artifacts.push(Api(), "ns/runs", tmp_path)
+
+
+def test_the_watchdog_is_started_detached_with_no_stdin():
+    line = next(l for l in (OPS / "entrypoint.sh").read_text().splitlines() if "watchdog.sh\" --arm" in l)
+    assert "setsid" in line and "</dev/null" in line
+
+
+# ═══ the remote.env lives on the laptop only until the bootstrap succeeds ═══════════
+
+def test_remote_env_is_deleted_from_the_laptop_stage_dir_after_a_successful_bootstrap(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    (stage_dir / "remote.env").write_text("HF_TOKEN=hf_secret\n")
+    c = cfg(ledger=str(hb(tmp_path, time_now())), stage_dir=str(stage_dir),
+            local_logs=str(tmp_path / "logs"))
+    monkeypatch.setattr(driver, "run_cmd", lambda *a, **k: (0, ""))
+    steps = [s for s in plan_for(c) if s.name == "bootstrap"]
+    driver.run_steps(c, steps, None)
+    assert not (stage_dir / "remote.env").exists()
+
+
+def test_remote_env_survives_a_failed_bootstrap_so_it_can_be_retried(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    (stage_dir / "remote.env").write_text("HF_TOKEN=hf_secret\n")
+    c = cfg(ledger=str(hb(tmp_path, time_now())), stage_dir=str(stage_dir),
+            local_logs=str(tmp_path / "logs"))
+    monkeypatch.setattr(driver, "run_cmd", lambda *a, **k: (1, ""))
+    with pytest.raises(SystemExit):
+        driver.run_steps(c, [s for s in plan_for(c) if s.name == "bootstrap"], None)
+    assert (stage_dir / "remote.env").exists()
+
+
+def test_uploading_without_remote_env_says_to_re_stage(tmp_path):
+    c = cfg(stage_dir=str(tmp_path))
+    with pytest.raises(SystemExit, match="stage.py"):
+        driver.check_stage_for_upload(c)
+
+
+def time_now() -> float:
+    return __import__("time").time()
+
+
+# ═══ resume: an arm that finished on an earlier droplet is skipped on a fresh one ═══
+
+class FinalHub(HubStub):
+    def __init__(self, files, tmp_path):
+        super().__init__(None, tmp_path)
+        self.files = files
+
+    def list_files(self, repo):
+        return list(self.files)
+
+
+def test_an_arm_whose_final_adapter_is_on_the_hub_is_skipped_on_a_fresh_droplet(tmp_path):
+    hub = FinalHub(["adapter_config.json", "adapter_model.safetensors", resume.HUB_DONE,
+                    "last-checkpoint/trainer_state.json"], tmp_path)
+    res = resume.status(tmp_path / "fresh-disk", "ns/sft-a", hub)
+    assert res["state"] == "done" and res["source"] == "hub" and hub.downloads == 0
+
+
+def test_adapter_files_on_the_hub_without_the_final_marker_are_just_a_checkpoint_and_training_resumes(tmp_path):
+    # hub_strategy="every_save" leaves a checkpoint's model files in the repo: not proof of "finished"
+    hub = FinalHub(["adapter_config.json", "adapter_model.safetensors"], tmp_path)
+    assert resume.status(tmp_path / "d", "ns/sft-a", hub)["state"] == "fresh"
+
+
+def test_an_unreadable_hub_repo_never_skips_an_arm(tmp_path):
+    class Broken(HubStub):
+        def list_files(self, repo): raise OSError("hub down")
+    assert resume.status(tmp_path / "d", "ns/sft-a", Broken(None, tmp_path))["state"] == "fresh"
+
+
+def test_the_final_marker_is_uploaded_last_by_run_sft():
+    text = (OPS / "run_sft.sh").read_text()
+    order = [text.index(s) for s in ('path_in_repo=ADAPTER', 'path_in_repo="adapter_config.json"', "path_in_repo=HUB_DONE")]
+    assert order == sorted(order)

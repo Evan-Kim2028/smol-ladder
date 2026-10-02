@@ -30,6 +30,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 PY="$AMD_VENV/bin/python"
+# No arm may have finished (a sync after a reclaim, or a failed smoke): the directory must still
+# exist or `find` fails, and under pipefail that aborts the script before it pushes the logs.
+mkdir -p "$AMD_REMOTE_LOG/adapters"
 FINISHED=()
 for arm in ${ARMS//,/ }; do
   dir="$(amd_arm_dir "$arm")"
@@ -41,7 +44,7 @@ for arm in ${ARMS//,/ }; do
 done
 cp "$AMD_REMOTE_ROOT/tokens.json" "$AMD_REMOTE_LOG/" 2>/dev/null || true
 
-( cd "$AMD_REMOTE_LOG" && find adapters -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum > SHA256SUMS.artifacts.tmp \
+( cd "$AMD_REMOTE_LOG" && find adapters -type f -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS.artifacts.tmp \
   && mv SHA256SUMS.artifacts.tmp SHA256SUMS.artifacts )
 amd_log "finished arms copied: ${FINISHED[*]:-none}; checksums in $AMD_REMOTE_LOG/SHA256SUMS.artifacts"
 
