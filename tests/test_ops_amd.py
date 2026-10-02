@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -1763,15 +1764,16 @@ def test_every_subprocess_the_driver_starts_gets_the_stripped_environment(monkey
     seen = []
 
     class Spy:
-        def __init__(self, *a, **kw): seen.append(kw.get("env")); self.returncode = 0; self.stdout = ""
+        def __init__(self, *a, **kw):
+            seen.append(kw.get("env")); self.returncode = 0; self.stdout = iter(())
         def wait(self, *a, **kw): return 0
+        def poll(self): return 0
+        def kill(self): pass
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
     monkeypatch.setattr(driver.subprocess, "Popen", Spy)
     monkeypatch.setattr(driver.subprocess, "call", lambda *a, **kw: seen.append(kw.get("env")) or 0)
-    monkeypatch.setattr(driver.subprocess, "run", lambda *a, **kw: seen.append(kw.get("env")) or
-                        type("R", (), {"stdout": "", "returncode": 0})())
     c = cfg()
     driver.run_cmd(P.ssh(c, ["true"]), c.host)
     driver.run_cmd(P.ssh(c, ["true"]), c.host, capture=True)
@@ -2203,3 +2205,189 @@ def test_a_failed_account_listing_is_reported_but_does_not_undo_a_verified_destr
     assert cloud.destroy(NoAudit(tagged=[droplet()]), "smol-ladder", led, sleep=lambda s: None,
                          now=lambda: T0 + HOUR)
     assert "could not audit" in capsys.readouterr().out
+
+
+# ═══ `go`: the destroy happens ══════════════════════════════════════════════════════
+
+class GoRecorder:
+    """Replaces run_steps/best_effort_sync inside `go`. `fail` maps a phase to an exception."""
+
+    def __init__(self, fail=None):
+        self.log, self.fail = [], fail or {}
+
+    def run_steps(self, cfg, steps, api=None, only="", new_session=False):
+        names = [s.name for s in steps]
+        if only:
+            self.log.append(only)
+            if only in self.fail:
+                raise self.fail[only]
+        else:
+            self.log.extend(names)
+
+    def best_effort_sync(self, cfg, steps, **kw):
+        self.log.append("best-effort-sync")
+        return True
+
+
+@pytest.fixture
+def go_env(monkeypatch, tmp_path):
+    rec = GoRecorder()
+    monkeypatch.setattr(driver, "run_steps", rec.run_steps)
+    monkeypatch.setattr(driver, "best_effort_sync", rec.best_effort_sync)
+    c = cfg(ledger=str(tmp_path / "l.jsonl"))
+    return rec, c, plan_for(c)
+
+
+def test_go_runs_the_phases_in_order_then_tears_down_exactly_once(go_env):
+    rec, c, steps = go_env
+    assert driver.go(c, steps, None) == 0
+    assert rec.log == ["train", "serve", "tunnel", "eval", "sync", "tunnel-down", "destroy"]
+
+
+def test_go_reaches_destroy_when_a_step_raises_and_syncs_first(go_env):
+    rec, c, steps = go_env
+    rec.fail["eval"] = RuntimeError("the harness fell over")
+    with pytest.raises(RuntimeError):
+        driver.go(c, steps, None)
+    assert rec.log == ["train", "serve", "tunnel", "eval", "best-effort-sync", "tunnel-down", "destroy"]
+
+
+def test_go_reaches_destroy_when_a_gate_refuses_mid_run(go_env):
+    rec, c, steps = go_env
+    rec.fail["train"] = SystemExit("STOPPING BEFORE 'sft-B'")
+    with pytest.raises(SystemExit):
+        driver.go(c, steps, None)
+    assert rec.log[-3:] == ["best-effort-sync", "tunnel-down", "destroy"]
+
+
+def test_go_reaches_destroy_on_ctrl_c(go_env):
+    rec, c, steps = go_env
+    rec.fail["serve"] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        driver.go(c, steps, None)
+    assert rec.log[-1] == "destroy"
+
+
+def test_a_failed_verify_sync_stops_before_the_destroy_and_says_so(go_env, capsys):
+    rec, c, steps = go_env
+    rec.fail["sync"] = driver.SyncUnverified("verify-sync FAILED")
+    with pytest.raises(driver.SyncUnverified):
+        driver.go(c, steps, None, now=lambda: T0)
+    assert "destroy" not in rec.log and "best-effort-sync" not in rec.log
+    out = capsys.readouterr().out
+    assert "STOPPING BEFORE THE DESTROY" in out and "still up and BILLING" in out
+
+
+def test_a_failed_verify_sync_is_overridden_when_the_budget_forces_the_destroy(go_env, capsys):
+    rec, c, steps = go_env
+    L.append(c.ledger, L.CREATED, now=T0, price_per_hour=2.46)
+    rec.fail["sync"] = driver.SyncUnverified("verify-sync FAILED")
+    with pytest.raises(driver.SyncUnverified):
+        driver.go(c, steps, None, now=lambda: T0 + 14.2 * HOUR)   # 30 min more would pass $35
+    assert rec.log[-3:] == ["best-effort-sync", "tunnel-down", "destroy"]
+    out = capsys.readouterr().out
+    assert "FORCED DESTROY" in out and "LOST" in out and "$35.00" in out
+
+
+def test_a_failed_verify_sync_is_overridden_when_the_deadman_deadline_is_near(go_env):
+    rec, c, steps = go_env
+    L.heartbeat_write(c.ledger, T0, last_ok=T0, poll_seconds=30, tag="smol-ladder",
+                      deadline=T0 + 600, budget=35.0, total_cap=90.0)
+    rec.fail["sync"] = driver.SyncUnverified("verify-sync FAILED")
+    with pytest.raises(driver.SyncUnverified):
+        driver.go(c, steps, None, now=lambda: T0)
+    assert rec.log[-1] == "destroy"
+
+
+def test_best_effort_sync_is_bounded_guarded_and_never_blocks_the_destroy(tmp_path):
+    c = cfg(ledger=str(tmp_path / "l.jsonl"))
+    calls = []
+
+    def runner(cmd, host, timeout=None):
+        calls.append((cmd.argv[0], timeout))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired("ssh", timeout)
+        return 1, ""
+    assert driver.best_effort_sync(c, plan_for(c), runner=runner, timeout=99.0) is False
+    assert [x[1] for x in calls] == [99.0, 99.0] and len(calls) == 2     # both tried, both bounded
+
+
+GO_HARNESS = textwrap.dedent('''
+    import sys, time
+    from pathlib import Path
+    sys.path.insert(0, {repo!r})
+    from ops.amd import driver, plan as P
+    record = Path({record!r})
+    def note(s):
+        with record.open("a") as fh:
+            fh.write(s + "\\n")
+    def fake_run_steps(cfg, steps, api=None, only="", new_session=False):
+        if only == "train":
+            print("READY", flush=True)
+            time.sleep(60)                      # "training", until the signal arrives
+        elif not only:
+            note("+".join(s.name for s in steps))   # the teardown: tunnel-down + destroy
+    driver.run_steps = fake_run_steps
+    driver.best_effort_sync = lambda cfg, steps, **kw: note("best-effort-sync")
+    driver.install_signal_handlers()
+    cfg = P.Config(host="203.0.113.9", fingerprint="aa", ledger={ledger!r})
+    driver.go(cfg, P.build_plan(cfg, {{}}, P.Measured()), None)
+''')
+
+
+def run_go_harness(tmp_path, sig, second_signal=False):
+    record = tmp_path / "record.txt"
+    script = tmp_path / "harness.py"
+    script.write_text(GO_HARNESS.format(repo=str(REPO_ROOT), record=str(record),
+                                        ledger=str(tmp_path / "l.jsonl")))
+    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
+                            stderr=subprocess.PIPE)
+    assert proc.stdout.readline().strip() == "READY"
+    proc.send_signal(sig)
+    if second_signal:
+        proc.send_signal(sig)
+    proc.wait(timeout=30)
+    return proc.returncode, record.read_text().splitlines() if record.exists() else []
+
+
+def test_sigterm_during_go_still_reaches_the_destroy(tmp_path):
+    code, record = run_go_harness(tmp_path, signal.SIGTERM)
+    assert record == ["best-effort-sync", "tunnel-down+destroy"], record
+    assert code == 128 + signal.SIGTERM
+
+
+def test_sighup_during_go_still_reaches_the_destroy(tmp_path):
+    code, record = run_go_harness(tmp_path, signal.SIGHUP)
+    assert record[-1] == "tunnel-down+destroy" and code == 128 + signal.SIGHUP
+
+
+def test_a_signal_delivered_twice_does_not_cancel_the_cleanup(tmp_path):
+    code, record = run_go_harness(tmp_path, signal.SIGTERM, second_signal=True)
+    assert record[-1] == "tunnel-down+destroy"
+
+
+def test_without_the_handlers_sigterm_would_skip_the_finally(tmp_path):
+    """The reviewer's finding, demonstrated: the same harness without install_signal_handlers()."""
+    script = tmp_path / "bare.py"
+    record = tmp_path / "bare.txt"
+    script.write_text(textwrap.dedent(f"""
+        import time
+        try:
+            print("READY", flush=True); time.sleep(60)
+        finally:
+            open({str(record)!r}, "w").write("finally ran")
+    """))
+    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "READY"
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=30)
+    assert not record.exists()
+
+
+def test_the_driver_main_installs_the_handlers():
+    assert "install_signal_handlers()" in inspect_source(driver.main)
+
+
+def inspect_source(fn) -> str:
+    import inspect
+    return inspect.getsource(fn)

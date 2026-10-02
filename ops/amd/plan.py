@@ -193,6 +193,7 @@ class Step:
     api: str = ""                  # human description of an API call (where == "api")
     reserve: bool = True           # hold back the sync/destroy reserve when gating
     billed: bool = True
+    timeout: float = 0.0           # wall seconds before the driver kills the step; 0 = derive
 
 
 # ── arm / model naming: defined once, read by the serve and the eval commands ───────────────
@@ -499,6 +500,16 @@ def default_deadline_minutes(cfg: Config, rows: list[Row]) -> float:
 
 
 # ── the ordered plan ──────────────────────────────────────────────────────────────
+
+TIMEOUT_FLOOR_S = 900.0
+TIMEOUT_FACTOR = 3.0           # a step may take this many times its projection before it is killed
+
+
+def step_timeout(step: Step) -> float:
+    """Generous (3x the projection, at least 15 minutes) and finite: a hung ssh or a stuck harness
+    must not keep a billed droplet open until the deadman's deadline."""
+    return step.timeout or max(TIMEOUT_FLOOR_S, TIMEOUT_FACTOR * step.seconds)
+
 
 def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> list[Step]:
     """Every step, in the order the reviewer runs them. Each step is one command (or one group of

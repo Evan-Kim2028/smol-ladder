@@ -25,11 +25,14 @@ ops/amd/ledger.jsonl. See docs/AMD_RUNBOOK.md.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -270,27 +273,113 @@ def last_go(events: list[dict]) -> bool | None:
     return None
 
 
-def run_cmd(cmd: P.Cmd, host: str, capture: bool = False) -> tuple[int, str]:
+DEFAULT_STEP_TIMEOUT_S = 900.0
+TIMEOUT_CODE = 124           # what `timeout(1)` exits with; no real step returns it
+
+
+def _echo(line: str) -> None:
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def _stream(argv: list[str], env: dict, timeout: float | None) -> tuple[int, str]:
+    """Run, echo every line AS IT ARRIVES (a smoke or a probe that prints nothing for ten billed
+    minutes looks identical to one that is stuck), and return the full text. A timer kills the
+    child at `timeout`: a hung ssh must not hold a billed droplet open forever."""
+    proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    timed_out = threading.Event()
+
+    def expire() -> None:
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout, expire) if timeout else None
+    if timer:
+        timer.daemon = True
+        timer.start()
+    chunks: list[str] = []
+    try:
+        for line in proc.stdout:
+            _echo(line)
+            chunks.append(line)
+        proc.wait()
+    finally:
+        if timer:
+            timer.cancel()
+        if proc.poll() is None:          # an exception (a SIGTERM turned into one) mid-stream
+            proc.kill()
+            proc.wait()
+    if timed_out.is_set():
+        _echo(f"  !! killed after {timeout:.0f}s (step timeout)\n")
+        return TIMEOUT_CODE, "".join(chunks)
+    return proc.returncode, "".join(chunks)
+
+
+def run_cmd(cmd: P.Cmd, host: str, capture: bool = False,
+            timeout: float | None = None) -> tuple[int, str]:
+    """One command, with its output streamed and a timeout. `capture` only means "also return the
+    text": output is never held back."""
     argv = [a.replace("<droplet-ip>", host) for a in cmd.argv]
     env = child_env(dict(cmd.env))
     if "<droplet-ip>" in " ".join(cmd.argv) and not host:
         raise SystemExit("no droplet IP: create it first or pass --host")
     print("  $ " + cmd.shell(), flush=True)
-    if not capture:
-        return subprocess.call(argv, env=env), ""
-    proc = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True)
-    sys.stdout.write(proc.stdout)
-    return proc.returncode, proc.stdout
+    if capture:
+        return _stream(argv, env, timeout)
+    try:
+        return subprocess.call(argv, env=env, timeout=timeout), ""
+    except subprocess.TimeoutExpired:
+        print(f"  !! killed after {timeout:.0f}s (step timeout)", flush=True)
+        return TIMEOUT_CODE, ""
 
 
-def run_parallel(cmds: list[P.Cmd], host: str) -> int:
-    procs = []
-    for cmd in cmds:
-        print("  $ " + cmd.shell() + " &", flush=True)
-        procs.append(subprocess.Popen(cmd.argv, env=child_env(dict(cmd.env))))
-    codes = [p.wait() for p in procs]
-    return max(codes) if codes else 0
+def run_parallel(cmds: list[P.Cmd], host: str, capture: bool = False,
+                 timeout: float | None = None) -> tuple[int, str]:
+    """Concurrent commands, one process each. With `capture` their lines are streamed to the
+    terminal (interleaved, unprefixed: the trial counter must stay at the start of a line) and
+    returned together."""
+    procs: list[subprocess.Popen] = []
+    chunks: list[str] = []
+    readers: list[threading.Thread] = []
+    lock = threading.Lock()
+
+    def pump(proc: subprocess.Popen) -> None:
+        for line in proc.stdout:
+            with lock:
+                _echo(line)
+                chunks.append(line)
+
+    deadline = time.monotonic() + timeout if timeout else None
+    codes: list[int] = []
+    try:
+        for cmd in cmds:
+            print("  $ " + cmd.shell() + " &", flush=True)
+            argv = [a.replace("<droplet-ip>", host) for a in cmd.argv]
+            kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) \
+                if capture else {}
+            proc = subprocess.Popen(argv, env=child_env(dict(cmd.env)), **kw)
+            procs.append(proc)
+            if capture:
+                t = threading.Thread(target=pump, args=(proc,), daemon=True)
+                t.start()
+                readers.append(t)
+        for proc in procs:
+            try:
+                codes.append(proc.wait(timeout=None if deadline is None
+                                       else max(0.0, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                print(f"  !! killed after {timeout:.0f}s (step timeout)", flush=True)
+                codes.append(TIMEOUT_CODE)
+                break
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        for t in readers:
+            t.join(timeout=5)
+    return (max(codes) if codes else 0), "".join(chunks)
 
 
 # ── measurements ──────────────────────────────────────────────────────────────────
@@ -371,6 +460,52 @@ def cmd_project(cfg: P.Config, events: list[dict]) -> bool:
 
 # ── phases ────────────────────────────────────────────────────────────────────────
 
+CAPTURED = ("probe-eval", "probe-serve", "smoke-checks")   # output parsed for measurements
+
+
+class SyncUnverified(SystemExit):
+    """verify-sync failed. A SystemExit so nothing downstream swallows it, and a type of its own so
+    `go` can tell "what matters is not off the droplet" from any other failure."""
+
+
+class Terminated(SystemExit):
+    """SIGTERM or SIGHUP, turned into an exception so the `finally` blocks run."""
+
+    def __init__(self, signum: int):
+        super().__init__(128 + signum)
+        self.signum = signum
+
+
+def _raise_terminated(signum, frame) -> None:   # noqa: ARG001 - the signature signal() demands
+    raise Terminated(signum)
+
+
+def install_signal_handlers() -> None:
+    """Python runs `finally` on an exception, and by default SIGTERM and SIGHUP are not one: the
+    process just dies, with the droplet still billing. Turn both into `Terminated`. Run long
+    commands detached (`setsid nohup ... &`, see the runbook) so a closed terminal does not even
+    send them; this is the second line of defence, not the first."""
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_terminated)
+
+
+@contextlib.contextmanager
+def shielded_signals():
+    """Ignore SIGTERM, SIGHUP and SIGINT for the duration. The cleanup in a `finally` must not be
+    interrupted by the second Ctrl-C or the second SIGTERM that a nervous operator sends."""
+    sigs = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    try:
+        old = {s: signal.signal(s, signal.SIG_IGN) for s in sigs}
+    except ValueError:                     # not the main thread: nothing to shield
+        yield
+        return
+    try:
+        yield
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+
+
 def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
               new_session: bool = False) -> None:
     ledger = Path(cfg.ledger)
@@ -399,10 +534,11 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
         elif step.name == "tunnel-down":
             code = subprocess.call(list(step.cmds[0].argv), env=child_env()) and 0
         elif len(step.cmds) > 1:
-            code = run_parallel(step.cmds, cfg.host)
+            code, out = run_parallel(step.cmds, cfg.host, capture=step.name in CAPTURED,
+                                     timeout=P.step_timeout(step))
         else:
-            code, out = run_cmd(step.cmds[0], cfg.host,
-                                capture=step.name in ("probe-eval", "probe-serve", "smoke-checks"))
+            code, out = run_cmd(step.cmds[0], cfg.host, capture=step.name in CAPTURED,
+                                timeout=P.step_timeout(step))
         wall = time.time() - t0
         L.append(ledger, L.STEP_END, step=step.name, code=code, seconds=round(wall, 1),
                  projected_seconds=step.seconds)
@@ -415,9 +551,94 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
             spt = seconds_per_trial(out, wall)
             if spt:
                 L.append(ledger, L.MEASURED, sec_per_trial=round(spt, 2), probe_wall_s=round(wall, 1))
+        if code != 0 and step.name == "verify-sync":
+            raise SyncUnverified("verify-sync FAILED: something that matters is not safely off "
+                                 "the droplet (the FAIL lines above say what).")
         if code != 0:
             raise SystemExit(f"step '{step.name}' exited {code}. Nothing was cleaned up: "
                              "`driver.py status` shows what is billing; `destroy --yes` stops it.")
+
+
+BEST_EFFORT_SYNC_TIMEOUT_S = 420.0
+HOLD_S = 1800.0      # how long a droplet may be held for the reviewer after a failed verify-sync
+
+
+def best_effort_sync(cfg: P.Config, steps: list[P.Step], runner=None,
+                     timeout: float = BEST_EFFORT_SYNC_TIMEOUT_S) -> bool:
+    """Try to get the adapters and logs off the droplet right before it is destroyed. Bounded
+    (each command has a timeout) and guarded (nothing it raises may stop the destroy that
+    follows). Returns whether both commands exited 0; it verifies nothing, because it exists for
+    the case where the normal path did not get to run."""
+    runner = runner or run_cmd
+    if not cfg.host:
+        print("  best-effort sync skipped: no droplet IP is known")
+        return False
+    ok = True
+    for step in steps:
+        if step.name not in ("sync-droplet", "sync-pull"):
+            continue
+        try:
+            code, _ = runner(step.cmds[0], cfg.host, timeout=timeout)
+        except (Exception, SystemExit) as exc:   # noqa: BLE001 - the destroy must still run
+            print(f"  best-effort {step.name} raised {type(exc).__name__}: {exc}")
+            ok = False
+            continue
+        print(f"  best-effort {step.name}: exit {code}")
+        ok &= code == 0
+    L.append(Path(cfg.ledger), L.NOTE, text=f"best-effort sync before destroy: ok={ok}")
+    return ok
+
+
+def forced_destroy_reason(cfg: P.Config, now: float) -> str:
+    """Why the droplet cannot be held for the reviewer to fix a failed sync ("" if it can): holding
+    it for HOLD_S plus the destroy would pass a cap, or the deadman's deadline falls inside the
+    hold. Money and time win over the sync: the droplet is destroyed and what was lost is reported."""
+    ledger = Path(cfg.ledger)
+    v = L.verdict(L.read(ledger), now, HOLD_S, cfg.price, cfg.budget, cfg.total_cap, P.DESTROY_S)
+    if not v.allowed:
+        return v.reason
+    beat = L.heartbeat_read(ledger)
+    if beat and float(beat.get("deadline") or 0) < now + HOLD_S + P.DESTROY_S:
+        return "the dead-man switch's deadline falls within the next half hour"
+    return ""
+
+
+def go(cfg: P.Config, steps: list[P.Step], api, now=time.time) -> int:
+    """train -> serve -> tunnel -> eval -> sync -> destroy, and the destroy happens.
+
+    * A step that raises, a refused gate, Ctrl-C, SIGTERM or SIGHUP (see install_signal_handlers):
+      the `finally` first makes a bounded best-effort sync, then destroys. A failed evaluation must
+      not leave a GPU billing, and must not take the adapters down with it.
+    * verify-sync fails in the normal path: STOP BEFORE the destroy and say so. The adapters are
+      the one thing that cannot be recomputed cheaply, so the droplet is held for the reviewer
+      (the dead-man switch still bounds it) UNLESS the budget or the deadline cannot afford that,
+      in which case it is destroyed and what was lost is reported.
+    """
+    hold = False
+    synced = False
+    try:
+        for ph in ("train", "serve", "tunnel", "eval", "sync"):
+            run_steps(cfg, steps, api, only=ph)
+        synced = True
+    except SyncUnverified as exc:
+        forced = forced_destroy_reason(cfg, now())
+        if forced:
+            print(f"\n!! {exc}\n!! FORCED DESTROY: {forced}\n!! Destroying anyway after one more "
+                  "best-effort sync. Anything in the FAIL lines above that is not on the Hub is "
+                  "LOST; the private Hub repos are the only copies that survive.")
+        else:
+            hold = True
+            print(f"\n!! {exc}\n!! STOPPING BEFORE THE DESTROY. The droplet is still up and "
+                  "BILLING. Fix it and run `driver.py sync`, then `driver.py destroy --yes`. The "
+                  "dead-man switch destroys it at its deadline regardless.")
+        raise
+    finally:
+        if not hold:
+            with shielded_signals():
+                if not synced:
+                    best_effort_sync(cfg, steps)
+                run_steps(cfg, [s for s in steps if s.name in ("tunnel-down", "destroy")], api)
+    return 0
 
 
 def do_create(cfg: P.Config, api, new_session: bool = False) -> int:
@@ -519,6 +740,7 @@ def cmd_status(cfg: P.Config, events: list[dict], api) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    install_signal_handlers()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -609,14 +831,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no GO on record: run `driver.py smoke` (or `project`) first. The "
                          "measured projection must fit the budget before anything is trained.")
     if c == "go":
-        api = client()
-        try:
-            for ph in ("train", "serve", "tunnel", "eval", "sync"):
-                run_steps(cfg, steps, api, only=ph)
-        finally:
-            # The destroy runs whatever happened above: a failed eval must not leave a GPU billing.
-            run_steps(cfg, [s for s in steps if s.name in ("tunnel-down", "destroy")], api)
-        return 0
+        return go(cfg, steps, client())
     run_steps(cfg, steps, None, only=phases[c][0])
     return 0
 
