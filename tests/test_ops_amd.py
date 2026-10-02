@@ -401,7 +401,7 @@ def test_token_counts_staged_at_another_max_length_are_not_trusted(tmp_path):
 def test_the_heuristic_over_counts_rather_than_under_counts(tmp_path):
     (tmp_path / "train" / "sft_upstream").mkdir(parents=True)
     (tmp_path / "train" / "sft_upstream" / "train.jsonl").write_text('{"messages": []}\n' * 100)
-    (tmp_path / "train" / "ja3_sft.jsonl").write_text('{"messages": []}\n' * 10)
+    (tmp_path / "train" / "ja3_sft_v2.jsonl").write_text('{"messages": []}\n' * 10)
     t = P.heuristic_tokens(tmp_path, 8192)
     assert t["AB"].trained_tokens == t["A"].trained_tokens + t["B"].trained_tokens
     assert "pessimistic" in t["A"].method
@@ -734,7 +734,7 @@ def fake_trainer(tmp_path):
     log.mkdir()
     (root / "data/train/sft_upstream/train.jsonl").write_text('{"a": 1}\n{"a": 2}\n')
     (root / "data/train/sft_upstream/val.jsonl").write_text('{"a": 3}\n')
-    (root / "data/train/ja3_sft.jsonl").write_text('{"b": 1}\n')
+    (root / "data/train/ja3_sft_v2.jsonl").write_text('{"b": 1}\n')
     rec = tmp_path / "trainer-argv.txt"
     stub = venv / "bin" / "python"
     stub.write_text(textwrap.dedent(f"""\
@@ -788,7 +788,7 @@ def test_run_sft_without_a_measurement_still_never_trains_at_batch_one_and_keeps
 
 def test_run_sft_arm_b_trains_on_the_single_file(fake_trainer):
     argv = run_sft(fake_trainer, "--arm", "B")
-    assert argv[argv.index("--data") + 1].endswith("data/train/ja3_sft.jsonl")
+    assert argv[argv.index("--data") + 1].endswith("data/train/ja3_sft_v2.jsonl")
     assert argv[argv.index("--hub-model-id") + 1] == "ns/smol-ladder-sft-b"
 
 
@@ -1361,9 +1361,34 @@ def make_data(tmp_path: Path) -> Path:
     row = json.dumps({"messages": [{"role": "user", "content": "hello world " * 10}], "tools": []})
     (d / "sft_upstream" / "train.jsonl").write_text((row + "\n") * 5)
     (d / "sft_upstream" / "val.jsonl").write_text(row + "\n")
-    (d / "ja3_sft.jsonl").write_text((row + "\n") * 3)
-    (d / "ja3_sft.manifest.json").write_text("{}")
+    (d / "ja3_sft_v2.jsonl").write_text((row + "\n") * 3)
+    (d / "ja3_sft_v2.manifest.json").write_text(json.dumps({"replay": {"rate": 1.0}}))
+    (d / "ja3_sft_v2.index.jsonl").write_text('{"task_id": "t"}\n' * 3)
     return tmp_path / "data"
+
+
+def test_staging_arm_b_is_v2_and_refuses_v1_or_an_unproven_v2(tmp_path, monkeypatch):
+    """Adapters trained on ja3_sft.jsonl (v1) are invalid: it is not the conversation the harness
+    builds. Arm B is ja3_sft_v2, and staging refuses a v2 whose manifest does not record that every
+    row replayed through the harness."""
+    import tarfile
+
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
+    repo, data = make_repo(tmp_path), make_data(tmp_path)
+    stage.stage(tmp_path / "ok", "HEAD", 8192, data, repo=repo, namespace="ns", encode=len)
+    with tarfile.open(tmp_path / "ok" / "sft_b.tar.gz") as tar:
+        assert sorted(tar.getnames()) == ["ja3_sft_v2.index.jsonl", "ja3_sft_v2.jsonl",
+                                          "ja3_sft_v2.manifest.json"]
+    manifest = data / "train" / "ja3_sft_v2.manifest.json"
+    manifest.write_text(json.dumps({"replay": {"rate": 0.99}}))
+    with pytest.raises(SystemExit, match="replay"):
+        stage.stage(tmp_path / "bad", "HEAD", 8192, data, repo=repo, namespace="ns", encode=len)
+    manifest.write_text("{}")
+    with pytest.raises(SystemExit, match="replay"):
+        stage.stage(tmp_path / "bad2", "HEAD", 8192, data, repo=repo, namespace="ns", encode=len)
+    (data / "train" / "ja3_sft_v2.jsonl").rename(data / "train" / "ja3_sft.jsonl")
+    with pytest.raises(SystemExit, match="ja3_sft_v2.*v1.*invalid"):
+        stage.stage(tmp_path / "v1", "HEAD", 8192, data, repo=repo, namespace="ns", encode=len)
 
 
 def test_staging_builds_verified_tarballs_the_pinned_commit_and_a_private_secrets_file(tmp_path, monkeypatch):

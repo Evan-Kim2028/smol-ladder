@@ -5,7 +5,7 @@
 #   run_sft.sh --arm A|B|AB [--max-length 8192] [--batch-size N --grad-accum M] [--max-steps N]
 #
 #   A   upstream's SmolDataEnvs-sft export     data/train/sft_upstream  (train.jsonl + val.jsonl)
-#   B   our exported ja3 traces                 data/train/ja3_sft.jsonl
+#   B   our exported ja3 traces                 data/train/ja3_sft_v2.jsonl
 #   AB  the union, built here from the two staged sets (A's val set is kept for eval-loss)
 #
 # What makes a spot reclaim cost minutes:
@@ -60,10 +60,10 @@ amd_assert_gpu_free
 # ── data ─────────────────────────────────────────────────────────────────────────
 case "$ARM" in
   A)  DATA="$AMD_DATA_ROOT/train/sft_upstream" ;;
-  B)  DATA="$AMD_DATA_ROOT/train/ja3_sft.jsonl" ;;
+  B)  DATA="$AMD_DATA_ROOT/train/ja3_sft_v2.jsonl" ;;
   AB) DATA="$AMD_DATA_ROOT/train/sft_ab"
       mkdir -p "$DATA"
-      cat "$AMD_DATA_ROOT/train/sft_upstream/train.jsonl" "$AMD_DATA_ROOT/train/ja3_sft.jsonl" > "$DATA/train.jsonl"
+      cat "$AMD_DATA_ROOT/train/sft_upstream/train.jsonl" "$AMD_DATA_ROOT/train/ja3_sft_v2.jsonl" > "$DATA/train.jsonl"
       cp "$AMD_DATA_ROOT/train/sft_upstream/val.jsonl" "$DATA/val.jsonl" ;;
 esac
 [[ -e "$DATA" ]] || amd_die "no data at $DATA; run entrypoint.sh first"

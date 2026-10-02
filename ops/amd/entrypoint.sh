@@ -42,13 +42,13 @@ if [[ "$(cat "$ROOT/.amd-commit" 2>/dev/null || true)" != "$COMMIT" ]]; then
 fi
 mkdir -p "$ROOT/data/train" "$ROOT/runs"
 [[ -s "$ROOT/data/train/sft_upstream/train.jsonl" ]] || tar -xzf "$STAGE/sft_a.tar.gz" -C "$ROOT/data/train"
-[[ -s "$ROOT/data/train/ja3_sft.jsonl" ]] || tar -xzf "$STAGE/sft_b.tar.gz" -C "$ROOT/data/train"
-for f in sft_upstream/train.jsonl sft_upstream/val.jsonl ja3_sft.jsonl; do
+[[ -s "$ROOT/data/train/ja3_sft_v2.jsonl" ]] || tar -xzf "$STAGE/sft_b.tar.gz" -C "$ROOT/data/train"
+for f in sft_upstream/train.jsonl sft_upstream/val.jsonl ja3_sft_v2.jsonl; do
   [[ -s "$ROOT/data/train/$f" ]] || die "missing $ROOT/data/train/$f after unpacking"
 done
 cp "$STAGE/tokens.json" "$ROOT/tokens.json"
 install -m 600 "$STAGE/remote.env" "$ROOT/.env"
-log "data: A $(wc -l < "$ROOT/data/train/sft_upstream/train.jsonl") rows, B $(wc -l < "$ROOT/data/train/ja3_sft.jsonl") rows"
+log "data: A $(wc -l < "$ROOT/data/train/sft_upstream/train.jsonl") rows, B $(wc -l < "$ROOT/data/train/ja3_sft_v2.jsonl") rows"
 
 # shellcheck source=common.sh
 source "$ROOT/ops/amd/common.sh"

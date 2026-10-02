@@ -391,7 +391,7 @@ def heuristic_tokens(data_dir: Path, max_length: int) -> dict[str, SetTokens]:
     roughly 10-15%: the safe direction for a budget."""
     out: dict[str, SetTokens] = {}
     sets = {"A": [data_dir / "train" / "sft_upstream" / "train.jsonl"],
-            "B": [data_dir / "train" / "ja3_sft.jsonl"]}
+            "B": [data_dir / "train" / "ja3_sft_v2.jsonl"]}
     for key, files in sets.items():
         files = [f for f in files if f.exists()]
         if not files:

@@ -135,7 +135,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     mean_tokens = tokens["trained_tokens"] / tokens["rows"]
     data = Path("/tmp/bench_rows.jsonl")
     n = make_bench_data(ROOT / "data/train/sft_upstream/train.jsonl",
-                        ROOT / "data/train/ja3_sft.jsonl", data, args.rows)
+                        ROOT / "data/train/ja3_sft_v2.jsonl", data, args.rows)
     py = sys.executable
     results = []
     for bs in args.batches:

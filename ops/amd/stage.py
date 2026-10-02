@@ -7,7 +7,7 @@ The output directory is what `driver.py bootstrap` copies over; it contains
 
     code.tar.gz       `git archive` of the pinned commit: no git, no GitHub, no clone on the droplet
     sft_a.tar.gz      arm A: upstream's SmolDataEnvs-sft export (train.jsonl + val.jsonl)
-    sft_b.tar.gz      arm B: our ja3 traces + manifest
+    sft_b.tar.gz      arm B: our ja3 traces, v2 (the harness's conversation) + manifest + index
     tokens.json       trained-token counts per arm at this --max-length: the chat template's
                       rendering (tool calls and results included) through the Qwen3.5 tokenizer
                       when `transformers` and the cached tokenizer exist (`--extra train`), else a
@@ -240,16 +240,26 @@ def stage(out: Path, commit: str, max_length: int, data: Path, repo: Path = REPO
                          + "\n  ".join(dirty) + "\ncommit them (the pin is the commit), or pass "
                          "--allow-dirty to stage the commit without them.")
     a_dir = data / "train" / "sft_upstream"
-    b_file = data / "train" / "ja3_sft.jsonl"
+    b_file = data / "train" / "ja3_sft_v2.jsonl"
     for needed in (a_dir / "train.jsonl", a_dir / "val.jsonl", b_file):
         if not needed.exists():
-            raise SystemExit(f"missing {needed}")
+            hint = ("; arm B is ja3_sft_v2 (the harness's conversation, `python -m "
+                    "train.export_ja3_v2`). ja3_sft.jsonl is v1 and adapters trained on it are "
+                    "invalid" if needed == b_file else "")
+            raise SystemExit(f"missing {needed}{hint}")
+    b_manifest = data / "train" / "ja3_sft_v2.manifest.json"
+    if b_manifest.exists():
+        replay = (json.loads(b_manifest.read_text()).get("replay") or {}).get("rate")
+        if replay != 1.0:
+            raise SystemExit(f"{b_manifest} reports a replay rate of {replay}: every arm-B row must "
+                             "replay byte-identically through the harness (train/replay.py)")
 
     make_code_tarball(repo, sha, out / "code.tar.gz")
     make_tarball(out / "sft_a.tar.gz", data / "train",
                  ["sft_upstream/train.jsonl", "sft_upstream/val.jsonl"])
-    members_b = ["ja3_sft.jsonl"] + (["ja3_sft.manifest.json"]
-                                     if (data / "train" / "ja3_sft.manifest.json").exists() else [])
+    members_b = ["ja3_sft_v2.jsonl"] + [
+        name for name in ("ja3_sft_v2.manifest.json", "ja3_sft_v2.index.jsonl")
+        if (data / "train" / name).exists()]
     make_tarball(out / "sft_b.tar.gz", data / "train", members_b)
 
     tokens = build_token_counts([a_dir / "train.jsonl"], b_file, max_length, encode, render)
