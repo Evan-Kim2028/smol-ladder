@@ -56,6 +56,27 @@ def local_fingerprint(pub: Path) -> str:
         return ""
 
 
+def money(text: str) -> float:
+    """argparse type for a dollar cap. A total cap above the hard limit is an error, not a clamp:
+    typing 120 means the reviewer believes it is allowed, and it is not."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def total_cap_arg(text: str) -> float:
+    value = money(text)
+    if value > P.HARD_TOTAL_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"${value:g} is above the ${P.HARD_TOTAL_LIMIT:g} HARD total limit, which no flag or "
+            "environment variable can raise")
+    return value
+
+
 def add_common(ap: argparse.ArgumentParser) -> None:
     g = ap.add_argument_group("hardware")
     g.add_argument("--fallback", action="store_true",
@@ -68,8 +89,9 @@ def add_common(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--ssh-pubkey", default=str(Path.home() / ".ssh" / "id_ed25519.pub"))
     g.add_argument("--tag", default=P.TAG)
     g = ap.add_argument_group("money")
-    g.add_argument("--budget", type=float, default=P.DEFAULT_BUDGET, help="session cap, dollars")
-    g.add_argument("--total-cap", type=float, default=P.TOTAL_CAP)
+    g.add_argument("--budget", type=money, default=P.DEFAULT_BUDGET, help="session cap, dollars")
+    g.add_argument("--total-cap", type=total_cap_arg, default=P.TOTAL_CAP,
+                   help=f"working total cap, dollars (never above the ${P.HARD_TOTAL_LIMIT:g} hard limit)")
     g.add_argument("--deadline-minutes", type=float, default=0.0)
     g = ap.add_argument_group("work")
     g.add_argument("--arms", default=",".join(P.ARMS))
@@ -143,7 +165,8 @@ def print_table(cfg: P.Config, rows: list[P.Row], spent_session: float = 0.0) ->
     hours = sum(r.seconds for r in rows) / 3600.0
     kind = "spot" if cfg.spot else "on-demand"
     print(f"## costed plan: {cfg.size} in {cfg.region} ({kind}) at ${cfg.price}/h, "
-          f"session budget ${cfg.budget:.2f}, total cap ${cfg.total_cap:.2f}, image {cfg.image}")
+          f"session budget ${cfg.budget:.2f}, total cap ${cfg.total_cap:.2f} "
+          f"(HARD limit ${P.HARD_TOTAL_LIMIT:.2f}), image {cfg.image}")
     print(f"  {'stage':<30} {'hours':>6} {'dollars':>8}  basis")
     for r in rows:
         print(f"  {r.stage:<30} {r.seconds / 3600.0:>6.2f} {r.dollars(cfg.price):>8.2f}  {r.basis}")

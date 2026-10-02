@@ -64,9 +64,23 @@ TAG = "smol-ladder"
 NAME = "smol-ladder"
 
 DEFAULT_BUDGET = 35.0       # this session
-TOTAL_CAP = 90.0            # the whole account; the $100 credit minus a margin
+TOTAL_CAP = 90.0            # the WORKING total cap: the $100 credit minus a margin
+# The owner's rule: total spend (every earlier dollar included) has a HARD cutoff that nothing may
+# override. It is a constant, not a setting: no flag, no env var and no Config field can raise it.
+# Every cap in this package goes through `effective_total_cap`, which clamps to it.
+HARD_TOTAL_LIMIT = 95.0
+# Held back from the hard limit by the dead-man switch for the destroy itself: a poll interval
+# plus the verify loop is about two minutes, which is about $0.10 at $2.46/h.
+DESTROY_MARGIN = 0.50
 CREDIT = 100.0
 CREDIT_EXPIRES = "2026-10-18"
+
+
+
+def effective_total_cap(cap: float) -> float:
+    """The cap that is actually enforced: never above the hard limit, whatever was asked for."""
+    return min(float(cap), HARD_TOTAL_LIMIT)
+
 
 ARMS = ("A", "B", "AB")
 BASE_MODEL = "Qwen/Qwen3.5-2B"
@@ -146,6 +160,11 @@ class Config:
     ledger: str = "ops/amd/ledger.jsonl"
     tunnel_socket: str = "/tmp/smol-ladder-tunnel.sock"
     env_file: str = ".env"
+
+    def __post_init__(self) -> None:
+        if self.total_cap > HARD_TOTAL_LIMIT:
+            raise ValueError(f"total cap ${self.total_cap:g} is above the ${HARD_TOTAL_LIMIT:g} "
+                             "hard limit, which nothing may raise")
 
     @property
     def spot(self) -> bool:

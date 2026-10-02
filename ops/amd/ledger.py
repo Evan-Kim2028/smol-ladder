@@ -31,6 +31,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ops.amd.plan import HARD_TOTAL_LIMIT, effective_total_cap
+
 CREATED = "created"
 READY = "ready"
 DESTROYED = "destroyed"
@@ -182,6 +184,8 @@ def verdict(events: list[dict], now: float, step_seconds: float, rate: float,
     matters is the moment a step is refused and nobody is watching.
     """
     cur = spend(events, now, rate)
+    hard = total_cap >= HARD_TOTAL_LIMIT
+    total_cap = effective_total_cap(total_cap)    # the hard limit is applied here, not by the caller
     extra = (max(step_seconds, 0.0) + max(reserve_seconds, 0.0)) / 3600.0 * rate
     session_after = cur.session + extra
     total_after = cur.total + extra
@@ -195,7 +199,8 @@ def verdict(events: list[dict], now: float, step_seconds: float, rate: float,
     if total_after > total_cap + eps:
         return Verdict(False, (
             f"REFUSING: total projected ${total_after:.2f} (${cur.total:.2f} accrued + "
-            f"${extra:.2f}) exceeds the ${total_cap:.2f} total cap by "
+            f"${extra:.2f}) exceeds the ${total_cap:.2f} "
+            f"{'HARD total limit, which nothing may override,' if hard else 'total cap'} by "
             f"${total_after - total_cap:.2f}."), session_after, total_after)
     return Verdict(True, (
         f"ok: session ${cur.session:.2f} + ${extra:.2f} = ${session_after:.2f} of "

@@ -34,7 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from ops.amd import cloud  # noqa: E402
 from ops.amd import ledger as L  # noqa: E402
 from ops.amd.doapi import DoApi, load_dotenv, token_from_env  # noqa: E402
-from ops.amd.plan import DEFAULT_BUDGET, PRICE_MI350X, TAG, TOTAL_CAP  # noqa: E402
+from ops.amd.plan import (DEFAULT_BUDGET, DESTROY_MARGIN, HARD_TOTAL_LIMIT,  # noqa: E402
+                          PRICE_MI350X, TAG, TOTAL_CAP, effective_total_cap)
 
 POLL_SECONDS = 30
 # After the deadline with nothing left to destroy, keep looking this long (a create may still be
@@ -73,9 +74,14 @@ def decide(now: float, deadline: float, session_dollars: float, total_dollars: f
     if session_dollars >= session_cap:
         return Decision(True, f"session cost ${session_dollars:.2f} reached the "
                               f"${session_cap:.2f} cap; {names} still exist")
-    if total_dollars >= total_cap:
-        return Decision(True, f"total cost ${total_dollars:.2f} reached the ${total_cap:.2f} "
-                              f"cap; {names} still exist")
+    # The hard limit is applied HERE, whatever total_cap was passed in, and the destroy's own cost
+    # is held back: the destroy has to finish before the limit, not start at it.
+    limit = effective_total_cap(total_cap) - DESTROY_MARGIN
+    if total_dollars >= limit:
+        which = "the HARD limit" if total_cap >= HARD_TOTAL_LIMIT else "the total cap"
+        return Decision(True, f"total cost ${total_dollars:.2f} reached ${limit:.2f} (= {which} "
+                              f"${effective_total_cap(total_cap):.2f} minus ${DESTROY_MARGIN:.2f} "
+                              f"for the destroy itself); {names} still exist")
     off = [d.get("name") for d in droplets if d.get("status") == "off"]
     if off:
         return Decision(True, f"{off} powered off but still billing (power-off does not stop "
@@ -109,6 +115,15 @@ def tick(api, tag: str, ledger_path: Path, now: float, deadline: float, session_
     return decision
 
 
+def total_cap_arg(text: str) -> float:
+    value = float(text)
+    if value > HARD_TOTAL_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"${value:g} is above the ${HARD_TOTAL_LIMIT:g} HARD total limit, which no flag or "
+            "environment variable can raise")
+    return value
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -116,7 +131,8 @@ def main() -> None:
                     help="wall clock from now (or from --start) after which the droplet is destroyed")
     ap.add_argument("--start", type=float, default=None, help="epoch the deadline counts from")
     ap.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="session cap in dollars")
-    ap.add_argument("--total-cap", type=float, default=TOTAL_CAP)
+    ap.add_argument("--total-cap", type=total_cap_arg, default=TOTAL_CAP,
+                    help=f"working total cap (never above the ${HARD_TOTAL_LIMIT:g} hard limit)")
     ap.add_argument("--price", type=float, default=PRICE_MI350X)
     ap.add_argument("--ledger", default=str(Path(__file__).resolve().parent / "ledger.jsonl"))
     ap.add_argument("--tag", default=TAG)

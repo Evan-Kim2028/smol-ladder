@@ -1645,3 +1645,65 @@ def test_the_runbook_no_longer_plans_on_the_old_hardware_or_an_invented_wheel_in
     text = runbook()
     assert "wheels.vllm.ai" not in text
     assert "bootstrap.sh" not in text and "run_eval.sh" not in text   # replaced by entrypoint.sh / laptop eval
+
+
+# ═══ the $95 hard cutoff ════════════════════════════════════════════════════════════
+
+def test_the_hard_limit_is_95_and_the_working_defaults_are_unchanged():
+    assert P.HARD_TOTAL_LIMIT == 95.0
+    assert (P.TOTAL_CAP, P.DEFAULT_BUDGET) == (90.0, 35.0)
+    assert P.effective_total_cap(1000.0) == 95.0 and P.effective_total_cap(40.0) == 40.0
+
+
+def test_a_config_above_the_hard_limit_cannot_exist():
+    with pytest.raises(ValueError, match="hard limit"):
+        P.Config(total_cap=95.01)
+    assert P.Config(total_cap=95.0).total_cap == 95.0
+
+
+def test_argparse_rejects_a_total_cap_above_95_for_the_driver_and_the_deadman(tmp_path):
+    out = run_driver(tmp_path, "plan", "--total-cap", "96")
+    assert out.returncode == 2 and "HARD total limit" in out.stderr
+    ok = run_driver(tmp_path, "plan", "--total-cap", "95")
+    assert ok.returncode == 0, ok.stderr
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "AMD_OFFLINE": "1"}
+    dm = subprocess.run([sys.executable, str(OPS / "deadman.py"), "--deadline-minutes", "5",
+                         "--total-cap", "120"], capture_output=True, text=True, env=env,
+                        cwd=str(REPO_ROOT))
+    assert dm.returncode == 2 and "HARD total limit" in dm.stderr
+
+
+def test_no_environment_variable_can_raise_the_cap(tmp_path):
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "AMD_OFFLINE": "1",
+           "AMD_TOTAL_CAP": "500", "TOTAL_CAP": "500", "AMD_HARD_TOTAL_LIMIT": "500"}
+    out = subprocess.run([sys.executable, str(OPS / "driver.py"), "plan", "--ledger",
+                          str(tmp_path / "l.jsonl")], capture_output=True, text=True, env=env,
+                         cwd=str(REPO_ROOT))
+    assert "total cap $90.00 (HARD limit $95.00)" in out.stdout
+
+
+def test_the_deadman_destroys_before_the_hard_limit_even_with_a_huge_cap_passed_in():
+    # total_cap=1000 is what a buggy caller might pass; the limit is 95 - 0.50 for the destroy.
+    below = deadman.decide(T0, T0 + 99 * HOUR, 1.0, 94.49, 1e6, 1000.0, [droplet()])
+    at = deadman.decide(T0, T0 + 99 * HOUR, 1.0, 94.50, 1e6, 1000.0, [droplet()])
+    assert not below.destroy and at.destroy and "HARD limit" in at.reason
+
+
+def test_the_deadman_uses_the_lower_of_the_working_cap_and_the_hard_limit():
+    d = deadman.decide(T0, T0 + 99 * HOUR, 1.0, 89.5, 35.0, 90.0, [droplet()])
+    assert d.destroy and "total cap" in d.reason
+
+
+def test_the_gate_refuses_any_step_that_would_pass_95_whatever_the_cap_says():
+    prior = [{"event": L.PRIOR, "ts": T0, "dollars": 94.0}]
+    v = L.verdict(prior, T0, HOUR, 2.46, 1e6, 1e6)      # 94 + 2.46 > 95
+    assert not v.allowed and "HARD total limit" in v.reason
+    assert L.verdict(prior, T0, 0.3 * HOUR, 2.46, 1e6, 1e6).allowed
+
+
+def test_the_driver_gate_stops_a_step_at_the_hard_limit(tmp_path):
+    led = ledger_with(tmp_path, (L.PRIOR, T0, {"dollars": 94.5}))
+    c = cfg(ledger=str(led), budget=1e6, total_cap=95.0)
+    with pytest.raises(SystemExit) as exc:
+        driver.gate(c, P.Step("train", "sft-A", "droplet", seconds=HOUR), now=T0)
+    assert "HARD total limit" in str(exc.value)
