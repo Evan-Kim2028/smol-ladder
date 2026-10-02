@@ -87,8 +87,9 @@ For each released model, under its own protocol, with its own prompt text byte-f
 - **GRPO model → `--agent program`.** One turn, no tools, 1024 tokens, `enable_thinking=False`,
   greedy, the program extracted from the last fence and re-run sealed. That is exactly
   `eval_pass1.py`. This is the number to compare against the published ~0.28→0.40.
-- **SFT model → `--agent bash`.** The `bash` schema verbatim, `/workdir/answer.txt` rewritten to
-  the trial directory, the loop ending on submission, upstream's command guard applied.
+- **SFT model → `--agent bash`.** The rows' own conversation (1e): their user turn, their `bash`
+  schema, `/home/user/input` and `/workdir/answer.txt` used literally in a sandbox built for them,
+  upstream's command guard applied.
 - **Our solver on either of them → `--agent tools`.** Expect a large drop. That drop is itself a
   finding and belongs in the post (it is a format-transfer measurement, which is the PLAN's
   stated risk "A vs B confounded by format"), but it must be *labelled* as such.
@@ -132,6 +133,84 @@ used to overflow it, get a 400, burn five retries and crash with no transcript. 
   (`answer_submitted`, `model_stopped`, `max_turns`, `context_exhausted`, `single_turn`, `error`),
   `turns_used`, `last_prompt_tokens`, `truncated_outputs`, `context_length`.
 
+### 1e. `--agent bash`, reconstructed from the rows (2026-10-02)
+
+**What was wrong.** The harness sent the *generic ladder prompt* as the user turn (tables in
+`./input`, write `./solution.py`, run `python3 solution.py`) under a system turn that said "write
+`/workdir/answer.txt`": a contradictory instruction. It also formatted tool results its own way
+(`--- stderr ---` dividers, `""` for no output), rewrote the model's `/home/user/input` and
+`/workdir` to host-relative paths with `localise_paths` (so host paths leaked into outputs), and ran
+the commands on the host's Python 3.14. **Everything in `data/runs/amd1-*` measured the base model
+under that contradictory prompt. Those trees are evidence of the bug, not results; they are kept and
+must not be quoted as pass rates.**
+
+**What it does now**, each point checked against the 4,673 SmolDataEnvs-sft rows:
+
+- **User turn.** `upstream.BASH_USER`, unwrapped, filled with the task's question, its own file
+  list and its own answer-format line (`answer_format_of`, from the task's `instruction`; empty for
+  jupyter-agent and synthetic tasks). Grouping the rows by user turn with those three parts cut out
+  leaves **one** skeleton, and rebuilding from the rows' own fields matches **4,673 / 4,673** byte
+  for byte. Rebuilt from the SmolDataEnvs task rows joined by `task_id` it is 4,487 / 4,673 (96.0%)
+  with the revision now cached (4,304, 92.1%, with the older snapshot the rows were generated from);
+  the rest differ in the task's own file list or question text, which no template can repair. An
+  empty format line leaves one blank line, a given one two.
+  The file list is the task's `files` (else the input directory): the container held the whole
+  directory (in all 178 rows that `ls` it after a shorter listing, `ls` showed every file), but
+  listing the directory would match only 74% of the rows' user turns. So L1 in bash mode names the
+  task's tables, as in training, while `tools` mode keeps listing the directory.
+- **Rungs.** L2/L3/L4 and the L1+schema control append their blocks to that message, so L1 is a prefix
+  of every higher rung. The L4 reference program is shown with `/home/user/input` paths under a
+  header that points at `/workdir/answer.txt`; nothing mentions `solution.py`.
+- **Tool results** (`or_agent.format_tool_result`): stdout and stderr as one stream; no output is
+  `(empty output, rc=N)` (rc 0, 1, 2 and 137 occur); any other output carries no status, whatever the
+  exit code; a command past 180 s returns `[shell_exec] error: RuntimeError: Command timed out after
+  180 seconds`; output is cut to 8,000 characters plus `\n... [truncated]`. A `printf %s v >
+  /workdir/answer.txt` submission is answered `Wrote N bytes to /workdir/answer.txt`: all 1,833 such
+  rows are, and nothing else is.
+- **Paths and environment** (`run_ladder.jail_bash`): the tables are read-only at `/home/user/input`
+  (symlinks resolved, the `.complete` marker hidden), a per-trial `/workdir` and `$HOME=/home/user`
+  are writable, cwd is `/workdir` (the rows never show the cwd; this is a choice), the account is
+  `user`, the root is a tmpfs holding only `/usr` and `/etc`, and the commands run under the
+  `tools`-mode venv's Python mounted at `/usr/local` so tracebacks read
+  `/usr/local/lib/python3.14/site-packages/...`. The API key is not in the commands' environment.
+  Nothing rewrites the model's commands. Grading is unchanged: `answer.txt` is read from the
+  per-trial `/workdir` after the jail exits and graded offline.
+- **Request.** `temperature` 0, `tool_choice` auto, the one `bash` tool (byte-equal to the rows'),
+  `chat_template_kwargs {"enable_thinking": false}`, `max_tokens` 1,024 clamped to the context left.
+- **End of episode** (`--bash-stop`). `submit` (default, unchanged): the episode ends when
+  `answer.txt` exists or the model replies without a tool call. `model`: only the model ends it, as
+  the rows show (391 rows keep calling tools after their first write, 194 write the answer twice,
+  511 contain a tool-free turn mid-run). The two are different measurements; pick one per sweep and
+  record it (`result.json` carries `bash_stop`).
+- `program` and `tools` modes, and their prompts, are unchanged. (`program` still sends the generic
+  ladder prompt rather than `upstream.program_prompt`; that is the same class of bug and was left
+  alone.)
+
+**What is verified without a model.** `tests/test_bash_fidelity.py` replays the recorded trajectories
+through `bash_loop` with the recorded outputs and asserts that the conversation sent at each turn
+equals the recorded one up to that turn: 4,672 of 4,673 rows exactly (the other submits, speaks and
+keeps working; `model` stops at the closing message). `tools/oracle_server.py` serves a recorded
+trajectory's turns to the real `run_ladder --agent bash` loop and `tools/oracle_report.py` compares
+the outcome with the recording. On 60 SmolDataEnvs train tasks (10 of them the requested set: 10 / 10 and
+8 / 10) the recorded answers graded equal to gold in **60 / 60 with `--bash-stop model`** and
+**56 / 60 with `submit`**; the four `submit` failures are the policy ending an episode the recording continued
+(one rewrote its answer after the first write, three speak once before submitting). A first run
+that scored 6 / 10 found two harness faults, both fixed: the dataset grader's math-verify tier was
+silently off in worker threads (`smol_ladder/grade.py`), and the answer receipt above. What still
+differs in the tool results of 11 of the 60 trials, none of which changed an answer: `ls -la` of
+the input directory (the rows show root-owned files, ours the host's mode, ACL marker and date: 5),
+pandas' string-array repr (`ArrowStringArray` here, `StringArray` there, because our environment
+has pyarrow: 2), float digits past the 15th (3), and Python 3.14's traceback carets against the
+rows' 3.12 (1). **Not verified until a real model is served:** how a trained model behaves at the
+points where the harness chooses (cwd, the end-of-episode policy), and any effect of the sandbox's
+single-threaded BLAS on the 180 s deadline.
+
+**Packages:** the sandbox has pandas, numpy, scipy, scikit-learn, statsmodels, matplotlib, seaborn
+and tabulate. Training commands import 29 other packages in 75 rows (1.6%), most of which the
+training container lacked too (`xgboost` 23 rows, `imblearn` 11, `nltk` 6, ...); the prompt also
+lists `plotly`, which the sandbox lacks (no training command imports it). `pip install` does not work
+in the sandbox (the rows show it failing in 97 of 106 attempts).
+
 ---
 
 ## 2. What we changed in the code
@@ -148,8 +227,9 @@ The jail's environment is allowlisted rather than inherited, so only the endpoin
 the named key travel into a trial; the base URL is passed even when empty because a local server
 cannot do without it.
 
-`smol_ladder/upstream.py` — the two upstream protocols verbatim, plus `localise_paths` (rewrites
-`/home/user/input` → `input`, `/workdir` → `.`) and `looks_like_a_command`.
+`smol_ladder/upstream.py` — the two upstream protocols verbatim, plus `answer_format_of` and
+`looks_like_a_command`. (`localise_paths`, which rewrote the model's paths, is gone: `--agent bash`
+now builds the sandbox to fit the paths, see 1e.)
 
 `run_ladder.py --agent {tools,program,bash}`. All three run in the same bubblewrap jail and are
 graded by the same offline sealed pass and the same `smol_ladder.grade.grade`, so the comparison
