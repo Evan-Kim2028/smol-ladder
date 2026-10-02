@@ -10,6 +10,7 @@ and the [information ladder](https://evan-kim2028.github.io/evan_writings/writin
 - `docs/LADDER.md`: rung definitions and the Blackwell ordering
 - `docs/LOCAL_MODELS.md`: what the released 2B models were trained under, and serving them locally
 - `docs/TRAINING.md`: exporting data, LoRA SFT and GRPO
+- `docs/AMD_RUNBOOK.md`: running the SFT arms on an AMD MI300X droplet (`ops/amd/`)
 - `docs/audits/`: read-only audits of the results tree, with the findings later work overturned
 
 ## Modules
