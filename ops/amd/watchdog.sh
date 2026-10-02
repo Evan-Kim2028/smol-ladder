@@ -26,7 +26,7 @@ IDLE_MIN="${AMD_IDLE_LIMIT_MIN:-30}"
 SSH_MIN="${AMD_SSH_LIMIT_MIN:-20}"
 TICK="${AMD_WATCHDOG_TICK:-60}"
 STATE_DIR="${AMD_STATE_DIR:-$AMD_REMOTE_ROOT/.watchdog}"
-WORK_PATTERN='train\.sft_lora|vllm\.entrypoints|vllm serve|smoke\.sh|run_sft\.sh|serve\.sh|sync_back\.sh|bench\.py|merge_adapter'
+WORK_PATTERN='train\.sft_lora|ops\.amd\.sft_run|vllm\.entrypoints|vllm serve|smoke\.sh|run_sft\.sh|serve\.sh|sync_back\.sh|bench\.py|merge_adapter'
 ONCE=0; ARM=0; DRY=0
 
 while [[ $# -gt 0 ]]; do

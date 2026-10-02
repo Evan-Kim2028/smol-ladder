@@ -29,9 +29,8 @@ AMD_LORA_R="${AMD_LORA_R:-16}"
 # Effective batch is held at upstream's 8 sequences per optimizer step so arm A stays comparable
 # to the published recipe; the smoke picks how that 8 is split into batch x accumulation.
 AMD_EFFECTIVE_BATCH="${AMD_EFFECTIVE_BATCH:-8}"
-# train/sft_lora.py saves every max(50, max_steps // 2) steps and, with no --max-steps, every
-# 100: at 8 sequences a step that is a checkpoint every few minutes, each pushed to the Hub by
-# hub_strategy="every_save". It has no flag for this; the bound is stated in the runbook.
+# Checkpoints: run_sft.sh --save-steps (default 50) through ops/amd/sft_run.py, because
+# train/sft_lora.py has no flag for it. Each save is pushed to the Hub by hub_strategy="every_save".
 
 # ── the Hub: the only copy of anything that outlives the droplet ─────────────────
 AMD_HUB_NAMESPACE="${AMD_HUB_NAMESPACE:-}"
@@ -97,13 +96,35 @@ amd_served_name() {
 }
 
 # ── GPU memory must be free before an arm trains ────────────────────────────────
-# The smoke's probe server holds ~85% of the card (AMD_GPU_UTIL) and the benchmark picked its batch
-# size on an EMPTY card: training beside a live server would run on ~15% of the memory with a batch
-# size nobody measured, and a live vLLM also counts as "work" for the idle watchdog.
+# A live server holds most of the card and the benchmark picked its batch size on an EMPTY card:
+# training beside it would run on a sliver of the memory with a batch size nobody measured, and a
+# live vLLM also counts as "work" for the idle watchdog.
 AMD_GPU_FREE_MIN="${AMD_GPU_FREE_MIN:-0.90}"      # fraction of the card that must be free
+AMD_GPU_ROOM_WAIT_S="${AMD_GPU_ROOM_WAIT_S:-180}"  # how long to wait for it (amd_wait_gpu_room)
 
 amd_gpu_free_fraction() {
   "$AMD_VENV/bin/python" -c 'import torch; free, total = torch.cuda.mem_get_info(); print(free / total)'
+}
+
+# amd_wait_gpu_room <fraction> [seconds]: poll until at least that fraction of the card is free.
+# Used after servers are killed and before the next one starts: a killed engine returns its memory
+# a few seconds late, and starting into the gap is what made the base server fail once.
+amd_wait_gpu_room() {
+  local need="$1" limit="${2:-$AMD_GPU_ROOM_WAIT_S}" t0 frac=""
+  t0=$(date +%s)
+  while :; do
+    frac="$(amd_gpu_free_fraction 2>/dev/null || true)"
+    if [[ -n "$frac" ]] && awk -v f="$frac" -v m="$need" 'BEGIN { exit !(f >= m) }'; then
+      amd_log "GPU room: ${frac} of the card is free (need ${need})"
+      return 0
+    fi
+    if (( $(date +%s) - t0 >= limit )); then
+      pgrep -af 'vllm|sft_lora|sft_run' >&2 || true
+      amd_die "GPU memory not released after ${limit}s (free fraction '${frac:-unreadable}', need ${need})"
+    fi
+    amd_log "waiting for GPU memory to be released (free '${frac:-unreadable}', need ${need})"
+    sleep "${AMD_GPU_FREE_SLEEP:-5}"
+  done
 }
 
 amd_assert_gpu_free() {
@@ -117,7 +138,7 @@ amd_assert_gpu_free() {
     amd_log "GPU memory not free yet (free fraction '${frac:-unreadable}', need ${AMD_GPU_FREE_MIN}); try $i/$tries"
     sleep "${AMD_GPU_FREE_SLEEP:-5}"
   done
-  pgrep -af 'vllm|sft_lora' >&2 || true
+  pgrep -af 'vllm|sft_lora|sft_run' >&2 || true
   amd_die "GPU memory is not free (free fraction '${frac:-unreadable}', need ${AMD_GPU_FREE_MIN}): something still holds the card. Refusing to train beside it."
 }
 
