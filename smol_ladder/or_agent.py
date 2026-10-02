@@ -13,6 +13,7 @@ Same contract as the cmd agent: write ./solution.py, print the answer as the las
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -169,8 +171,71 @@ def overflow_numbers(body: str) -> tuple[int | None, int | None]:
     return (int(m.group(1)) if m else None, int(c.group(1)) if c else None)
 
 
+# ── decoding settings ─────────────────────────────────────────────────────────
+# Every agent mode samples through `call_model`, so the settings live in one place and reach the
+# jailed solver through the environment (run_ladder allowlists these names). The default is the
+# harness's historical request, temperature 0 and nothing else, byte for byte: a flag that is not
+# given adds no key to the body.
+DECODING_ENV = {
+    "temperature": "SMOL_LADDER_TEMPERATURE",
+    "top_p": "SMOL_LADDER_TOP_P",
+    "top_k": "SMOL_LADDER_TOP_K",
+    "repetition_penalty": "SMOL_LADDER_REPETITION_PENALTY",
+    "presence_penalty": "SMOL_LADDER_PRESENCE_PENALTY",
+    "seed": "SMOL_LADDER_SEED",
+}
+BASH_MAX_REPEAT_ENV = "SMOL_LADDER_BASH_MAX_REPEAT"
+
+
+@dataclass(frozen=True)
+class Decoding:
+    """The sampling settings of a request. `None` means "not sent": the server's own default.
+
+    `top_k` and `repetition_penalty` are not OpenAI fields; vLLM (and OpenRouter) accept them as
+    extra top-level keys of the same JSON body, which is what the SDK's `extra_body` produces, so
+    they go there directly. A server that does not know a key ignores or rejects it, which is the
+    run's problem to see, not ours to hide: nothing here silently drops a requested setting.
+    """
+    temperature: float = 0.0
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    presence_penalty: float | None = None
+    seed: int | None = None
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "Decoding":
+        env = os.environ if env is None else env
+        kw: dict = {}
+        for name, var in DECODING_ENV.items():
+            raw = (env.get(var) or "").strip()
+            if raw:
+                kw[name] = int(raw) if name in ("top_k", "seed") else float(raw)
+        return cls(**kw)
+
+    def body(self) -> dict:
+        """The request-body keys: `temperature` always (as before), the rest only when set."""
+        return {k: v for k, v in dataclasses.asdict(self).items()
+                if k == "temperature" or v is not None}
+
+    def is_default(self) -> bool:
+        return self == Decoding()
+
+    def as_dict(self) -> dict:
+        """Every field, set or not, so a record says what was NOT sent as well as what was."""
+        return dataclasses.asdict(self)
+
+    def canonical(self) -> str:
+        return json.dumps(self.as_dict(), sort_keys=True)
+
+    def env(self) -> dict[str, str]:
+        return {DECODING_ENV[k]: repr(v) for k, v in self.as_dict().items()
+                if v is not None and (k != "temperature" or v != 0.0)}
+
+
 def call_model(messages: list[dict], model: str, tools: list[dict] | None,
-               ep: Endpoint | None = None, max_tokens: int | None = None) -> dict:
+               ep: Endpoint | None = None, max_tokens: int | None = None,
+               decoding: Decoding | None = None) -> dict:
     """One chat completion, with retries.
 
     OpenRouter intermittently answers 200 with a body that has no "choices" (a routed-provider
@@ -185,7 +250,7 @@ def call_model(messages: list[dict], model: str, tools: list[dict] | None,
     body: dict = {
         "model": model,
         "messages": messages,
-        "temperature": 0.0,
+        **(decoding or Decoding.from_env()).body(),
     }
     if tools is not None:
         body["tools"] = tools
@@ -601,7 +666,8 @@ MAX_TEXT_ONLY_RUN = 1
 
 def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
               max_turns: int = 16, ep: Endpoint | None = None,
-              episode: Episode | None = None, stop: str = "model") -> list[dict]:
+              episode: Episode | None = None, stop: str = "model",
+              max_repeat: int | None = None) -> list[dict]:
     """The SFT protocol: one `bash` tool, and the loop ends when the answer is submitted.
 
     `stop` is the end-of-episode policy, and the two policies are different measurements:
@@ -633,7 +699,17 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
     /workdir/answer.txt, so the sandbox provides those paths (`run_ladder.jail_bash`) instead of
     this loop translating them.
 
-    Request: temperature 0, `tool_choice` auto, `tools` = upstream's single `bash` schema,
+    `max_repeat` (default off; `SMOL_LADDER_BASH_MAX_REPEAT` when None) is an ANALYSIS-ONLY loop
+    guard, not part of the protocol: once the model has issued the same tool call `max_repeat`
+    times in a row the episode ends with stop_reason "repeat_loop". The call that reaches the
+    count is still run and its output read, and nothing the model sees before that point is
+    changed. It only shortens a trial that was going to repeat itself to the turn cap, so a
+    looping trial costs less; it can end an episode that would have recovered later, so a run
+    that uses it is a different condition (run_ladder records it) and its pass rate is not
+    comparable to one without.
+
+    Request: temperature 0 unless `Decoding` says otherwise (SMOL_LADDER_TEMPERATURE, _TOP_P,
+    _TOP_K, _REPETITION_PENALTY, _PRESENCE_PENALTY, _SEED), `tool_choice` auto, `tools` = upstream's single `bash` schema,
     `chat_template_kwargs` {"enable_thinking": false} (the endpoint's default), and `max_tokens`
     1024 (eval_pass1's cap) clamped to the room left in the context. An exhausted context ends the
     episode (stop_reason "context_exhausted", graded on whatever answer.txt holds) rather than
@@ -651,6 +727,9 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
         raise ValueError(f"stop must be one of {STOP_POLICIES}, not {stop!r}")
     episode.stop_reason = "error"  # replaced on every clean exit; stays if a call raises
     answered, text_only_run, last_submit = False, 0, None
+    if max_repeat is None:
+        max_repeat = int(os.environ.get(BASH_MAX_REPEAT_ENV) or 0) or None
+    last_sig, same_run = None, 0
     for _ in range(max_turns):
         completion = complete_within_context(messages, model, BASH_TOOL, ep, episode,
                                              BASH_MAX_TOKENS)
@@ -671,6 +750,7 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
             if stop == "submit" or answered or text_only_run > MAX_TEXT_ONLY_RUN:
                 episode.stop_reason = "model_stopped"
                 break
+            last_sig = None  # a tool-free turn breaks "in a row"
             continue
         text_only_run = 0
         results = []
@@ -690,6 +770,13 @@ def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
             answered, last_submit = True, (turn, submitted)
             if stop == "submit":
                 episode.stop_reason = "answer_submitted"
+                break
+        if max_repeat:
+            sig = [(c["function"]["name"], c["function"]["arguments"]) for c in calls]
+            same_run = same_run + 1 if sig == last_sig else 1
+            last_sig = sig
+            if same_run >= max_repeat:
+                episode.stop_reason = "repeat_loop"
                 break
     else:
         episode.stop_reason = "max_turns"

@@ -238,6 +238,60 @@ in the sandbox (the rows show it failing in 97 of 106 attempts).
 
 ---
 
+### 1f. Decoding settings and the repeat loop (2026-10-02 gate)
+
+**What the gate showed.** 60 held-out tasks, L1, bash agent, temperature 0, 16 turns. Base 16/60,
+R (`smoldataenvs-sft-2b-v0`, 100 steps) 11/60. In 33 of R's 60 trials (24 of base's) the last four
+tool calls are the same string. Loops start at turn 3 for R (median; 21 of 33 start at turn 3),
+turn 7 for base. The call that gets repeated follows a traceback in 21 of R's 33 loops and a
+successful output the model then ignores in the other 12. In R's turns, 88% of tool-call turns have
+empty content (training rows: 50%; from turn 2 on, R writes text in 5-18% of turns, the rows in
+27-75%). The training rows repeat a call verbatim in 22 of 4,439 trajectories (10 consecutively).
+
+**History rendering is not the cause.** The request `bash_loop` sends (string `arguments`, tool
+messages with `tool_call_id` and `name`, assistant `content` as `""` when empty) was rendered with
+the Qwen3.5-2B tokenizer and `enable_thinking=False` for 2,007 assistant turns of 400 training rows
+(and 1,497 turns of the 120 gate transcripts): every prompt is a byte-exact prefix of the
+training-style render of the same conversation (dict `arguments`), and rendering string content as
+OpenAI text parts changes nothing. The template cannot render a *string* `arguments` itself (`|items`
+raises), so the wire request depends on vLLM turning it into a dict before templating; the gate's
+zero harness failures over 16-turn conversations (a 400 on turn 2 otherwise) show that it does. Not
+checked here: vLLM 0.17's own code path and the `qwen3_coder` parser's whitespace handling, since
+vLLM is not installed on this machine.
+
+**Upstream's settings.** `eval_pass1.py`: `do_sample=False`, `MAX_NEW_TOKENS=1024`, one program turn.
+`train_grpo.py`: `TEMPERATURE=0.8`, `TOP_P=1.0`, `repetition_penalty=1.05`,
+`MAX_COMPLETION_LENGTH=1024`, 8 generations. Neither script nor the READMEs publish a multi-turn
+bash rollout setting, and the SFT model card gives none, so there is no upstream number for this
+protocol. Qwen3.5-2B model card, non-thinking text: `temperature=1.0, top_p=1.0, top_k=20,
+min_p=0.0, presence_penalty=2.0, repetition_penalty=1.0`; its own no-thinking benchmark line uses
+`temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`. Sources:
+https://github.com/adithya-s-k/FineEnvs/tree/main/04-smoldataenvs/scripts (eval_pass1.py,
+train_grpo.py, rollout.py), https://huggingface.co/Qwen/Qwen3.5-2B,
+https://huggingface.co/AdithyaSK/smoldataenvs-sft-2b-v0.
+
+**Flags** (all agent modes; default is the old request, temperature 0, no other key):
+`--temperature --top-p --top-k --repetition-penalty --presence-penalty --seed`, or the matching
+`SMOL_LADDER_TEMPERATURE|TOP_P|TOP_K|REPETITION_PENALTY|PRESENCE_PENALTY|SEED`. `top_k` and
+`repetition_penalty` go as top-level body keys, which is what the OpenAI SDK's `extra_body` sends.
+Any non-default value needs `--run-tag`; the settings go in every `result.json` (`decoding`) and in
+RUN.json, they change `prompt_sha256` (so `summarize` flags mixed conditions like mixed prompts;
+default settings hash exactly as before), and a tag refuses a launch whose settings differ from the
+ones it started with. `--bash-max-repeat N` is analysis only: after the Nth identical tool call in
+a row the episode ends with `stop_reason: repeat_loop`; the model's inputs are untouched up to that
+point, and the run is its own condition (recorded as `bash_max_repeat`, hashed, tag-locked).
+
+**Recommended for the main L1 evaluation (same for every arm; unvalidated).** Sampled decoding,
+`--temperature 0.7 --top-p 0.8 --top-k 20`, no penalties, `--samples 3` and no repeat guard. Reasons:
+greedy decoding is what produces the verbatim loops; 0.7/0.8/20 is Qwen's own no-thinking
+evaluation setting minus the presence penalty, which at 1.5-2.0 penalises tokens a shell command
+must reuse (paths, `python3`, `pd.read_csv`) and was not tuned for tool calling. One sample at
+T>0 is noisy (60 tasks: about 6 points standard error), hence three. Validate with the 60 gate
+tasks, base and R, three conditions: T0 (done), the recommended setting, and the recommended setting
+plus `--presence-penalty 1.5`. Prefer the recommended setting unless the penalty condition cuts the
+last-four-identical share without lowering pass rate for both models. If R still loops at T0.7, the
+adapter (100 steps) is the problem and decoding cannot fix it.
+
 ## 2. What we changed in the code
 
 `smol_ladder/or_agent.py` — the endpoint is configuration, not a constant:

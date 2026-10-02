@@ -42,6 +42,7 @@ from pathlib import Path
 from smol_ladder import bash_env
 from smol_ladder.grade import grade
 from smol_ladder.ladder import hint_source, ladder_fingerprint, prompt_for, read_source
+from smol_ladder.or_agent import BASH_MAX_REPEAT_ENV, DECODING_ENV, Decoding
 from smol_ladder.tasks import DATA, input_dir, load_split
 from smol_ladder.upstream import HOME_DIR as U_HOME
 from smol_ladder.upstream import INPUT_DIR as U_INPUT
@@ -90,6 +91,30 @@ def prompt_sha256(prompt: str) -> str:
     got wider -- changes this, and the summariser then refuses to average across the two.
     """
     return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def condition_sha256(prompt: str) -> str:
+    """`prompt_sha256`, extended by the decoding settings when they are not the default.
+
+    The summariser refuses to pool results whose `prompt_sha256` differ, and that is exactly the
+    guard decoding needs: temperature 0 and temperature 0.7 are different measurements of the
+    same prompt. A default-decoding trial hashes exactly as before, so every existing result stays
+    poolable with new default ones; any other setting (or the analysis-only repeat guard, which
+    changes where episodes end) gives a different hash and is therefore never averaged in blind.
+    """
+    dec = Decoding.from_env()
+    guard = os.environ.get(BASH_MAX_REPEAT_ENV, "").strip()
+    if dec.is_default() and not guard:
+        return prompt_sha256(prompt)
+    extra = {"decoding": dec.as_dict(), **({"bash_max_repeat": int(guard)} if guard else {})}
+    return prompt_sha256(prompt + "\n\0condition:" + json.dumps(extra, sort_keys=True))
+
+
+def decoding_record(agent: str) -> dict:
+    """What result.json and RUN.json say about how the model was sampled."""
+    guard = os.environ.get(BASH_MAX_REPEAT_ENV, "").strip()
+    return {"decoding": Decoding.from_env().as_dict(),
+            **({"bash_max_repeat": int(guard)} if guard and agent == "bash" else {})}
 
 
 def source_for(split: str):
@@ -471,6 +496,10 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
         # Context window override for the bash loop's budget (else read from GET /v1/models).
         "SMOL_LADDER_MAX_MODEL_LEN": os.environ.get("SMOL_LADDER_MAX_MODEL_LEN", ""),
+        # Decoding settings and the analysis-only repeat guard (or_agent.Decoding), allowlisted
+        # like the endpoint: the solver inside the jail samples with what this launch asked for.
+        **{var: os.environ.get(var, "")
+           for var in (*DECODING_ENV.values(), BASH_MAX_REPEAT_ENV)},
     }
     # A key held under a non-default name has to travel under its own name too, since that is
     # what SMOL_LADDER_API_KEY_ENV now points at.
@@ -545,8 +574,9 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         result["last_prompt_tokens"] = episode.get("last_prompt_tokens")
         result["truncated_outputs"] = episode.get("truncated_outputs")
         result["context_length"] = episode.get("context_length")
-    result["prompt_sha256"] = prompt_sha256(prompt)
+    result["prompt_sha256"] = condition_sha256(prompt)
     result["ladder_sha256"] = ladder_fingerprint()
+    result.update(decoding_record(agent))
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
     # rung and sample default to what the caller passed anyway: gen_refs drives once() directly
     # with a rung label and no sample axis, and a reference has rung "reference", sample 0.
@@ -835,7 +865,7 @@ def harness_failure(rung_label: str, prompt_rung: str, sample: int, prompt: str,
               "error": f"{type(exc).__name__}: {exc}"[-2000:]}
     result.update(git_provenance())
     if prompt:
-        result["prompt_sha256"] = prompt_sha256(prompt)
+        result["prompt_sha256"] = condition_sha256(prompt)
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
     result["rung"] = prompt_rung
     result["sample"] = sample
@@ -944,7 +974,7 @@ def _stamp() -> str:
 _LAUNCH_KEYS = ("git_commit", "git_dirty", "command_line", "start_time", "model", "agent",
                 "rungs", "samples", "climb", "workers", "max_turns", "limit", "split",
                 "run_tag", "tasks_planned", "tasks_skipped_no_inputs", "skipped_for_inputs_file",
-                "bash_stop")
+                "bash_stop", "decoding", "bash_max_repeat")
 # What a launch reports when it ends, so these are not part of the run's lasting shape.
 _COUNT_KEYS = ("tasks", "trials", "skipped", "trials_scored", "passes")
 
@@ -965,6 +995,25 @@ def _save_run_record(path: Path, record: dict) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=1))
     return record
+
+
+def decoding_clash(existing: dict, header: dict) -> str:
+    """Why this launch may not join the run already recorded, or "" when it may.
+
+    A run tag is one condition. A record with no `decoding` key predates the flags and was
+    temperature 0 with no repeat guard, which is what "no setting" means here too, so old tags stay
+    resumable by default launches and only by those.
+    """
+    if not existing.get("launches") and not existing.get("model"):
+        return ""
+    default = Decoding().as_dict()
+    was = (existing.get("decoding") or default, existing.get("bash_max_repeat"))
+    now = (header.get("decoding") or default, header.get("bash_max_repeat"))
+    if was == now:
+        return ""
+    return (f"run tag {header.get('run_tag')!r} was started with decoding {was[0]} / repeat guard "
+            f"{was[1]} and this launch has {now[0]} / {now[1]}: results of different decoding "
+            f"conditions are never pooled in one run. Use a new --run-tag.")
 
 
 def open_run_record(path: Path, header: dict) -> int:
@@ -1117,9 +1166,42 @@ def main() -> None:
                          "go to data/skipped_<split>.json.")
     ap.add_argument("--no-skip-uncached", dest="skip_uncached", action="store_false",
                     help="attempt every task, fetching whatever tables are missing")
+    # Request-level decoding, all agent modes. Defaults reproduce the historical request (temperature
+    # 0, no other key), so nothing changes unless a flag is given. See or_agent.Decoding.
+    dg = ap.add_argument_group("decoding", "sampling settings sent with every request; any "
+                               "non-default value needs --run-tag and is a different condition")
+    dg.add_argument("--temperature", type=float, default=None, help="default 0 (greedy)")
+    dg.add_argument("--top-p", type=float, default=None)
+    dg.add_argument("--top-k", type=int, default=None, help="vLLM/OpenRouter extra body key")
+    dg.add_argument("--repetition-penalty", type=float, default=None,
+                    help="vLLM/OpenRouter extra body key")
+    dg.add_argument("--presence-penalty", type=float, default=None)
+    dg.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--bash-max-repeat", type=int, default=None, metavar="N",
+                    help="ANALYSIS ONLY, off by default. --agent bash: end the episode with "
+                         "stop_reason 'repeat_loop' once the same tool call has been issued N "
+                         "times in a row. Cheaper loops, but a different condition from a run "
+                         "without it. Needs --run-tag.")
     args = ap.parse_args()
     if args.samples < 1:
         ap.error("--samples must be at least 1")
+    if args.bash_max_repeat is not None and (args.bash_max_repeat < 2 or args.agent != "bash"):
+        ap.error("--bash-max-repeat needs --agent bash and N >= 2")
+    # Flags win over an inherited environment, and the environment is what the jail is handed.
+    for name, var in DECODING_ENV.items():
+        value = getattr(args, name)
+        if value is not None:
+            os.environ[var] = repr(value)
+    if args.bash_max_repeat is not None:
+        os.environ[BASH_MAX_REPEAT_ENV] = str(args.bash_max_repeat)
+    try:
+        decoding = Decoding.from_env()
+    except ValueError as e:
+        ap.error(f"bad SMOL_LADDER_* decoding setting: {e}")
+    guard = int(os.environ.get(BASH_MAX_REPEAT_ENV) or 0)
+    if (not decoding.is_default() or guard) and not args.run_tag:
+        ap.error("non-default decoding (or --bash-max-repeat) needs --run-tag: the untagged "
+                 "tree is shared with temperature-0 results and must not be mixed with them")
 
     rows, inputs_of = source_for(args.split)
     if args.task_ids:
@@ -1165,6 +1247,7 @@ def main() -> None:
     header = {
         "run_tag": args.run_tag, "split": args.split, "model": args.model, "agent": args.agent,
         **({"bash_stop": args.bash_stop} if args.agent == "bash" else {}),
+        **decoding_record(args.agent),
         "rungs": rungs, "samples": args.samples, "climb": bool(args.climb),
         "workers": args.workers, "max_turns": args.max_turns, "limit": args.limit,
         "tasks_planned": len(rows),
@@ -1178,6 +1261,9 @@ def main() -> None:
         **reference_state(rows, args.split, rungs),
     }
     if run_record is not None:
+        clash = decoding_clash(_read_run_record(run_record), header)
+        if clash:
+            ap.error(clash)
         launch = open_run_record(run_record, header)
     print(f"{len(rows)} tasks x {len(rungs)} rungs x {args.samples} samples"
           f"{'' if args.climb else ', no climb'}; code {git_provenance()['git_commit'][:8]}"
