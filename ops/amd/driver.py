@@ -10,16 +10,22 @@
     python ops/amd/driver.py train              SFT A, B, A+B (resumable, skips finished arms)
     python ops/amd/driver.py serve              ONE vLLM: base + all adapters
     python ops/amd/driver.py tunnel [up|down]   ssh -L to the droplet (loopback)
-    python ops/amd/driver.py eval               ladder on THIS laptop: L1 for all four, then L2..L4, control
+    python ops/amd/driver.py eval --stage L1    L1 for all four models, then STOP: read it, then buy more
+    python ops/amd/driver.py eval --stage rest  L2-L4 and the one-turn control (--stage hints / control / all)
     python ops/amd/driver.py sync               adapters + logs off the droplet, then verify them
     python ops/amd/driver.py destroy --yes      DELETE by tag, then GET until none remains
     python ops/amd/driver.py go                 train -> serve -> tunnel -> eval -> sync -> destroy
-    python ops/amd/driver.py status             uptime and accrued cost, from the ledger
+    python ops/amd/driver.py status             droplet, uptime, dollars accrued and remaining, the
+                                                caps, the $95 hard limit, and whether the deadman lives
 
 Nothing mutates the cloud without `--yes`, and `--yes` is only ever typed by the reviewer. Every
 billed step passes a budget gate first (ledger accrual + the step + a reserve for sync/destroy
-must stay under --budget and under the total cap), and every lifecycle event is appended to
-ops/amd/ledger.jsonl. See docs/AMD_RUNBOOK.md.
+must stay under --budget and under the total cap, which can never exceed the $95 hard limit) and a
+deadman gate (a fresh heartbeat from the independent watcher, ops/amd/deadman.py), and every
+lifecycle event is appended to ops/amd/ledger.jsonl. Run long commands detached
+(`setsid nohup python ops/amd/driver.py go >> logs/go.log 2>&1 < /dev/null &`): SIGTERM and SIGHUP
+are turned into exceptions so `go` still reaches its destroy, but a detached process never gets the
+HUP at all. See docs/AMD_RUNBOOK.md.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import signal
@@ -154,8 +161,25 @@ def with_host(cfg: P.Config, events: list[dict]) -> P.Config:
     return cfg
 
 
+def hardware_of(cfg: P.Config) -> str:
+    return f"{cfg.size}|{cfg.region}|{cfg.image}"
+
+
+def measure_key(cfg: P.Config, events: list[dict]) -> tuple:
+    """(droplet id, hardware) that measurements and a GO are valid for: the droplet that is live
+    now. With none live the key matches nothing, so a stale GO or throughput from an earlier
+    droplet (possibly on other hardware) can never be read as this one's."""
+    live = L.open_interval(events)
+    return (live.get("droplet_id") if live else "<no live droplet>", hardware_of(cfg))
+
+
+def stamp(cfg: P.Config, events: list[dict]) -> dict:
+    droplet_id, hardware = measure_key(cfg, events)
+    return {"droplet_id": droplet_id, "hardware": hardware}
+
+
 def make_plan(cfg: P.Config, events: list[dict]) -> tuple[list[P.Step], list[P.Row]]:
-    meas = P.measured_from_ledger(events)
+    meas = P.measured_from_ledger(events, measure_key(cfg, events))
     tokens = tokens_for(cfg)
     rows = P.projection(cfg, tokens, meas)
     cfg.deadline_minutes = cfg.deadline_minutes or P.default_deadline_minutes(cfg, rows)
@@ -178,13 +202,23 @@ def print_table(cfg: P.Config, rows: list[P.Row], spent_session: float = 0.0) ->
           f"(session headroom ${cfg.budget - total:.2f}, credit headroom ${P.CREDIT - total:.2f})")
     if total > cfg.budget:
         print(f"  !! OVER THE SESSION BUDGET by ${total - cfg.budget:.2f}")
+    staged = P.staged_dollars(rows, cfg.price)
+    if staged["hints"] or staged["control"]:
+        print(f"  {'-' * 60}")
+        print(f"  stop after L1:  ${staged['l1_only']:.2f} in all (everything above except the two "
+              "optional rows below)")
+        print(f"  + L2-L4:        ${staged['hints']:.2f} incremental   (eval --stage hints)")
+        print(f"  + control:      ${staged['control']:.2f} incremental   (eval --stage control)")
     if any(not r.measured and "UNMEASURED" in r.basis for r in rows):
         print("  !! rows marked UNMEASURED are placeholders; the smoke measures them and `project` "
               "re-renders this table before any arm is trained")
     return {"rows": [{"stage": r.stage, "seconds": round(r.seconds), "dollars":
                       round(r.dollars(cfg.price), 2), "basis": r.basis} for r in rows],
             "total_hours": round(hours, 2), "total_dollars": round(total, 2),
-            "price_per_hour": cfg.price, "budget": cfg.budget, "within_budget": total <= cfg.budget}
+            "price_per_hour": cfg.price, "budget": cfg.budget, "within_budget": total <= cfg.budget,
+            "l1_only_dollars": round(staged["l1_only"], 2),
+            "incremental_dollars": {"L2-L4": round(staged["hints"], 2),
+                                    "control": round(staged["control"], 2)}}
 
 
 def show_step(step: P.Step) -> None:
@@ -266,9 +300,12 @@ def gate(cfg: P.Config, step: P.Step, now: float | None = None) -> None:
         "watcher has exited or is stale: re-arm it before the next create.")
 
 
-def last_go(events: list[dict]) -> bool | None:
+def last_go(events: list[dict], key: tuple | None = None) -> bool | None:
+    """The latest GO/NO-GO, counting only decisions stamped with `key` (see measure_key)."""
     for e in reversed(events):
         if e.get("event") == L.MEASURED and "go" in e:
+            if key is not None and (e.get("droplet_id"), e.get("hardware")) != tuple(key):
+                continue
             return bool(e["go"])
     return None
 
@@ -403,16 +440,18 @@ def parse_probe_serve(text: str) -> dict:
     return out
 
 
-def seconds_per_trial(output: str, wall_seconds: float) -> float | None:
-    """Wall seconds per trial at the probe's worker count, from the harness's own progress lines."""
+def seconds_per_trial(output: str, wall_seconds: float, models: int = 1) -> float | None:
+    """Wall seconds per trial of ONE model at the probe's worker count and concurrency, from the
+    harness's own progress lines. With `models` harnesses running at once the lines of all of them
+    are counted, so each model's trial count is the total divided by `models`."""
     n = len(TRIAL_LINE.findall(output))
-    return wall_seconds / n if n else None
+    return wall_seconds / (n / models) if n else None
 
 
 def go_no_go(cfg: P.Config, events: list[dict], now: float) -> tuple[bool, list[str], dict]:
     """The decision the smoke ends with. NO-GO on any failed check, an unmeasured throughput, or a
     projection (money already spent + everything still to run) that passes either cap."""
-    meas = P.measured_from_ledger(events)
+    meas = P.measured_from_ledger(events, measure_key(cfg, events))
     rows = P.projection(cfg, tokens_for(cfg), meas)
     spent = L.spend(events, now, cfg.price)
     remaining = P.remaining_after(rows, "sft")
@@ -438,7 +477,7 @@ def go_no_go(cfg: P.Config, events: list[dict], now: float) -> tuple[bool, list[
 
 def cmd_project(cfg: P.Config, events: list[dict]) -> bool:
     ok, reasons, info = go_no_go(cfg, events, time.time())
-    rows = P.projection(cfg, tokens_for(cfg), P.measured_from_ledger(events))
+    rows = P.projection(cfg, tokens_for(cfg), P.measured_from_ledger(events, measure_key(cfg, events)))
     print_table(cfg, rows)
     print(f"\n  spent so far ${info['spent']:.2f}; still to run ${info['remaining']:.2f}")
     if ok:
@@ -449,7 +488,7 @@ def cmd_project(cfg: P.Config, events: list[dict]) -> bool:
             print(f"  - {r}")
         print("  options: --limit/--samples/--rungs smaller, drop an arm (--arms A,B), "
               "--max-length smaller, or raise --budget on purpose; then `project` again.")
-    L.append(Path(cfg.ledger), L.MEASURED, go=ok, reasons=reasons)
+    L.append(Path(cfg.ledger), L.MEASURED, go=ok, reasons=reasons, **stamp(cfg, events))
     if ok:
         left = P.total_dollars(P.remaining_after(rows, "sft"), cfg.price) / cfg.price * 3600.0
         minutes = int(left * 1.25 / 60.0 + 15)
@@ -533,7 +572,7 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
         elif step.name == "go-no-go":
             code = 0 if cmd_project(cfg, L.read(ledger)) else 3
         elif step.name == "verify-sync":
-            code = 0 if verify_sync(cfg) else 1
+            code = 0 if verify_sync(cfg, ran=ran_steps(L.read(ledger))) else 1
         elif step.name in ("tunnel", "probe-tunnel"):
             code = ensure_tunnel(cfg)
         elif step.name == "tunnel-down":
@@ -552,13 +591,14 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
             Path(cfg.stage_dir, "remote.env").unlink(missing_ok=True)
         if step.name == "smoke-pull" and code == 0:
             data = json.loads(Path(cfg.local_logs, "measurements.json").read_text())
-            L.append(ledger, L.MEASURED, **parse_measurements(data))
+            L.append(ledger, L.MEASURED, **parse_measurements(data), **stamp(cfg, L.read(ledger)))
         if step.name == "probe-serve":
-            L.append(ledger, L.MEASURED, **parse_probe_serve(out))
+            L.append(ledger, L.MEASURED, **parse_probe_serve(out), **stamp(cfg, L.read(ledger)))
         if step.name == "probe-eval" and code == 0:
-            spt = seconds_per_trial(out, wall)
+            spt = seconds_per_trial(out, wall, models=len(step.cmds))
             if spt:
-                L.append(ledger, L.MEASURED, sec_per_trial=round(spt, 2), probe_wall_s=round(wall, 1))
+                L.append(ledger, L.MEASURED, sec_per_trial=round(spt, 2), probe_wall_s=round(wall, 1),
+                         probe_models=len(step.cmds), **stamp(cfg, L.read(ledger)))
         if code != 0 and step.name == "verify-sync":
             raise SyncUnverified("verify-sync FAILED: something that matters is not safely off "
                                  "the droplet (the FAIL lines above say what).")
@@ -716,19 +756,76 @@ def sha_check(root: Path, sums_name: str = "SHA256SUMS.artifacts") -> list[str]:
     return bad
 
 
+EVAL_STAGES = {
+    "L1": ("eval-L1",),
+    "hints": ("eval-L2", "eval-L3", "eval-L4"),
+    "control": ("eval-control",),
+    "rest": ("eval-L2", "eval-L3", "eval-L4", "eval-control"),
+    "all": ("eval-L1", "eval-L2", "eval-L3", "eval-L4", "eval-control"),
+}
+
+
+def select_eval(steps: list[P.Step], stage: str) -> list[P.Step]:
+    """The plan with only the requested evaluation stage's steps in the eval phase. `L1` runs the
+    four models at L1 and stops: the reviewer reads those numbers, then buys `hints` or not."""
+    keep = set(EVAL_STAGES[stage])
+    chosen = [s for s in steps if s.phase != "eval" or s.name in keep]
+    if not any(s.phase == "eval" for s in chosen):
+        raise SystemExit(f"--stage {stage} selects nothing: the plan has no such evaluation step "
+                         "(check --rungs / --no-base / --no-program-control)")
+    return chosen
+
+
+def ran_steps(events: list[dict]) -> set[str]:
+    """Names of steps that have finished with exit 0 (the evaluation's results live on the laptop,
+    so this is read across droplets and sessions)."""
+    return {e["step"] for e in events if e.get("event") == L.STEP_END and e.get("code") == 0}
+
+
 def hub_repos(cfg: P.Config, namespace: str) -> dict[str, str]:
     base = {"A": "smol-ladder-sft-a", "B": "smol-ladder-sft-b", "AB": "smol-ladder-sft-ab"}
     return {a: f"{namespace}/{base[a]}" for a in P.ARMS if a in cfg.arms}
 
 
+TRIAL_FLOOR = 0.9     # a run tag must hold at least this fraction of the trials it was asked for
+
+
+def trial_files(root: Path, tag: str, split: str, rung: str) -> int:
+    base = root / tag / split
+    if not base.exists():
+        return 0
+    return (len(list(base.glob(f"*/{rung}/result.json")))
+            + len(list(base.glob(f"*/{rung}/s*/result.json"))))
+
+
+def required_trials(cfg: P.Config, ran: set[str] | None = None) -> dict[str, tuple[str, int, int]]:
+    """run tag -> (rung counted, expected, minimum). Only the FIRST rung of the plan is counted:
+    every task gets it, whereas L2-L4 skip tasks that have no verified reference, so for them the
+    expected count is an upper bound and a floor on it would fail a healthy run. `ran` limits the
+    check to the stages that actually ran (`eval --stage L1` must not be failed for the hint rungs
+    it was told not to run)."""
+    rung = "L1" if "L1" in cfg.rungs else cfg.rungs[0]
+    n = cfg.samples if rung == "L1" else cfg.late_samples
+    out: dict[str, tuple[str, int, int]] = {}
+    if ran is None or f"eval-{rung}" in ran:
+        for arm in P.eval_arms(cfg):
+            out[P.run_tag(cfg, arm)] = (rung, cfg.limit * n, math.ceil(TRIAL_FLOOR * cfg.limit * n))
+    if cfg.include_base and cfg.program_control and (ran is None or "eval-control" in ran):
+        out[f"{P.run_tag(cfg, 'base')}-program"] = (
+            "L1", cfg.limit, math.ceil(TRIAL_FLOOR * cfg.limit))
+    return out
+
+
 def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
-                namespace: str | None = None) -> bool:
+                namespace: str | None = None, ran: set[str] | None = None) -> bool:
     """After the sync, before the destroy: is everything that matters somewhere that is not the droplet?
 
     1. every adapter is readable on the Hub (`hub_files(repo)` lists a repo's files; injected so a
        test needs no network),
     2. the droplet's own checksum list matches the copies pulled to logs/amd/,
-    3. every run tag has result files in the laptop's results tree (the laptop wrote them directly).
+    3. every run tag that was evaluated holds at least 90% of the trials it was asked for in the
+       laptop's results tree (the laptop wrote them directly). A tag with one result file is a
+       sweep that died, not a result.
     """
     ok = True
     ns = namespace
@@ -750,11 +847,11 @@ def verify_sync(cfg: P.Config, hub_files=None, runs_root: Path | None = None,
           + (f": {bad}" if bad else ""))
     ok &= not bad
     root = runs_root or (REPO_ROOT / "data" / "runs")
-    for tag, expected in P.expected_trials(cfg).items():
-        n = len(list((root / tag / cfg.split).glob("*/*/result.json"))) if (root / tag).exists() else 0
-        n += len(list((root / tag / cfg.split).glob("*/*/s*/result.json"))) if (root / tag).exists() else 0
-        good = n > 0
-        print(f"  {'PASS' if good else 'FAIL'}  run tag {tag}: {n} result files (at most {expected})")
+    for tag, (rung, expected, minimum) in required_trials(cfg, ran).items():
+        n = trial_files(root, tag, cfg.split, rung)
+        good = n >= minimum
+        print(f"  {'PASS' if good else 'FAIL'}  run tag {tag}: {n} {rung} result files "
+              f"(expected {expected}, need at least {minimum} = {TRIAL_FLOOR:.0%})")
         ok &= good
     return ok
 
@@ -772,11 +869,27 @@ def cmd_status(cfg: P.Config, events: list[dict], api) -> None:
         except SystemExit as exc:
             print(f"  API check failed: {exc}")
     s = L.summarise(events, now, cfg.price)
+    print_status(cfg, s, now)
+
+
+def print_status(cfg: P.Config, s: dict, now: float) -> None:
+    """Everything the reviewer needs to decide whether to continue, from the ledger alone."""
+    cap = P.effective_total_cap(cfg.total_cap)
     print("## status")
     print(f"  state      {s['state']}")
-    print(f"  uptime     {s['uptime_seconds'] / 60.0:.1f} min   ip {s.get('ip') or '-'}")
-    print(f"  accrued    session ${s['session_dollars']:.2f} of ${cfg.budget:.2f}; "
-          f"total ${s['total_dollars']:.2f} of ${cfg.total_cap:.2f}  (${s['price_per_hour']}/h)")
+    print(f"  droplet    id {s.get('droplet_id') or '-'}   ip {s.get('ip') or '-'}   "
+          f"uptime {s['uptime_seconds'] / 60.0:.1f} min   (${s['price_per_hour']}/h)")
+    print(f"  accrued    session ${s['session_dollars']:.2f}   total ${s['total_dollars']:.2f}")
+    print(f"  remaining  ${cfg.budget - s['session_dollars']:.2f} under the ${cfg.budget:.2f} session "
+          f"budget;  ${cap - s['total_dollars']:.2f} under the ${cap:.2f} working total cap")
+    print(f"  caps       session ${cfg.budget:.2f}   working total ${cfg.total_cap:.2f}   "
+          f"HARD limit ${P.HARD_TOTAL_LIMIT:.2f} (nothing may exceed it; the deadman destroys at "
+          f"${min(cfg.total_cap, P.HARD_TOTAL_LIMIT) - P.DESTROY_MARGIN:.2f})")
+    fresh, why = L.heartbeat_status(Path(cfg.ledger), now, tag=cfg.tag, budget=cfg.budget,
+                                    total_cap=cfg.total_cap)
+    print(f"  deadman    {'HEARTBEAT FRESH' if fresh else 'NO LIVE DEADMAN'}: {why}")
+    if not fresh:
+        print(f"             start it:  {deadman_command(cfg)}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -795,6 +908,11 @@ def main(argv: list[str] | None = None) -> int:
         if n == "create":
             p.add_argument("--new-session", action="store_true",
                            help="reset the session budget (default: only the first create does)")
+        if n in ("eval", "go"):
+            p.add_argument("--stage", choices=list(EVAL_STAGES), default="all",
+                           help="evaluation stage: L1 = the four models at L1 only, then stop (look "
+                                "at it, then decide); hints = L2-L4; control = the one-turn "
+                                "control; rest = hints + control; all = everything (default)")
         if n == "tunnel":
             p.add_argument("action", nargs="?", default="up", choices=["up", "down"])
         if n == "note-prior-spend":
@@ -839,9 +957,11 @@ def main(argv: list[str] | None = None) -> int:
     if c == "project":
         return 0 if cmd_project(cfg, events) else 3
     if c == "verify-sync":
-        return 0 if verify_sync(cfg) else 1
+        return 0 if verify_sync(cfg, ran=ran_steps(events)) else 1
 
     steps, _ = make_plan(cfg, events)
+    if c in ("eval", "go"):
+        steps = select_eval(steps, args.stage)
     phases = {"create": ["create"], "bootstrap": ["bootstrap"], "smoke": ["smoke"],
               "train": ["train"], "serve": ["serve"], "eval": ["eval"], "sync": ["sync"],
               "destroy": ["destroy"], "tunnel": ["tunnel"]}
@@ -867,9 +987,10 @@ def main(argv: list[str] | None = None) -> int:
             return subprocess.call(list(P.tunnel_down(cfg).argv), env=child_env())
         return ensure_tunnel(cfg)
 
-    if c in ("train", "go") and last_go(events) is not True:
-        raise SystemExit("no GO on record: run `driver.py smoke` (or `project`) first. The "
-                         "measured projection must fit the budget before anything is trained.")
+    if c in ("train", "go") and last_go(events, measure_key(cfg, events)) is not True:
+        raise SystemExit("no GO on record for THIS droplet and hardware: run `driver.py smoke` (or "
+                         "`project`) first. The measured projection must fit the budget before "
+                         "anything is trained, and a GO from an earlier droplet does not carry over.")
     if c == "go":
         return go(cfg, steps, client())
     run_steps(cfg, steps, None, only=phases[c][0])

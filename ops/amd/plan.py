@@ -102,7 +102,10 @@ SYNC_S = 300.0
 DESTROY_S = 60.0
 RESERVE_S = SYNC_S + DESTROY_S   # held back so the last two steps are always affordable
 SAFETY = 1.15                # multiplier on measured training time
-CONTENTION = 1.5             # four concurrent sweeps share one server and the laptop's cores
+CONTENTION = 1.5             # four concurrent sweeps share one server and the laptop's cores; a
+                             # guess applied to a ONE-model measurement
+CONTENTION_FROM_2WAY = 1.25  # applied instead when the probe measured TWO concurrent models: half
+                             # of the 1 -> 4 slowdown is then already in the measured number
 
 # Placeholders. Every one is labelled UNMEASURED in the table and replaced by the smoke.
 ASSUMED_TOKENS_PER_S = 6000.0
@@ -334,6 +337,17 @@ def probe_cmd(cfg: Config) -> Cmd:
     return eval_cmd(cfg, "base", "L1", 1, tag=f"{cfg.tag_prefix}-probe", limit=20)
 
 
+def probe_cmds(cfg: Config) -> list[Cmd]:
+    """The probe drives TWO models at once (the base and the smoke's adapter, both already on the
+    probe server), so contention is measured rather than assumed: the 4-way run is then an
+    extrapolation from 2, not from 1. Same trial count per model as before, so the wall time grows
+    only by the contention itself (about a minute). The adapter's port is `A`'s (they differ only
+    in `merged` mode, where the probe adapter sits on the first adapter port)."""
+    adapter = eval_cmd(cfg, "A", "L1", 1, tag=f"{cfg.tag_prefix}-probe-adapter",
+                       model=PROBE_NAME, limit=20)
+    return [probe_cmd(cfg), adapter]
+
+
 def expected_trials(cfg: Config) -> dict[str, int]:
     """Upper bound of result files per run tag (L2-L4 skip tasks that have no reference)."""
     per = 0
@@ -394,21 +408,27 @@ class Measured:
     batch_size: int = 0
     grad_accum: int = 0
     sec_per_trial: float = 0.0       # wall seconds per bash trial at cfg.workers, from the probe
+    probe_models: int = 0            # models that drove the probe concurrently (0 = not measured)
     probe_start_s: float = 0.0       # vLLM start time with base + adapter
     tool_calls_ok: bool | None = None
     checks_ok: bool | None = None
     resume_ok: bool | None = None
 
 
-def measured_from_ledger(events: list[dict]) -> Measured:
+def measured_from_ledger(events: list[dict], key: tuple | None = None) -> Measured:
+    """Fold the ledger's `measured` events into one Measured. With `key` = (droplet_id, hardware)
+    only events stamped with exactly that key count: a number measured on another droplet, or on
+    other hardware, must never carry over. `key=None` is for pure tests and reads everything."""
     m = Measured()
     for e in events:
         if e.get("event") != "measured":
             continue
-        for key in ("tokens_per_s", "batch_size", "grad_accum", "sec_per_trial",
-                    "probe_start_s", "tool_calls_ok", "checks_ok", "resume_ok"):
-            if e.get(key) is not None:
-                setattr(m, key, e[key])
+        if key is not None and (e.get("droplet_id"), e.get("hardware")) != tuple(key):
+            continue
+        for key_ in ("tokens_per_s", "batch_size", "grad_accum", "sec_per_trial", "probe_models",
+                     "probe_start_s", "tool_calls_ok", "checks_ok", "resume_ok"):
+            if e.get(key_) is not None:
+                setattr(m, key_, e[key_])
     return m
 
 
@@ -418,21 +438,38 @@ def sft_seconds(tokens: int, tokens_per_s: float) -> float:
     return tokens / tokens_per_s * SAFETY + SFT_OVERHEAD_S
 
 
-def eval_seconds(cfg: Config, sec_per_trial: float) -> float:
-    """Wall seconds the one server must stay up for the whole evaluation.
+def contention_for(meas: Measured) -> float:
+    return CONTENTION_FROM_2WAY if meas.probe_models >= 2 else CONTENTION
+
+
+def hint_rungs(cfg: Config) -> tuple[str, ...]:
+    return tuple(r for r in cfg.rungs if r != "L1")
+
+
+def eval_breakdown(cfg: Config, sec_per_trial: float, contention: float = CONTENTION) -> dict[str, float]:
+    """Wall seconds the one server must stay up, split the way the reviewer buys it: L1 for all
+    models, the hint rungs (L2-L4) on top, and the one-turn control.
 
     Phases run in series, the models inside a phase run concurrently, so a phase takes
-    (trials per model) x (measured wall seconds per trial) x CONTENTION. `sec_per_trial` was
-    measured with one model driving the server and the laptop's cores to itself, which is what
-    CONTENTION pays for.
-    """
-    total = 0.0
+    (trials per model) x (measured wall seconds per trial) x contention."""
+    out = {"L1": 0.0, "hints": 0.0, "control": 0.0}
     for rung in cfg.rungs:
         n = cfg.samples if rung == "L1" else cfg.late_samples
-        total += cfg.limit * n * sec_per_trial * CONTENTION
+        out["L1" if rung == "L1" else "hints"] += cfg.limit * n * sec_per_trial * contention
     if cfg.include_base and cfg.program_control:
-        total += cfg.limit * sec_per_trial * PROGRAM_COST_FACTOR * CONTENTION
-    return total
+        out["control"] = cfg.limit * sec_per_trial * PROGRAM_COST_FACTOR * contention
+    return out
+
+
+def eval_seconds(cfg: Config, sec_per_trial: float, contention: float = CONTENTION) -> float:
+    """Wall seconds the one server must stay up for the whole evaluation (every stage)."""
+    return sum(eval_breakdown(cfg, sec_per_trial, contention).values())
+
+
+ROW_SERVE = "serve: start vLLM"
+ROW_L1 = "eval L1 (4 models)"
+ROW_HINTS = "eval L2-L4 (incremental)"
+ROW_CONTROL = "eval program control"
 
 
 @dataclass
@@ -477,10 +514,22 @@ def projection(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
         rows.append(Row(f"sft {arm}", sft_seconds(t.trained_tokens, tps),
                         f"{t.trained_tokens / 1e6:.2f}M tokens / {tps:,.0f} tok/s x {SAFETY} "
                         f"+ {SFT_OVERHEAD_S:.0f}s; {tps_basis}", bool(meas.tokens_per_s)))
-    ev = eval_seconds(cfg, spt)
-    rows.append(Row("serve + evaluate (4 models)", SERVE_START_S + ev,
-                    f"{len(eval_arms(cfg))} models, {len(cfg.rungs)} rungs, {cfg.limit} tasks; "
-                    f"{spt_basis}; x{CONTENTION} contention", bool(meas.sec_per_trial)))
+    cont = contention_for(meas)
+    ev = eval_breakdown(cfg, spt, cont)
+    cont_basis = (f"x{cont} contention (probe measured {meas.probe_models} concurrent models)"
+                  if meas.probe_models >= 2 else f"x{cont} contention (guess)")
+    n_models = len(eval_arms(cfg))
+    rows.append(Row(ROW_SERVE, SERVE_START_S, "estimate: vLLM start with base + 3 adapters", False))
+    if "L1" in cfg.rungs:
+        rows.append(Row(ROW_L1, ev["L1"], f"{n_models} models, {cfg.limit} tasks x {cfg.samples} "
+                        f"samples; {spt_basis}; {cont_basis}", bool(meas.sec_per_trial)))
+    if hint_rungs(cfg):
+        rows.append(Row(ROW_HINTS, ev["hints"], f"{n_models} models, {','.join(hint_rungs(cfg))}, "
+                        f"{cfg.limit} tasks x {cfg.late_samples} sample; {spt_basis}; {cont_basis}; "
+                        "optional: look at L1 first", bool(meas.sec_per_trial)))
+    if ev["control"]:
+        rows.append(Row(ROW_CONTROL, ev["control"], f"base under --agent program, {cfg.limit} "
+                        f"tasks; {PROGRAM_COST_FACTOR}x a bash trial; optional", bool(meas.sec_per_trial)))
     rows.append(Row("sync back + verify", SYNC_S, "reserve", False))
     rows.append(Row("destroy + verify", DESTROY_S, "reserve", False))
     return rows
@@ -488,6 +537,16 @@ def projection(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
 
 def total_dollars(rows: list[Row], price: float) -> float:
     return sum(r.dollars(price) for r in rows)
+
+
+def staged_dollars(rows: list[Row], price: float) -> dict[str, float]:
+    """What the session costs if it stops after L1, and what each optional stage adds to that.
+    `l1_only` keeps every other row (create, smoke, training, serve, the sync/destroy reserve)."""
+    extra = {"hints": ROW_HINTS, "control": ROW_CONTROL}
+    add = {k: sum(r.dollars(price) for r in rows if r.stage == name) for k, name in extra.items()}
+    total = total_dollars(rows, price)
+    return {"l1_only": total - add["hints"] - add["control"], "hints": add["hints"],
+            "control": add["control"], "all": total}
 
 
 def remaining_after(rows: list[Row], first_stage_prefix: str) -> list[Row]:
@@ -592,9 +651,10 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
         "the tool-call parser returns tool calls BEFORE any arm is trained"))
     steps.append(Step("smoke", "probe-tunnel", "laptop", [tunnel_up(cfg)], 0.0,
                       "ssh -L to the droplet, loopback on both ends", billed=False))
-    steps.append(Step("smoke", "probe-eval", "laptop", [probe_cmd(cfg)],
+    steps.append(Step("smoke", "probe-eval", "laptop", probe_cmds(cfg),
                       secs("smoke: serve + 20-task probe") * 0.5,
-                      "20 tasks of L1 under --agent bash: measures seconds per trial"))
+                      "20 tasks of L1 under --agent bash, base and probe adapter CONCURRENTLY: "
+                      "measures seconds per trial under 2-way contention"))
     steps.append(Step("smoke", "stop-probe-server", "droplet", [remote_script(
         cfg, "serve.sh", "--stop")], 15.0,
         "STOP the probe vLLM: it holds ~85% of the GPU, the benchmark chose its batch size on an "
@@ -617,19 +677,21 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
     steps.append(Step("serve", "serve", "droplet", [remote_script(
         cfg, "serve.sh", "--all", "--arms", ",".join(cfg.arms), "--wait",
         *(["--merged"] if cfg.serve_mode == "merged" else []))],
-        SERVE_START_S,
+        secs(ROW_SERVE),
         "ONE vLLM server: base + every adapter as named LoRA modules" if cfg.serve_mode == "lora"
         else "merge each adapter, one vLLM server per model (fallback mode)"))
     steps.append(Step("tunnel", "tunnel", "laptop", [tunnel_up(cfg)], 0.0,
                       "re-opened if the probe tunnel was closed", billed=False))
-    ev_total = secs("serve + evaluate (4 models)") - SERVE_START_S
     phases = eval_phases(cfg)
-    weight = {rung: (cfg.samples if rung == "L1" else cfg.late_samples) for rung in cfg.rungs}
-    weight["control"] = PROGRAM_COST_FACTOR
-    wsum = sum(weight[p] for p, _ in phases) or 1.0
+    hints = max(len(hint_rungs(cfg)), 1)
+    phase_seconds = {"L1": secs(ROW_L1), "control": secs(ROW_CONTROL)}
+    for rung in hint_rungs(cfg):
+        phase_seconds[rung] = secs(ROW_HINTS) / hints
     for phase, cmds in phases:
-        steps.append(Step("eval", f"eval-{phase}", "laptop", cmds, ev_total * weight[phase] / wsum,
-                          f"{len(cmds)} sweep{'s' if len(cmds) != 1 else ''} concurrently against the one server"))
+        note = f"{len(cmds)} sweep{'s' if len(cmds) != 1 else ''} concurrently against the one server"
+        if phase == "L1":
+            note += "; `eval --stage L1` stops after this one so the hint rungs can be bought or not"
+        steps.append(Step("eval", f"eval-{phase}", "laptop", cmds, phase_seconds[phase], note))
     steps.append(Step("sync", "sync-droplet", "droplet", [remote_script(
         cfg, "sync_back.sh", "--push-hub", "--arms", ",".join(cfg.arms))], secs("sync back + verify") * 0.6,
         "adapters, checkpoints and logs to the private Hub repos", reserve=False))

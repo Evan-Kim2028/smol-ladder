@@ -1033,6 +1033,9 @@ def test_seconds_per_trial_comes_from_the_harness_progress_lines():
 
 # ═══ go / no-go ═════════════════════════════════════════════════════════════════════
 
+DROPLET = 7
+
+
 def events_for(tmp_path, **meas) -> tuple[P.Config, list[dict]]:
     c = cfg(ledger=str(tmp_path / "l.jsonl"), stage_dir=str(tmp_path / "stage"))
     (tmp_path / "stage").mkdir()
@@ -1042,7 +1045,10 @@ def events_for(tmp_path, **meas) -> tuple[P.Config, list[dict]]:
     fields = {"tokens_per_s": 9000.0, "batch_size": 8, "grad_accum": 1, "sec_per_trial": 6.0,
               "probe_start_s": 240.0, "tool_calls_ok": True, "checks_ok": True, "resume_ok": True}
     fields.update(meas)
-    L.append(c.ledger, L.MEASURED, now=T0, **fields)
+    # a live droplet, and measurements stamped with ITS id and hardware (the only ones that count)
+    L.append(c.ledger, L.CREATED, now=T0 - 60, price_per_hour=2.46, droplet_id=DROPLET)
+    L.append(c.ledger, L.READY, now=T0 - 30, droplet_id=DROPLET, ip="198.51.100.7")
+    L.append(c.ledger, L.MEASURED, now=T0, droplet_id=DROPLET, hardware=driver.hardware_of(c), **fields)
     return c, L.read(Path(c.ledger))
 
 
@@ -1084,7 +1090,7 @@ def test_a_projection_past_the_session_budget_stops_for_the_reviewer(tmp_path):
 
 def test_money_already_spent_counts_toward_the_projection(tmp_path):
     c, ev = events_for(tmp_path)
-    L.append(c.ledger, L.CREATED, now=T0, price_per_hour=2.46)
+    L.append(c.ledger, L.CREATED, now=T0, price_per_hour=2.46, droplet_id=DROPLET)
     ev = L.read(Path(c.ledger))
     ok_early, _, _ = driver.go_no_go(c, ev, T0 + 600)
     ok_late, reasons, _ = driver.go_no_go(c, ev, T0 + 12 * HOUR)
@@ -1305,7 +1311,7 @@ def make_runs(root: Path, tags, n=2):
 
 
 def test_verify_sync_passes_when_adapters_checksums_and_runs_are_all_present(tmp_path, capsys):
-    c = cfg(local_logs=str(tmp_path / "logs"))
+    c = cfg(local_logs=str(tmp_path / "logs"), limit=2, samples=1)
     (tmp_path / "logs" / "adapters" / "A").mkdir(parents=True)
     f = tmp_path / "logs" / "adapters" / "A" / "adapter_model.safetensors"
     f.write_bytes(b"abc")
@@ -2689,3 +2695,255 @@ def test_the_final_marker_is_uploaded_last_by_run_sft():
     text = (OPS / "run_sft.sh").read_text()
     order = [text.index(s) for s in ('path_in_repo=ADAPTER', 'path_in_repo="adapter_config.json"', "path_in_repo=HUB_DONE")]
     assert order == sorted(order)
+
+
+# ═══ verify-sync wants 90% of the trials, not one file ══════════════════════════════
+
+def verified(tmp_path, n_files, limit=10, samples=1, ran=None, hub_ok=True):
+    c = cfg(local_logs=str(tmp_path / "logs"), limit=limit, samples=samples)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "logs" / "SHA256SUMS.artifacts").write_text("")
+    runs = tmp_path / "runs"
+    for tag in P.expected_trials(c):
+        make_runs(runs, [tag], n=n_files)
+    hub = (lambda r: ["adapter_config.json", "adapter_model.safetensors"]) if hub_ok else (lambda r: [])
+    return driver.verify_sync(c, hub_files=hub, runs_root=runs, namespace="ns", ran=ran)
+
+
+def test_a_run_tag_with_a_single_result_no_longer_passes(tmp_path):
+    assert verified(tmp_path, 1) is False
+
+
+def test_nine_of_ten_trials_passes_and_eight_of_ten_fails(tmp_path):
+    assert verified(tmp_path, 9) is True
+    (tmp_path / "x").mkdir()
+    assert verified(tmp_path / "x", 8) is False
+
+
+def test_only_the_first_rung_is_counted_because_later_rungs_skip_tasks_without_a_reference(tmp_path):
+    c = cfg(limit=10, samples=1)
+    assert driver.required_trials(c)["amd1-a"] == ("L1", 10, 9)
+    root = tmp_path / "runs"
+    for i in range(10):                       # L1 complete, L2 almost empty: still a pass
+        (root / "amd1-a" / "test" / f"t{i}" / "L1").mkdir(parents=True)
+        (root / "amd1-a" / "test" / f"t{i}" / "L1" / "result.json").write_text("{}")
+    (root / "amd1-a" / "test" / "t0" / "L2").mkdir(parents=True)
+    (root / "amd1-a" / "test" / "t0" / "L2" / "result.json").write_text("{}")
+    assert driver.trial_files(root, "amd1-a", "test", "L1") == 10
+
+
+def test_samples_land_in_s_k_directories_and_are_counted(tmp_path):
+    root = tmp_path / "runs" / "t" / "test"
+    for i in range(3):
+        d = root / "task" / "L1" / f"s{i}"
+        d.mkdir(parents=True)
+        (d / "result.json").write_text("{}")
+    (root / "task" / "L1" / "result.json").write_text("{}")
+    assert driver.trial_files(tmp_path / "runs", "t", "test", "L1") == 4
+
+
+def test_verify_after_an_l1_only_evaluation_does_not_demand_the_control_or_hint_rungs(tmp_path):
+    c = cfg(limit=10, samples=1)
+    assert set(driver.required_trials(c, ran={"eval-L1"})) == {"amd1-base", "amd1-a", "amd1-b", "amd1-ab"}
+    assert set(driver.required_trials(c, ran={"eval-control"})) == {"amd1-base-program"}
+    assert driver.required_trials(c, ran=set()) == {}
+
+
+# ═══ evaluation in stages: L1 first, then decide ════════════════════════════════════
+
+def test_the_eval_stage_L1_keeps_only_the_four_L1_sweeps():
+    steps = driver.select_eval(plan_for(), "L1")
+    ev = [s for s in steps if s.phase == "eval"]
+    assert [s.name for s in ev] == ["eval-L1"] and len(ev[0].cmds) == 4
+    assert all("--rungs" in c.argv and c.argv[c.argv.index("--rungs") + 1] == "L1" for c in ev[0].cmds)
+    assert "sft-A" in names(steps) and "destroy" in names(steps)        # nothing else is touched
+
+
+def test_the_hint_rungs_are_a_separate_stage_and_so_is_the_control():
+    assert [s.name for s in driver.select_eval(plan_for(), "hints") if s.phase == "eval"] == [
+        "eval-L2", "eval-L3", "eval-L4"]
+    assert [s.name for s in driver.select_eval(plan_for(), "control") if s.phase == "eval"] == ["eval-control"]
+    assert [s.name for s in driver.select_eval(plan_for(), "rest") if s.phase == "eval"] == [
+        "eval-L2", "eval-L3", "eval-L4", "eval-control"]
+    assert len([s for s in driver.select_eval(plan_for(), "all") if s.phase == "eval"]) == 5
+
+
+def test_a_stage_that_selects_nothing_is_an_error():
+    with pytest.raises(SystemExit):
+        driver.select_eval(plan_for(cfg(rungs=("L1",))), "hints")
+
+
+def test_eval_accepts_a_stage_flag_and_rejects_an_unknown_one(tmp_path):
+    ok = run_driver(tmp_path, "eval", "--stage", "L1")
+    assert "invalid choice" not in ok.stderr           # it parses; the gate then stops it (no deadman)
+    assert "STOPPING BEFORE 'eval-L1'" in ok.stderr
+    bad = run_driver(tmp_path, "eval", "--stage", "everything")
+    assert bad.returncode == 2 and "invalid choice" in bad.stderr
+
+
+def test_the_L1_step_costs_what_the_table_says_and_the_stages_add_up_to_the_whole():
+    c = cfg()
+    rows = {r.stage: r for r in P.projection(c, tokens(), P.Measured())}
+    steps = {s.name: s for s in plan_for(c)}
+    assert steps["eval-L1"].seconds == pytest.approx(rows[P.ROW_L1].seconds)
+    assert sum(steps[n].seconds for n in ("eval-L2", "eval-L3", "eval-L4")) == pytest.approx(
+        rows[P.ROW_HINTS].seconds)
+    assert steps["eval-control"].seconds == pytest.approx(rows[P.ROW_CONTROL].seconds)
+
+
+def test_the_costed_table_separates_the_l1_only_cost_from_the_incremental_rungs():
+    rows = P.projection(cfg(), tokens(), P.Measured())
+    st = P.staged_dollars(rows, 2.46)
+    by = {r.stage: r.dollars(2.46) for r in rows}
+    assert st["hints"] == pytest.approx(by[P.ROW_HINTS]) and st["control"] == pytest.approx(by[P.ROW_CONTROL])
+    assert st["l1_only"] + st["hints"] + st["control"] == pytest.approx(st["all"])
+    assert st["l1_only"] < st["all"] and by[P.ROW_L1] > 0
+    only_l1 = P.projection(cfg(rungs=("L1",), program_control=False), tokens(), P.Measured())
+    assert P.ROW_HINTS not in {r.stage for r in only_l1}
+    assert P.staged_dollars(only_l1, 2.46)["l1_only"] == pytest.approx(P.total_dollars(only_l1, 2.46))
+
+
+def test_the_printed_plan_shows_the_l1_only_total_and_each_increment(tmp_path):
+    out = run_driver(tmp_path, "plan").stdout
+    assert "stop after L1:" in out and "+ L2-L4:" in out and "+ control:" in out
+    raw = run_driver(tmp_path, "plan", "--json").stdout
+    table = json.loads(raw[raw.index("{"):])
+    assert table["l1_only_dollars"] < table["total_dollars"]
+    assert set(table["incremental_dollars"]) == {"L2-L4", "control"}
+
+
+# ═══ the probe measures contention with two models ══════════════════════════════════
+
+def test_the_probe_drives_two_models_at_once_on_the_probe_server():
+    step = next(s for s in plan_for() if s.name == "probe-eval")
+    models = [c.argv[c.argv.index("--model") + 1] for c in step.cmds]
+    assert models == ["amd-base-2b", "amd-probe-2b"]
+    assert len({c.argv[c.argv.index("--run-tag") + 1] for c in step.cmds}) == 2
+    assert all(c.argv[c.argv.index("--limit") + 1] == "20" for c in step.cmds)   # same trials/model as before
+
+
+def test_in_merged_mode_the_probe_adapter_is_reached_on_its_own_port():
+    step = next(s for s in plan_for(cfg(serve_mode="merged")) if s.name == "probe-eval")
+    urls = [dict(c.env)["SMOL_LADDER_BASE_URL"] for c in step.cmds]
+    assert urls[0].endswith(":8000/v1") and urls[1].endswith(":8001/v1")
+
+
+def test_seconds_per_trial_divides_by_the_models_that_shared_the_probe():
+    out = "\n".join(f"[{i % 20 + 1}/20] t reward=1.0" for i in range(40))
+    assert driver.seconds_per_trial(out, 120.0, models=2) == pytest.approx(6.0)
+    assert driver.seconds_per_trial(out, 120.0, models=1) == pytest.approx(3.0)
+
+
+def test_a_two_model_measurement_gets_a_smaller_extrapolation_factor_and_the_table_says_so():
+    one = P.projection(cfg(), tokens(), measured(probe_models=1))
+    two = P.projection(cfg(), tokens(), measured(probe_models=2))
+    r1 = next(r for r in one if r.stage == P.ROW_L1)
+    r2 = next(r for r in two if r.stage == P.ROW_L1)
+    assert r2.seconds == pytest.approx(r1.seconds * P.CONTENTION_FROM_2WAY / P.CONTENTION)
+    assert "probe measured 2 concurrent models" in r2.basis and "(guess)" in r1.basis
+
+
+def test_the_probe_run_is_captured_streamed_from_two_processes(monkeypatch, capsys):
+    outputs = []
+
+    class P_:
+        def __init__(self, argv, **kw):
+            self.stdout = iter([f"[1/2] t reward=1.0\n", f"[2/2] t reward=0.0\n"])
+            self.returncode = 0
+        def wait(self, timeout=None): return 0
+        def poll(self): return 0
+        def kill(self): pass
+    monkeypatch.setattr(driver.subprocess, "Popen", P_)
+    c = cfg()
+    code, text = driver.run_parallel(P.probe_cmds(c), c.host, capture=True, timeout=5)
+    assert code == 0 and len(driver.TRIAL_LINE.findall(text)) == 4
+    assert "[1/2] t reward=1.0" in capsys.readouterr().out          # it was echoed, not held back
+
+
+# ═══ measurements and a GO are keyed to the droplet and the hardware ════════════════
+
+def keyed_events(tmp_path, droplet_id=7, hw=None, **over):
+    c = cfg(ledger=str(tmp_path / "l.jsonl"))
+    L.append(c.ledger, L.CREATED, now=T0, price_per_hour=2.46, droplet_id=droplet_id)
+    return c
+
+
+def test_measurements_from_another_droplet_do_not_carry_over(tmp_path):
+    c = keyed_events(tmp_path, droplet_id=7)
+    L.append(c.ledger, L.MEASURED, now=T0, tokens_per_s=9000.0, droplet_id=6,
+             hardware=driver.hardware_of(c))
+    m = P.measured_from_ledger(L.read(c.ledger), driver.measure_key(c, L.read(c.ledger)))
+    assert m.tokens_per_s == 0.0
+    L.append(c.ledger, L.MEASURED, now=T0, tokens_per_s=8000.0, droplet_id=7,
+             hardware=driver.hardware_of(c))
+    m = P.measured_from_ledger(L.read(c.ledger), driver.measure_key(c, L.read(c.ledger)))
+    assert m.tokens_per_s == 8000.0
+
+
+def test_measurements_from_other_hardware_do_not_carry_over(tmp_path):
+    c = keyed_events(tmp_path)
+    fallback = cfg(ledger=c.ledger, size=P.SIZE_MI325X, region=P.REGION_MI325X, price=P.PRICE_MI325X)
+    L.append(c.ledger, L.MEASURED, now=T0, tokens_per_s=9000.0, droplet_id=7,
+             hardware=driver.hardware_of(fallback))
+    assert P.measured_from_ledger(L.read(c.ledger), driver.measure_key(c, L.read(c.ledger))).tokens_per_s == 0.0
+
+
+def test_a_stale_go_never_carries_over_to_a_new_droplet(tmp_path):
+    c = keyed_events(tmp_path, droplet_id=7)
+    L.append(c.ledger, L.MEASURED, now=T0, go=True, droplet_id=7, hardware=driver.hardware_of(c))
+    ev = L.read(c.ledger)
+    assert driver.last_go(ev, driver.measure_key(c, ev)) is True
+    L.append(c.ledger, L.DESTROYED, now=T0 + HOUR)
+    L.append(c.ledger, L.CREATED, now=T0 + 2 * HOUR, price_per_hour=2.46, droplet_id=8)
+    ev = L.read(c.ledger)
+    assert driver.last_go(ev, driver.measure_key(c, ev)) is None        # droplet 8 has no GO yet
+    L.append(c.ledger, L.DESTROYED, now=T0 + 3 * HOUR)
+    ev = L.read(c.ledger)
+    assert driver.last_go(ev, driver.measure_key(c, ev)) is None        # nothing live: nothing is valid
+
+
+def test_the_plan_after_a_destroy_shows_unmeasured_again(tmp_path):
+    c = keyed_events(tmp_path)
+    L.append(c.ledger, L.MEASURED, now=T0, tokens_per_s=9000.0, sec_per_trial=5.0, droplet_id=7,
+             hardware=driver.hardware_of(c))
+    c.stage_dir = str(tmp_path / "none")
+    _, rows_live = driver.make_plan(c, L.read(c.ledger))
+    assert not any("UNMEASURED" in r.basis for r in rows_live if r.stage.startswith("sft"))
+    L.append(c.ledger, L.DESTROYED, now=T0 + HOUR)
+    _, rows_after = driver.make_plan(c, L.read(c.ledger))
+    assert any("UNMEASURED" in r.basis for r in rows_after if r.stage.startswith("sft"))
+
+
+def test_every_measured_event_the_driver_writes_is_stamped_with_the_droplet_and_hardware():
+    src = inspect_source(driver.run_steps) + inspect_source(driver.cmd_project)
+    assert src.count("**stamp(") >= 4
+    assert driver.stamp(cfg(), [])["hardware"].startswith("gpu-mi350x1-288gb-spot|ric1|")
+
+
+# ═══ status ═════════════════════════════════════════════════════════════════════════
+
+def status_text(tmp_path, capsys, with_heartbeat, hours=1.0):
+    now = __import__("time").time()
+    c = cfg(ledger=str(tmp_path / "l.jsonl"))
+    L.append(c.ledger, L.SESSION, now=now - hours * HOUR, budget=35.0, total_cap=90.0)
+    L.append(c.ledger, L.CREATED, now=now - hours * HOUR, price_per_hour=2.46, droplet_id=77)
+    L.append(c.ledger, L.READY, now=now - hours * HOUR + 60, droplet_id=77, ip="198.51.100.7")
+    L.append(c.ledger, L.PRIOR, now=now - 2 * hours * HOUR, dollars=10.0)
+    if with_heartbeat:
+        hb(tmp_path, now)
+    driver.print_status(c, L.summarise(L.read(c.ledger), now, 2.46), now)
+    return capsys.readouterr().out
+
+
+def test_status_prints_droplet_uptime_dollars_remaining_caps_and_the_hard_limit(tmp_path, capsys):
+    out = status_text(tmp_path, capsys, with_heartbeat=True)
+    assert "id 77" in out and "198.51.100.7" in out and "uptime 60.0 min" in out
+    assert "session $2.46" in out and "total $12.46" in out
+    assert "$32.54 under the $35.00 session budget" in out and "$77.54 under the $90.00 working total cap" in out
+    assert "HARD limit $95.00" in out and "destroys at $89.50" in out
+    assert "HEARTBEAT FRESH" in out
+
+
+def test_status_says_loudly_when_there_is_no_live_deadman_and_how_to_start_one(tmp_path, capsys):
+    out = status_text(tmp_path, capsys, with_heartbeat=False)
+    assert "NO LIVE DEADMAN" in out and "setsid nohup python ops/amd/deadman.py" in out
