@@ -1956,6 +1956,18 @@ def runbook() -> str:
     return RUNBOOK.read_text()
 
 
+def test_the_runbook_quotes_the_totals_the_driver_computes():
+    text = runbook()
+    m = re.search(r"Costed plan: gate only \$([\d.]+)\. Gate \+ train \+ L1 eval \$([\d.]+)\. "
+                  r"Everything bought \$([\d.]+)\.", text.replace("**", ""))
+    assert m, "the runbook has no parseable costed-plan line"
+    rows = P.projection(P.Config(), tokens_from_data(), P.Measured())
+    st = P.staged_dollars(rows, P.PRICE_MI350X)
+    assert [float(x) for x in m.groups()] == pytest.approx([st["gate_only"], st["core"], st["all"]], abs=0.006)
+    m = re.search(r"\*\*TOTAL, every row\*\* \| \*\*([\d.]+)\*\* \| \*\*([\d.]+)\*\*", text)
+    assert float(m.group(2)) == pytest.approx(P.total_dollars(rows, P.PRICE_MI350X), abs=0.006)
+
+
 def tokens_from_data() -> dict[str, P.SetTokens]:
     """The same token counts the runbook quotes: from tokens.json if staged, else the numbers
     measured with the Qwen3.5 tokenizer and recorded in the runbook itself."""
@@ -3354,12 +3366,37 @@ def test_status_says_loudly_when_there_is_no_live_deadman_and_how_to_start_one(t
 
 # ═══ the runbook matches the fixes ══════════════════════════════════════════════════
 
+def test_the_runbook_quotes_each_stopping_point_and_optional_stage_the_driver_computes():
+    text = runbook().replace("**", "")
+    rows = P.projection(P.Config(), tokens_from_data(), P.Measured())
+    st = P.staged_dollars(rows, P.PRICE_MI350X)
+    m = re.search(r"Gate only: \$([\d.]+)\. Gate \+ train \+ L1 eval: \$([\d.]+)\. The second L1 sample adds\s+"
+                  r"\$([\d.]+)\. L2-L4 add \$([\d.]+)\.\s+The control adds \$([\d.]+)\.", text)
+    assert m, "the runbook has no parseable per-stage line"
+    assert [float(x) for x in m.groups()] == pytest.approx(
+        [st["gate_only"], st["core"], st["sample2"], st["hints"], st["control"]], abs=0.006)
+
+
+def test_the_runbook_table_rows_are_the_rows_the_driver_prints():
+    text = runbook()
+    for stage in (P.ROW_GATE_SERVE, P.ROW_GATE_EVAL, P.ROW_SERVE, P.ROW_L1, P.ROW_SAMPLE2, P.ROW_HINTS,
+                  P.ROW_CONTROL):
+        assert f"| {stage} |" in text, stage
+    rows = {r.stage: r for r in P.projection(P.Config(), tokens_from_data(), P.Measured())}
+    for stage, row in rows.items():
+        m = re.search(r"\| %s \| ([\d.]+) \| ([\d.]+) \|" % re.escape(stage), text)
+        assert m, stage
+        assert float(m.group(2)) == pytest.approx(row.dollars(P.PRICE_MI350X), abs=0.006), stage
+        assert float(m.group(1)) == pytest.approx(row.seconds / 3600.0, abs=0.006), stage
+    assert "serve + evaluate (4 models)" not in text
+
+
 def test_the_runbook_states_the_hard_limit_the_detached_start_and_the_rearm_rule():
     text = runbook()
     assert "$95 HARD limit" in text and "HEARTBEAT FRESH" in text
     assert "setsid nohup python ops/amd/deadman.py" in text and "< /dev/null &" in text
     assert "**Re-arm it before any further create.**" in text or "RE-ARM before any further create" in text
-    assert "--stage L1" in text and "--stage rest" in text and "stop-probe-server" in text
+    assert "--stage L1" in text and "--stage rest" in text and "stop-gate-server" in text
     assert "final.done" in text and "at least 90%" in text
 
 
@@ -4269,3 +4306,69 @@ def test_the_recounted_tokens_the_plan_falls_back_to_match_the_session_prep_numb
 def test_the_stage_requires_the_new_scripts_in_the_pinned_commit():
     for f in ("ops/amd/sft_run.py", "ops/amd/merge_adapter.py", "ops/amd/probe_tools.py"):
         assert f in stage.REQUIRED_IN_COMMIT
+
+
+# ═══ the runbook states the gate, the stall policy and the lessons, with the code's numbers ══════
+
+def test_the_runbook_states_session_1s_measurements_as_measured_on_that_hardware():
+    text = runbook()
+    for needle in ("5,446", "47 s", "22 trials per minute", "57 minutes", "12 minutes",
+                   "9,085,233", "3,123,047", "12,208,280", "measured in session 1"):
+        assert needle in text, needle
+    assert P.MEASURED_TOKENS_PER_S == 5446.0 and P.MEASURED_TRIALS_PER_MIN == 22.0
+    assert round(5 * 250 / P.MEASURED_TRIALS_PER_MIN) == 57
+    assert (P.RECOUNTED_TOKENS[8192]["A"][1], P.RECOUNTED_TOKENS[8192]["B"][1]) == (9_085_233, 3_123_047)
+
+
+def test_the_runbook_explains_the_gate_its_verdicts_and_what_accept_gate_may_and_may_not_do():
+    text = runbook()
+    for needle in ("2a. The gate", "first 60 tasks", "L1 tags", "GO", "NO-GO", "STOP", "--accept-gate",
+                   "paired comparison", "stop-reason histograms", "answer_submitted", "max_turns",
+                   "context_exhausted", "cannot override", "stop-gate-server", "refuse without it"):
+        assert needle in text, needle
+    assert P.GATE_TASKS == 60 and P.Config().gate_margin == 0.05 and P.Config().gate_max_failures == 3
+    assert "0.05" in text and "3 of 60" in text
+
+
+def test_the_runbook_states_the_stall_policy_with_the_numbers_the_code_uses():
+    text = runbook()
+    assert "5 minutes" in text and "50%" in text and "last **10**" in text and "twice in a row" in text
+    assert (SUP.DEFAULT_STALL_MIN, SUP.DEFAULT_ERROR_SHARE, SUP.DEFAULT_WINDOW, SUP.HEALTH_FAILS) == (5.0, 0.5, 10, 2)
+    for needle in ("--retry-failed", "restarted once", "exits non-zero (75)", "by the process group",
+                   "never by\npattern-matching", "progress-<step>.log", "trials per\nminute"):
+        assert needle in text, needle
+    assert SUP.EXIT_STALLED == 75
+    assert "--workers" in text and "--i-know" in text and "default **8**" in text and "above 10" in text
+
+
+def test_the_runbook_says_to_restart_the_deadman_after_a_relogin_and_names_the_agent_fallback():
+    text = runbook()
+    assert "re-login" in text and "stale\nheartbeat" in text and "NO LIVE DEADMAN" in text
+    assert "/run/user/<uid>/keyring/ssh" in text and "SSH_AUTH_SOCK" in text
+    assert "Restart the dead-man" in text or "restart the dead-man" in text.lower()
+
+
+def test_the_runbook_lists_the_lessons_from_session_1_each_with_its_guard():
+    text = runbook()
+    block = text[text.index("## 11. Lessons from session 1"):text.index("## Sources")]
+    items = re.findall(r"(?m)^\d+\. \*\*", block)
+    assert len(items) == 9
+    for needle in ("two hours", "byte-identical", "released upstream adapter", "Engine core initialization failed",
+                   "device wedged", "Please wait while we get your droplet ready", "unexpected filename",
+                   "dead-man process", "LoRA mode does not work", "0.15-0.2", "180-200", "amd2"):
+        assert needle in block, needle
+
+
+def test_the_runbook_says_why_the_fast_kernels_are_not_installed_and_how_to_try_them():
+    text = runbook()
+    assert "causal_conv1d" in text and "flash-linear-attention" in text and "Not installed, deliberately" in text
+    assert "constraints.txt flash-linear-attention" in text
+
+
+def test_the_runbook_defaults_match_the_code():
+    text = runbook()
+    c = P.Config()
+    assert (c.ckpt_steps, c.train_attempts, c.workers, c.samples, c.limit) == (50, 3, 8, 1, 250)
+    assert "`--ckpt-steps` (default 50)" in text and "`--train-attempts` (default 3)" in text
+    assert "0.17 of the GPU" in text and "ports 8000-8004" in text or "8000-8004" in text
+    assert "eval --stage sample2" in text and "--eval-only" in text
