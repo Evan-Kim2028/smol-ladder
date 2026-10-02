@@ -964,12 +964,36 @@ def wait_for_ssh(cfg: P.Config, runner=None, sleep=time.sleep, clock=time.monoto
         sleep(interval)
 
 
-def check_stage_for_upload(cfg: P.Config) -> None:
+def head_commit(repo: Path = REPO_ROOT) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def check_stage_for_upload(cfg: P.Config, head: str | None = None, data_dir: Path | None = None) -> None:
+    """Refuse to upload a stage dir that is not the one for THIS commit and these token counts.
+
+    A stage dir from an earlier session still has a remote.env in it and would otherwise be
+    uploaded as if current: the droplet would then run older code than the reviewer approved, with
+    token counts (hence a projection and a budget) from other data. So `repo.txt` must equal HEAD
+    and `tokens.json` must be for this --max-length and these data files; otherwise: re-run stage.py."""
     stage = Path(cfg.stage_dir)
+    again = "Re-run `ops/amd/stage.py` (free) and upload again."
     if not (stage / "remote.env").exists():
         raise SystemExit(f"{stage}/remote.env is missing. It is deleted after every successful "
-                         "bootstrap on purpose (it holds the HF token). Re-run `ops/amd/stage.py` "
-                         "(free) and upload again.")
+                         f"bootstrap on purpose (it holds the HF token). {again}")
+    head = head or head_commit()
+    repo_txt = stage / "repo.txt"
+    staged = repo_txt.read_text().strip() if repo_txt.exists() else ""
+    if staged != head:
+        raise SystemExit(f"{stage}/repo.txt is {staged[:10] or 'missing'} but HEAD is {head[:10]}: the "
+                         f"stage dir holds other code than the commit you are running. {again}")
+    tokens = P.load_tokens(stage / "tokens.json", cfg.max_length)
+    if tokens is None:
+        raise SystemExit(f"{stage}/tokens.json is missing or was counted at another --max-length "
+                         f"(this run: {cfg.max_length}). {again}")
+    stale = P.stale_tokens(tokens, data_dir or REPO_ROOT / "data")
+    if stale:
+        raise SystemExit(f"{stage}/tokens.json is stale: {stale}. {again}")
 
 
 def do_create(cfg: P.Config, api, new_session: bool = False) -> int:

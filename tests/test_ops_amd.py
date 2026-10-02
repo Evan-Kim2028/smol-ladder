@@ -4602,3 +4602,46 @@ def test_setup_installs_exact_versions_and_the_smoke_asserts_them():
     smoke = (OPS / "smoke.sh").read_text()
     assert "EXACTLY the verified versions" in smoke and "assert have == want" in smoke
     assert "datasets>=4.0" not in setup
+
+
+# ═══ M6: the stage dir must be the one for HEAD and for the current token counts ═══
+
+def good_stage(tmp_path, head="a" * 40, rows=(3, 2)):
+    stage_dir, data = tmp_path / "stage", tmp_path / "data"
+    (data / "train" / "sft_upstream").mkdir(parents=True)
+    (data / "train" / "sft_upstream" / "train.jsonl").write_text('{"a": 1}\n' * rows[0])
+    (data / "train" / "ja3_sft_v2.jsonl").write_text('{"b": 1}\n' * rows[1])
+    stage_dir.mkdir()
+    (stage_dir / "remote.env").write_text("HF_TOKEN=x\n")
+    (stage_dir / "repo.txt").write_text(head + "\n")
+    (stage_dir / "tokens.json").write_text(json.dumps({"max_length": 8192, "sets": {
+        "A": {"rows": rows[0], "trained_tokens": 30}, "B": {"rows": rows[1], "trained_tokens": 20},
+        "AB": {"rows": sum(rows), "trained_tokens": 50}}}))
+    return cfg(stage_dir=str(stage_dir), max_length=8192), data
+
+
+def test_a_stage_dir_for_this_commit_and_these_tokens_is_accepted(tmp_path):
+    c, data = good_stage(tmp_path)
+    driver.check_stage_for_upload(c, head="a" * 40, data_dir=data)
+
+
+def test_a_stage_dir_for_another_commit_is_refused(tmp_path):
+    c, data = good_stage(tmp_path, head="b" * 40)
+    with pytest.raises(SystemExit, match="repo.txt.*stage.py"):
+        driver.check_stage_for_upload(c, head="a" * 40, data_dir=data)
+    (Path(c.stage_dir) / "repo.txt").unlink()
+    with pytest.raises(SystemExit, match="missing"):
+        driver.check_stage_for_upload(c, head="a" * 40, data_dir=data)
+
+
+def test_stale_or_missing_token_counts_are_refused(tmp_path):
+    c, data = good_stage(tmp_path)
+    (data / "train" / "ja3_sft_v2.jsonl").write_text('{"b": 1}\n' * 9)     # data changed after staging
+    with pytest.raises(SystemExit, match="stale.*stage.py"):
+        driver.check_stage_for_upload(c, head="a" * 40, data_dir=data)
+    (Path(c.stage_dir) / "tokens.json").unlink()
+    with pytest.raises(SystemExit, match="tokens.json.*stage.py"):
+        driver.check_stage_for_upload(c, head="a" * 40, data_dir=data)
+    c2, data2 = good_stage(tmp_path / "x")
+    with pytest.raises(SystemExit, match="max-length"):
+        driver.check_stage_for_upload(cfg(stage_dir=c2.stage_dir, max_length=4096), head="a" * 40, data_dir=data2)
