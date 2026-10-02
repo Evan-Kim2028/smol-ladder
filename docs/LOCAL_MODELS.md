@@ -171,8 +171,8 @@ must not be quoted as pass rates.**
   (symlinks resolved, the `.complete` marker hidden), a per-trial `/workdir` and `$HOME=/home/user`
   are writable, cwd is `/workdir` (the rows never show the cwd; this is a choice), the account is
   `user`, the root is a tmpfs holding only `/usr` and `/etc`, and the commands run under the
-  `tools`-mode venv's Python mounted at `/usr/local` so tracebacks read
-  `/usr/local/lib/python3.14/site-packages/...`. The API key is not in the commands' environment.
+  **recording environment** (below), mounted at `/usr/local` so tracebacks read
+  `/usr/local/lib/python3.12/site-packages/...`. The API key is not in the commands' environment.
   Nothing rewrites the model's commands. Grading is unchanged: `answer.txt` is read from the
   per-trial `/workdir` after the jail exits and graded offline.
 - **Request.** `temperature` 0, `tool_choice` auto, the one `bash` tool (byte-equal to the rows'),
@@ -199,17 +199,39 @@ the outcome with the recording. On 60 SmolDataEnvs train tasks (10 of them the r
 **56 / 60 with `submit`**; the four `submit` failures are the policy ending an episode the recording continued
 (one rewrote its answer after the first write, three speak once before submitting). A first run
 that scored 6 / 10 found two harness faults, both fixed: the dataset grader's math-verify tier was
-silently off in worker threads (`smol_ladder/grade.py`), and the answer receipt above. What still
-differs in the tool results of 11 of the 60 trials, none of which changed an answer: `ls -la` of
-the input directory (the rows show root-owned files, ours the host's mode, ACL marker and date: 5),
-pandas' string-array repr (`ArrowStringArray` here, `StringArray` there, because our environment
-has pyarrow: 2), float digits past the 15th (3), and Python 3.14's traceback carets against the
-rows' 3.12 (1). **Not verified until a real model is served:** how a trained model behaves at the
+silently off in worker threads (`smol_ladder/grade.py`), and the answer receipt above. Under the recording environment
+(2026-10-02, after the fix below) the same 60 score **60 / 60**, and the tool results differ in 8
+trials, none of which changed an answer: `ls -la` of the input directory (the rows show root-owned
+files, ours the host's mode, ACL marker and date: 5) and float digits past the 15th (3, BLAS on a
+different CPU). Before it, 11 of 60 differed; the three that are gone were pandas' string-array repr
+(`ArrowStringArray` here, `StringArray` there, because the repo venv has pyarrow: 2) and Python 3.14's
+traceback carets against the rows' 3.12 (1). Two of the 60 had scored 58 for a different reason: their
+recordings are in `val.jsonl`, so the oracle server must be given both files. **Not verified until a real model is served:** how a trained model behaves at the
 points where the harness chooses (cwd, the end-of-episode policy), and any effect of the sandbox's
 single-threaded BLAS on the 180 s deadline.
 
-**Packages:** the sandbox has pandas, numpy, scipy, scikit-learn, statsmodels, matplotlib, seaborn
-and tabulate. Training commands import 29 other packages in 75 rows (1.6%), most of which the
+**The recording environment (`SMOL_LADDER_BASH_ENV`, built by `tools/build_eval_env.sh`).** What the
+rows were recorded under is in the rows. Row 1852 is a `pip list` taken there: **Python 3.12**
+(277 rows print `/usr/local/lib/python3.12/...` in a traceback or warning, none another version),
+pandas **3.0.3**, numpy **2.4.6**, scikit-learn **1.9.0**, scipy 1.17.1, matplotlib 3.11.0,
+seaborn 0.13.2, statsmodels 0.14.6, tabulate 0.10.0, pip 25.0.1, and *no* pyarrow, openpyxl, plotly or
+xgboost. Everything else agrees: 1,661 rows print column dtypes as `str` (pandas 3) against 13 that
+print `object` for a column; 44 outputs carry a `Pandas4Warning` and 40 pandas 3's
+`ChainedAssignmentError` text; sklearn warnings say "`probability` was deprecated in 1.9" (3 rows) and
+"`penalty` ... 1.8" (4); 30 outputs are `No module named 'xgboost'` (others: nltk, imblearn, h5py,
+openpyxl, networkx). Only one row hints at an older sklearn (a 1.8-era quantile warning), so the
+environment is pinned to the 1.9.0 of the pip list. The reviewer's reading that 49% of the rows show
+pandas-2 `object` dtypes came from counting the trailing `dtype: object` of a printed `df.dtypes`,
+which is the dtypes Series' own dtype; it does not distinguish the versions, and the data say pandas 3.
+What the repo venv got wrong was Python 3.14, numpy 2.5, a different sklearn and pyarrow being
+installed. `tools/eval_env_requirements.txt` is the pip list; `pip list` inside the sandbox reproduces
+row 1852 line for line. Evidence not in the rows: the exact 3.12 patch version (uv's 3.12.12 is used)
+and any package the model never printed. Each `result.json` records the interpreter and the key
+package versions (`bash_sandbox`); without the environment the sandbox falls back to the repo venv with
+a warning on stderr and `bash_sandbox.fallback: true`.
+
+**Packages (repo venv, for `tools`/`program` modes):** pandas, numpy, scipy, scikit-learn,
+statsmodels, matplotlib, seaborn and tabulate. Training commands import 29 other packages in 75 rows (1.6%), most of which the
 training container lacked too (`xgboost` 23 rows, `imblearn` 11, `nltk` 6, ...); the prompt also
 lists `plotly`, which the sandbox lacks (no training command imports it). `pip install` does not work
 in the sandbox (the rows show it failing in 97 of 106 attempts).

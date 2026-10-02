@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+from smol_ladder import bash_env
 from smol_ladder.grade import grade
 from smol_ladder.ladder import hint_source, ladder_fingerprint, prompt_for, read_source
 from smol_ladder.tasks import DATA, input_dir, load_split
@@ -237,10 +238,11 @@ def jail_bash(inputs: Path, workdir: Path, home: Path,
       it after the jail exits, the same offline grading as before), cwd /workdir;
     - the root is a tmpfs holding only /usr, /etc and the loader links, so no host path exists to
       be leaked by a traceback or a listing, and /etc/passwd names the account `user`;
-    - the interpreter is the one `tools` mode uses (this process's venv), but mounted where a
-      container would have it: its base prefix at /usr/local and its site-packages inside that,
-      so `python3` is /usr/local/bin/python3 and a traceback says
-      /usr/local/lib/python3.14/site-packages/pandas/... instead of a home directory.
+    - the interpreter is the recording environment (`bash_env`: Python 3.12 with the rows' pandas,
+      numpy and scikit-learn) when it is built, else this process's venv with a recorded warning;
+      either way it is mounted where a container would have it: its base prefix at /usr/local and
+      its site-packages inside that, so `python3` is /usr/local/bin/python3 and a traceback says
+      /usr/local/lib/python3.12/site-packages/pandas/... instead of a home directory.
 
     The network is open (the loop talks to the model through it), exactly as in `jail()`.
     """
@@ -264,14 +266,11 @@ def jail_bash(inputs: Path, workdir: Path, home: Path,
     # PYTHONUNBUFFERED: the rows show a traceback AFTER the output printed before it. A pipe makes
     # Python buffer stdout until exit, which puts the traceback first; unbuffered keeps the order.
     env: dict = {"HOME": U_HOME, "TMPDIR": "/tmp", "PYTHONUNBUFFERED": "1"}
-    base = Path(sys.base_prefix).resolve()
+    sandbox = bash_env.cached()
+    base = sandbox.base
     if not str(base).startswith("/usr"):
-        ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        sites = list(dict.fromkeys(Path(p).resolve() for p in sys.path
-                                   if p.endswith("site-packages") and Path(p).is_dir()))
-        # The one that holds the data stack is the one that appears as .../site-packages in
-        # tracebacks (under `uv run --with X` there are two: X's overlay and the project's).
-        sites.sort(key=lambda site: not (site / "pandas").is_dir())
+        ver = f"python{sandbox.version}"
+        sites = list(sandbox.sites)
         args += ["--ro-bind", str(base), "/usr/local"]
         extra = []
         for i, site in enumerate(sites):
@@ -560,6 +559,9 @@ def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: 
         result["hint_source"] = provenance["hint_source"]
     if agent == "bash":
         result["bash_stop"] = bash_stop
+        # Which interpreter ran the model's commands, and whether it was the recording environment
+        # (see smol_ladder/bash_env.py): a result without this cannot be compared with the rows.
+        result["bash_sandbox"] = bash_env.cached().record
         if (work / "answer.txt").exists():
             raw = (work / "answer.txt").read_text().strip()
             if looks_like_a_command(raw):
