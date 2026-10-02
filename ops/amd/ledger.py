@@ -230,3 +230,71 @@ def summarise(events: list[dict], now: float, default_rate: float = 0.0) -> dict
         out["uptime_seconds"] = 0.0
         out["state"] = "no open interval in the ledger: nothing should be billing"
     return out
+
+
+# ── the dead-man switch's heartbeat ───────────────────────────────────────────────
+#
+# A watcher that died (a missing token, a crashed API call, a closed terminal) looks exactly like a
+# watcher with nothing to do. So the watcher writes a timestamp every poll to a small file next to
+# the ledger, and the driver refuses to create a droplet, or start any billed step, unless that
+# timestamp is fresh: an unarmed session cannot start billing.
+
+HEARTBEAT_POLLS = 3          # fresh = written within this many poll intervals
+DEFAULT_POLL_SECONDS = 30.0
+
+
+def heartbeat_path(ledger_path) -> Path:
+    return Path(str(ledger_path) + ".heartbeat")
+
+
+def heartbeat_write(ledger_path, now: float, *, last_ok: float | None, poll_seconds: float,
+                    tag: str, deadline: float, budget: float, total_cap: float,
+                    state: str = "ok", pid: int = 0) -> None:
+    """Atomic replace, so a reader never sees half a file. `last_ok` is the last tick that
+    actually listed the droplets: a watcher that is alive but blind (every call failing) is
+    reported as such, because it is not protecting anything."""
+    path = heartbeat_path(ledger_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"ts": now, "last_ok": last_ok, "poll_seconds": poll_seconds,
+                               "tag": tag, "deadline": deadline, "budget": budget,
+                               "total_cap": total_cap, "state": state, "pid": pid}, sort_keys=True))
+    tmp.replace(path)
+
+
+def heartbeat_read(ledger_path) -> dict | None:
+    try:
+        data = json.loads(heartbeat_path(ledger_path).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("ts"), (int, float)) else None
+
+
+def heartbeat_status(ledger_path, now: float, tag: str | None = None,
+                     budget: float | None = None, total_cap: float | None = None) -> tuple[bool, str]:
+    """(fresh, why). Fresh means: written within HEARTBEAT_POLLS poll intervals, listed the droplets
+    successfully within that window, watches the same tag, was armed with caps no looser than
+    this session's, and its deadline has not passed."""
+    hb = heartbeat_read(ledger_path)
+    if hb is None:
+        return False, f"no heartbeat file at {heartbeat_path(ledger_path)}: the deadman is not running"
+    window = HEARTBEAT_POLLS * float(hb.get("poll_seconds") or DEFAULT_POLL_SECONDS)
+    age = now - float(hb["ts"])
+    if age > window:
+        return False, f"last heartbeat {age:.0f}s ago (limit {window:.0f}s): the deadman stopped"
+    if age < -window:
+        return False, f"heartbeat is {-age:.0f}s in the future: clock skew or a stale file"
+    ok = hb.get("last_ok")
+    if not isinstance(ok, (int, float)) or now - float(ok) > window:
+        return False, ("the deadman is running but cannot list droplets (every call failing), so "
+                       "it is not protecting anything")
+    if tag is not None and hb.get("tag") != tag:
+        return False, f"the deadman watches tag {hb.get('tag')!r}, not {tag!r}"
+    eps = 1e-9
+    if budget is not None and float(hb.get("budget") or 0) > budget + eps:
+        return False, f"the deadman was armed with a looser session cap (${hb.get('budget')}) than ${budget:g}"
+    if total_cap is not None and float(hb.get("total_cap") or 0) > total_cap + eps:
+        return False, f"the deadman was armed with a looser total cap (${hb.get('total_cap')}) than ${total_cap:g}"
+    if float(hb.get("deadline") or 0) <= now:
+        return False, "the deadman's wall-clock deadline has passed"
+    return True, f"fresh: {age:.0f}s old, state {hb.get('state')}"

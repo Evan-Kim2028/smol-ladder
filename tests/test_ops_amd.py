@@ -1806,3 +1806,215 @@ def test_a_200_without_a_droplets_list_is_a_failed_listing():
         def get(self, path): return 200, {"meta": {}}
     with pytest.raises(SystemExit):
         cloud.tagged(Api(), "smol-ladder")
+
+
+# ═══ the deadman loop, its heartbeat, and the driver's gate on it ═══════════════════
+
+class Clock:
+    def __init__(self, t=T0):
+        self.t = t
+    def __call__(self):
+        return self.t
+    def sleep(self, s):
+        self.t += s
+
+
+class _Stop(BaseException):
+    """Raised by a test's sleep to end a loop that, by design, would never return."""
+
+
+class LoopApi:
+    """Scripted tag listings: `script` is consumed one GET at a time; an Exception is raised, a
+    (status, body) tuple returned, and a list becomes the droplets. Past the end: the last item."""
+
+    def __init__(self, script, delete_clears_after=None):
+        self.script, self.calls, self.deletes = list(script), [], 0
+        self.delete_clears_after = delete_clears_after
+        self.last = None
+
+    def get(self, path):
+        self.calls.append(path)
+        if path.startswith("/droplets/"):
+            return (404, {}) if self.deletes and (self.delete_clears_after is not None
+                                                  and self.deletes >= self.delete_clears_after) \
+                else (200, {"droplet": {"id": 1}})
+        if path.startswith("/droplets?per_page"):
+            return 200, {"droplets": []}
+        item = self.script.pop(0) if self.script else self.last
+        self.last = item
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, tuple):
+            return item
+        if self.delete_clears_after is not None and self.deletes >= self.delete_clears_after:
+            return 200, {"droplets": []}
+        return 200, {"droplets": item}
+
+    def delete(self, path):
+        self.deletes += 1
+        return 204, {}
+
+
+def watch_args(tmp_path, clock, **over):
+    kw = dict(tag="smol-ladder", ledger_path=tmp_path / "l.jsonl", deadline=T0 + HOUR,
+              session_cap=35.0, total_cap=90.0, price=2.46, poll=30.0, sleep=clock.sleep,
+              clock=clock, out=lambda s: None)
+    kw.update(over)
+    return kw
+
+
+def test_the_deadman_loop_survives_api_exceptions_and_keeps_ticking(tmp_path):
+    clock, lines = Clock(), []
+    api = LoopApi([TimeoutError("read timed out"), __import__("http.client").client.IncompleteRead(b"x"),
+                   ValueError("not json"), (500, {"error": "boom"}), []])
+    # deadline long past: once a listing succeeds and shows nothing, it exits cleanly.
+    code = deadman.watch(api, **watch_args(tmp_path, clock, deadline=T0 - 2 * HOUR, out=lines.append))
+    assert code == 0
+    assert sum("tick failed" in l for l in lines) == 4 and any("exiting" in l for l in lines)
+    assert len([c for c in api.calls if c.startswith("/droplets?tag_name")]) == 5
+
+
+def test_the_backoff_grows_between_failures_and_is_capped(tmp_path):
+    clock, waits = Clock(), []
+    def sleep(s):
+        waits.append(s)
+        if len(waits) == 9:
+            raise _Stop
+        clock.sleep(s)
+    with pytest.raises(_Stop):
+        deadman.watch(LoopApi([OSError("down")]), **watch_args(tmp_path, clock, sleep=sleep))
+    assert waits[0] < waits[1] < waits[2] and max(waits) == deadman.MAX_BACKOFF_SECONDS
+
+
+def test_the_deadman_refuses_to_exit_while_a_destroy_is_unverified(tmp_path):
+    clock, sleeps, lines = Clock(), [0], []
+    def sleep(s):
+        sleeps[0] += 1
+        if sleeps[0] > 60:
+            raise _Stop
+        clock.sleep(s)
+    api = LoopApi([[droplet()]])               # the droplet never goes away
+    led = ledger_with(tmp_path, (L.CREATED, T0, {"price_per_hour": 2.46, "droplet_id": 1}))
+    with pytest.raises(_Stop):                  # it never returned: it was still trying when stopped
+        deadman.watch(api, **watch_args(tmp_path, clock, deadline=T0 + 10, sleep=sleep, out=lines.append))
+    assert api.deletes >= 3 and any("NOT verified" in l and "NOT exiting" in l for l in lines)
+    assert L.open_interval(L.read(led)) is not None
+
+
+def test_the_deadman_exits_zero_only_once_the_destroy_is_verified(tmp_path):
+    clock, lines = Clock(), []
+    api = LoopApi([[droplet()]], delete_clears_after=3)    # gone after the third DELETE
+    ledger_with(tmp_path, (L.CREATED, T0, {"price_per_hour": 2.46, "droplet_id": 1}))
+    code = deadman.watch(api, **watch_args(tmp_path, clock, deadline=T0 + 10, out=lines.append))
+    assert code == 0 and api.deletes == 3 and any("destroy verified" in l for l in lines)
+    assert L.open_interval(L.read(tmp_path / "l.jsonl")) is None
+
+
+def test_once_exits_nonzero_when_the_destroy_could_not_be_verified(tmp_path):
+    clock = Clock()
+    ledger_with(tmp_path, (L.CREATED, T0, {"price_per_hour": 2.46, "droplet_id": 1}))
+    assert deadman.watch(LoopApi([[droplet()]]), **watch_args(tmp_path, clock, deadline=T0 - 10,
+                                                              once=True)) == 1
+
+
+def test_the_destroys_ledger_events_carry_the_real_clock_not_the_decisions(tmp_path):
+    clock = Clock(T0 + 2 * HOUR)
+    api = LoopApi([[droplet()]], delete_clears_after=1)
+    api_delete = api.delete
+    api.delete = lambda path: (clock.sleep(40), api_delete(path))[1]     # the DELETE takes a while
+    led = ledger_with(tmp_path, (L.CREATED, T0, {"price_per_hour": 2.46, "droplet_id": 1}))
+    decided_at = clock()
+    d = deadman.tick(api, "smol-ladder", led, decided_at, T0 + HOUR, 35.0, 90.0, 2.46,
+                     dry_run=False, sleep=clock.sleep, clock=clock)
+    assert d.destroy and d.verified_gone
+    destroyed = [e for e in L.read(led) if e["event"] == L.DESTROYED][-1]
+    assert destroyed["ts"] > decided_at
+
+
+def test_the_heartbeat_is_written_every_tick_and_records_the_last_successful_listing(tmp_path):
+    clock = Clock()
+    seen = []
+    def sleep(s):
+        seen.append(L.heartbeat_read(tmp_path / "l.jsonl"))
+        if len(seen) == 3:
+            raise _Stop
+        clock.sleep(s)
+    api = LoopApi([[], OSError("x"), []])
+    with pytest.raises(_Stop):
+        deadman.watch(api, **watch_args(tmp_path, clock, sleep=sleep, deadline=T0 + 9 * HOUR))
+    assert seen[0]["state"] == "ok" and seen[0]["last_ok"] == T0
+    assert seen[1]["state"] == "error" and seen[1]["last_ok"] == T0     # blind, and says so
+    assert seen[0]["tag"] == "smol-ladder" and seen[0]["total_cap"] == 90.0
+
+
+def hb(tmp_path, now, **over):
+    kw = dict(last_ok=now, poll_seconds=30.0, tag="smol-ladder", deadline=now + HOUR, budget=35.0,
+              total_cap=90.0)
+    kw.update(over)
+    L.heartbeat_write(tmp_path / "l.jsonl", now, **kw)
+    return tmp_path / "l.jsonl"
+
+
+def test_a_heartbeat_is_fresh_within_three_poll_intervals_and_stale_after(tmp_path):
+    led = hb(tmp_path, T0)
+    assert L.heartbeat_status(led, T0 + 89)[0] and not L.heartbeat_status(led, T0 + 91)[0]
+    assert "stopped" in L.heartbeat_status(led, T0 + 500)[1]
+
+
+def test_a_blind_or_mismatched_or_loose_deadman_is_not_a_live_one(tmp_path):
+    assert not L.heartbeat_status(hb(tmp_path, T0, last_ok=T0 - 500), T0)[0]
+    assert not L.heartbeat_status(hb(tmp_path, T0), T0, tag="other")[0]
+    assert not L.heartbeat_status(hb(tmp_path, T0, budget=50.0), T0, budget=35.0)[0]
+    assert not L.heartbeat_status(hb(tmp_path, T0, total_cap=95.0), T0, total_cap=90.0)[0]
+    assert not L.heartbeat_status(hb(tmp_path, T0, deadline=T0 - 1), T0)[0]
+    assert not L.heartbeat_status(tmp_path / "missing.jsonl", T0)[0]
+    (tmp_path / "bad.jsonl.heartbeat").write_text("{not json")
+    assert not L.heartbeat_status(tmp_path / "bad.jsonl", T0)[0]
+
+
+def test_the_gate_refuses_create_and_every_billed_step_without_a_fresh_heartbeat(tmp_path):
+    c = cfg(ledger=str(tmp_path / "l.jsonl"))
+    steps = {s.name: s for s in plan_for(c)}
+    for name in ("create", "bootstrap", "smoke-checks", "sft-A", "serve"):
+        with pytest.raises(SystemExit) as exc:
+            driver.gate(c, steps[name], now=T0)
+        msg = str(exc.value)
+        assert f"STOPPING BEFORE '{name}'" in msg and "setsid nohup python ops/amd/deadman.py" in msg
+        assert "re-arm" in msg
+
+
+def test_a_fresh_heartbeat_lets_the_steps_through(tmp_path):
+    c = cfg(ledger=str(hb(tmp_path, T0)))
+    for name in ("create", "bootstrap", "sft-A"):
+        driver.gate(c, next(s for s in plan_for(c) if s.name == name), now=T0 + 10)
+
+
+def test_sync_and_destroy_are_never_blocked_by_a_dead_deadman(tmp_path, capsys):
+    c = cfg(ledger=str(tmp_path / "l.jsonl"))
+    for name in ("sync-droplet", "sync-pull", "destroy"):
+        driver.gate(c, next(s for s in plan_for(c) if s.name == name), now=T0)
+    assert "runs anyway" in capsys.readouterr().out
+
+
+def test_run_steps_will_not_post_a_create_without_a_deadman(tmp_path):
+    c = cfg(ledger=str(tmp_path / "l.jsonl"), local_logs=str(tmp_path / "logs"))
+    api = FakeApi()
+    with pytest.raises(SystemExit) as exc:
+        driver.run_steps(c, plan_for(c), api, only="create")
+    assert "No live dead-man switch" in str(exc.value) and mutations(api) == []
+
+
+def test_a_deadman_with_no_token_exits_loudly_and_writes_no_heartbeat(tmp_path):
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "AMD_OFFLINE": "1"}
+    out = subprocess.run([sys.executable, str(OPS / "deadman.py"), "--deadline-minutes", "5",
+                          "--ledger", str(tmp_path / "l.jsonl")], capture_output=True, text=True,
+                         env=env, cwd=str(REPO_ROOT))
+    assert out.returncode != 0 and "NOT ARMED" in out.stderr
+    assert not (tmp_path / "l.jsonl.heartbeat").exists()      # so the driver's gate refuses
+
+
+def test_the_deadman_command_in_the_refusal_is_detached_and_priced_for_the_hardware(tmp_path):
+    c = cfg(ledger=str(tmp_path / "l.jsonl"), size=P.SIZE_MI325X, price=P.PRICE_MI325X)
+    cmd = driver.deadman_command(c)
+    assert cmd.startswith("setsid nohup python ops/amd/deadman.py") and "--price 3.8" in cmd
+    assert "< /dev/null &" in cmd and f"--ledger {c.ledger}" in cmd

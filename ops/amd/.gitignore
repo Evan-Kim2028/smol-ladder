@@ -1,0 +1,4 @@
+# Local state of the session: the spend ledger and the dead-man switch's heartbeat. Never committed.
+ledger.jsonl
+ledger.jsonl.heartbeat
+ledger.jsonl.heartbeat.tmp

@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 OPS = Path(__file__).resolve().parent
@@ -213,12 +214,26 @@ def dry_run(cfg: P.Config, events: list[dict]) -> None:
 
 # ── gates and bookkeeping ─────────────────────────────────────────────────────────
 
+def deadman_command(cfg: P.Config) -> str:
+    """The exact command that arms the watcher, detached so closing the terminal cannot kill it."""
+    minutes = cfg.deadline_minutes or 600
+    ledger = "" if Path(cfg.ledger).resolve() == (OPS / "ledger.jsonl").resolve() \
+        else f" --ledger {cfg.ledger}"
+    return (f"setsid nohup python ops/amd/deadman.py --deadline-minutes {minutes:g} "
+            f"--budget {cfg.budget:g} --total-cap {cfg.total_cap:g} --price {cfg.price:g} "
+            f"--tag {cfg.tag}{ledger} >> logs/deadman.log 2>&1 < /dev/null &")
+
+
 def gate(cfg: P.Config, step: P.Step, now: float | None = None) -> None:
-    """Refuse a billed step whose projection would pass either cap.
+    """Refuse a billed step whose projection would pass either cap, or that has no live deadman.
 
     Steps with `reserve=False` (sync, tunnel-down, destroy) are the reserve itself: they print
     their verdict but are NEVER refused. A budget guard that can refuse the destroy is a guard that
     keeps the meter running at the exact moment it matters.
+
+    The deadman check is a gate too: the watcher that destroys a runaway droplet is a separate
+    process, and one that was never started, or died, looks the same as one with nothing to do. So
+    `create` and every other billed step need a heartbeat written within three poll intervals.
     """
     if not step.billed or step.seconds <= 0:
         return
@@ -232,6 +247,20 @@ def gate(cfg: P.Config, step: P.Step, now: float | None = None) -> None:
                          "--limit/--samples/--rungs, drop an arm, or raise --budget on purpose.")
     if not v.allowed:
         print(f"## {step.name} runs anyway: it is what stops the spending")
+    fresh, why = L.heartbeat_status(Path(cfg.ledger), now, tag=cfg.tag, budget=cfg.budget,
+                                    total_cap=cfg.total_cap)
+    print(f"## deadman gate for {step.name}: {why}")
+    if fresh:
+        return
+    if not step.reserve:
+        print(f"## {step.name} runs anyway: it is what stops the spending")
+        return
+    raise SystemExit(
+        f"\nSTOPPING BEFORE '{step.name}'. No live dead-man switch ({why}).\nNothing was started. "
+        "Nothing may bill without the independent watcher that destroys a runaway droplet. Start it "
+        f"in another terminal (detached, so closing the terminal cannot kill it):\n\n    "
+        f"{deadman_command(cfg)}\n\nthen check it with `driver.py status`. After ANY destroy the "
+        "watcher has exited or is stale: re-arm it before the next create.")
 
 
 def last_go(events: list[dict]) -> bool | None:
@@ -336,8 +365,7 @@ def cmd_project(cfg: P.Config, events: list[dict]) -> bool:
         left = P.total_dollars(P.remaining_after(rows, "sft"), cfg.price) / cfg.price * 3600.0
         minutes = int(left * 1.25 / 60.0 + 15)
         print(f"  re-arm the dead-man switch from measurements (stop the old one first):\n"
-              f"  $ python ops/amd/deadman.py --deadline-minutes {minutes} --budget {cfg.budget:g} "
-              f"--total-cap {cfg.total_cap:g} --tag {cfg.tag}")
+              f"  $ {deadman_command(replace(cfg, deadline_minutes=minutes))}")
     return ok
 
 

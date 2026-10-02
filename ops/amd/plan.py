@@ -526,9 +526,11 @@ def build_plan(cfg: Config, tokens: dict[str, SetTokens], meas: Measured) -> lis
         "python", "ops/amd/deadman.py", "--deadline-minutes",
         f"{cfg.deadline_minutes or default_deadline_minutes(cfg, list(rows.values())):g}",
         "--budget", f"{cfg.budget:g}", "--total-cap", f"{cfg.total_cap:g}",
-        "--tag", cfg.tag))], 0.0,
-        "start in a second terminal BEFORE create: destroys the tagged droplet at the deadline, "
-        "at the cap, or if it is found powered off; independent of the droplet", billed=False))
+        "--price", f"{cfg.price:g}", "--tag", cfg.tag))], 0.0,
+        "run DETACHED (setsid nohup ... >> logs/deadman.log 2>&1 < /dev/null &) BEFORE create: "
+        "destroys the tagged droplet at the deadline, at the cap (never above the $95 hard limit) "
+        "or if it is found powered off, and writes a heartbeat the driver requires before it "
+        "creates or bills anything; independent of the droplet", billed=False))
 
     body = create_body(cfg)
     steps.append(Step("create", "create", "api", [Cmd((
