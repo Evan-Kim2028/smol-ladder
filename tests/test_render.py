@@ -163,7 +163,8 @@ def test_the_jinja_renderer_agrees_with_the_tokenizers_own_template(render):
 @pytest.mark.slow
 @pytest.mark.parametrize("name,expected_rows", [("sft_upstream/train.jsonl", 4439),
                                                 ("sft_upstream/val.jsonl", 234),
-                                                ("ja3_sft.jsonl", 2029)])
+                                                ("ja3_sft.jsonl", 2029),
+                                                ("ja3_sft_v2.jsonl", None)])
 def test_every_row_of_both_datasets_renders_its_tool_calls(render, name, expected_rows):
     from train.format import read_jsonl
 
@@ -171,6 +172,9 @@ def test_every_row_of_both_datasets_renders_its_tool_calls(render, name, expecte
     if not path.exists():
         pytest.skip(f"{path} is not on this machine")
     rows = read_jsonl(path)
+    if expected_rows is None:       # arm B v2: the manifest is the record of how many rows it has
+        import json
+        expected_rows = json.loads((DATA / "ja3_sft_v2.manifest.json").read_text())["rows"]
     result = assert_tool_calls_rendered(rows, render, prepare(rows, "bash"), label=name)
     assert result["rows"] == expected_rows
     assert result["calls_rendered"] == result["calls_source"] > expected_rows
