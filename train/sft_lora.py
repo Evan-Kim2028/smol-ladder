@@ -35,7 +35,7 @@ import os
 from pathlib import Path
 
 from train.format import read_jsonl
-from train.render import (NON_THINKING, assert_tool_calls_rendered, normalise_messages,
+from train.render import (NON_THINKING, RenderingError, assert_tool_calls_rendered, normalise_messages,
                           tokenizer_renderer)
 
 # Upstream's defaults (scripts/train_sft.py), as of 2026-09-24.
@@ -110,7 +110,8 @@ def prepare(rows: list[dict], protocol: str) -> list[dict]:
     return out
 
 
-def verify_rendering(source: list[dict], fed: list[dict], tokenizer, label: str) -> dict:
+def verify_rendering(source: list[dict], fed: list[dict], tokenizer, label: str,
+                     protocol: str = "bash") -> dict:
     """Abort unless the text the trainer will see carries the source's tool calls.
 
     Renders what TRL will render (the rows after the Arrow round trip a `datasets.Dataset`
@@ -121,6 +122,12 @@ def verify_rendering(source: list[dict], fed: list[dict], tokenizer, label: str)
     from datasets import Dataset
 
     if source and not any(m.get("tool_calls") for r in source for m in r["messages"]):
+        if protocol == "bash":
+            # The bash protocol IS tool calls. A file with none (a program-protocol export, an
+            # empty or mangled file) used to pass this guard silently and train a model on text
+            # with nothing to call.
+            raise RenderingError(f"{label}: --protocol bash but none of the {len(source)} rows has "
+                                 "a tool call; refusing to train on it")
         return {"rows": len(source), "calls_source": 0}  # a protocol with no tool calls (program)
     arrow = Dataset.from_list(fed)
     result = assert_tool_calls_rendered(source, tokenizer_renderer(tokenizer),
@@ -269,9 +276,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     # Refuse to train on text that lost its tool calls. Cheap (under a minute for 4.7k rows) next
     # to a multi-hour run, and the failure it catches is silent: the loss still falls.
-    verify_rendering(source_train, train_rows, tokenizer, "train")
+    verify_rendering(source_train, train_rows, tokenizer, "train", args.protocol)
     if source_val:
-        verify_rendering(source_val, val_rows, tokenizer, "val")
+        verify_rendering(source_val, val_rows, tokenizer, "val", args.protocol)
 
     trainer = build(args, train_rows, val_rows, tokenizer)
     if args.resume:

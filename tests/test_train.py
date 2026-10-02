@@ -513,3 +513,15 @@ def test_the_shaping_diagnostic_is_weight_zero_by_default():
     # sets --shaping-weight non-zero has to change this function to make the bonus mean anything.
     funcs, _ = grpo.build_reward_funcs(sandbox=lambda row, code: "42\n")
     assert funcs[1]([[{"role": "assistant", "content": "x"}]] * 3) == [0.0, 0.0, 0.0]
+
+# ── the render guard: --protocol bash needs tool calls ──────────────────────────────────────
+
+def test_a_bash_file_with_no_tool_calls_is_an_error_and_a_program_file_is_not():
+    from train.render import RenderingError
+    from train.sft_lora import verify_rendering
+    rows = [{"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]}]
+    with pytest.raises(RenderingError, match="none of the 1 rows has a tool call"):
+        verify_rendering(rows, [], None, "train", "bash")
+    with pytest.raises(RenderingError):
+        verify_rendering(rows, [], None, "train")                      # bash is the default
+    assert verify_rendering(rows, [], None, "train", "program") == {"rows": 1, "calls_source": 0}
