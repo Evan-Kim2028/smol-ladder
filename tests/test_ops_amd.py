@@ -1707,3 +1707,102 @@ def test_the_driver_gate_stops_a_step_at_the_hard_limit(tmp_path):
     with pytest.raises(SystemExit) as exc:
         driver.gate(c, P.Step("train", "sft-A", "droplet", seconds=HOUR), now=T0)
     assert "HARD total limit" in str(exc.value)
+
+
+# ═══ credentials and the API client's error handling ════════════════════════════════
+
+from ops.amd import doapi  # noqa: E402
+
+
+def test_the_repo_specific_token_name_wins_over_the_generic_one(monkeypatch):
+    monkeypatch.setenv("DIGITALOCEAN_ACCESS_TOKEN", "generic")
+    monkeypatch.setenv("AMD_CLOUD_API_TOKEN", "specific")
+    assert doapi.token_from_env() == "specific"
+    monkeypatch.delenv("AMD_CLOUD_API_TOKEN")
+    assert doapi.token_from_env() == "generic"
+
+
+def test_dotenv_wins_over_a_stale_shell_variable_and_drops_the_other_token_name(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("# comment\nexport AMD_CLOUD_API_TOKEN='fresh'\nHF_TOKEN=hf_new\n")
+    monkeypatch.setenv("AMD_CLOUD_API_TOKEN", "stale")
+    monkeypatch.setenv("HF_TOKEN", "hf_old")
+    monkeypatch.setenv("DIGITALOCEAN_ACCESS_TOKEN", "stale-generic")
+    doapi.load_dotenv(env)
+    assert os.environ["AMD_CLOUD_API_TOKEN"] == "fresh" and os.environ["HF_TOKEN"] == "hf_new"
+    assert "DIGITALOCEAN_ACCESS_TOKEN" not in os.environ
+    assert doapi.token_from_env() == "fresh"
+
+
+def test_dotenv_leaves_the_shell_token_alone_when_the_file_names_none(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("AMD_HUB_NAMESPACE=me\n")
+    monkeypatch.setenv("DIGITALOCEAN_ACCESS_TOKEN", "shell")
+    doapi.load_dotenv(tmp_path / ".env")
+    assert doapi.token_from_env() == "shell"
+
+
+def test_child_processes_never_inherit_a_token(monkeypatch):
+    for name in doapi.SECRET_VARS:
+        monkeypatch.setenv(name, "SECRET")
+    env = doapi.child_env({"SMOL_LADDER_BASE_URL": "http://127.0.0.1:8000/v1"})
+    assert not set(doapi.SECRET_VARS) & set(env)
+    assert env["SMOL_LADDER_BASE_URL"].startswith("http://127.0.0.1") and "PATH" in env
+
+
+def test_every_subprocess_the_driver_starts_gets_the_stripped_environment(monkeypatch):
+    for name in doapi.SECRET_VARS:
+        monkeypatch.setenv(name, "SECRET")
+    seen = []
+
+    class Spy:
+        def __init__(self, *a, **kw): seen.append(kw.get("env")); self.returncode = 0; self.stdout = ""
+        def wait(self, *a, **kw): return 0
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(driver.subprocess, "Popen", Spy)
+    monkeypatch.setattr(driver.subprocess, "call", lambda *a, **kw: seen.append(kw.get("env")) or 0)
+    monkeypatch.setattr(driver.subprocess, "run", lambda *a, **kw: seen.append(kw.get("env")) or
+                        type("R", (), {"stdout": "", "returncode": 0})())
+    c = cfg()
+    driver.run_cmd(P.ssh(c, ["true"]), c.host)
+    driver.run_cmd(P.ssh(c, ["true"]), c.host, capture=True)
+    driver.run_parallel([P.ssh(c, ["true"]), P.ssh(c, ["true"])], c.host)
+    driver.ensure_tunnel(c)
+    assert seen and all(e is not None and not set(doapi.SECRET_VARS) & set(e) for e in seen), seen
+
+
+class _Resp:
+    def __init__(self, status=200, raw=b"{}", read_exc=None):
+        self.status, self._raw, self._exc = status, raw, read_exc
+    def read(self):
+        if self._exc:
+            raise self._exc
+        return self._raw
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+@pytest.mark.parametrize("resp", [
+    _Resp(read_exc=TimeoutError("read timed out")),
+    _Resp(read_exc=__import__("http.client").client.IncompleteRead(b"{")),
+    _Resp(raw=b"<html>502 bad gateway</html>"),
+    _Resp(raw=b"[1, 2]"),
+], ids=["read-timeout", "incomplete-read", "non-json-200", "json-but-not-an-object"])
+def test_a_read_or_parse_failure_is_status_zero_not_an_exception_and_not_an_empty_listing(
+        monkeypatch, resp):
+    monkeypatch.setattr(doapi.urllib.request, "urlopen", lambda *a, **kw: resp)
+    status, body = DoApi("t").get("/droplets")
+    assert status == 0 and "error" in body
+    # ... which the listing helper turns into a failure, never into "no droplets"
+    class Api:
+        def get(self, path): return DoApi("t").get(path)
+    with pytest.raises(SystemExit):
+        cloud.tagged(Api(), "smol-ladder")
+
+
+def test_a_200_without_a_droplets_list_is_a_failed_listing():
+    class Api:
+        def get(self, path): return 200, {"meta": {}}
+    with pytest.raises(SystemExit):
+        cloud.tagged(Api(), "smol-ladder")

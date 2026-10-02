@@ -40,7 +40,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from ops.amd import cloud  # noqa: E402
 from ops.amd import ledger as L  # noqa: E402
 from ops.amd import plan as P  # noqa: E402
-from ops.amd.doapi import DoApi, load_dotenv, token_from_env  # noqa: E402
+from ops.amd.doapi import DoApi, child_env, load_dotenv, token_from_env  # noqa: E402
 
 TRIAL_LINE = re.compile(r"^\[\d+/\d+\] .* reward=", re.M)
 
@@ -243,7 +243,7 @@ def last_go(events: list[dict]) -> bool | None:
 
 def run_cmd(cmd: P.Cmd, host: str, capture: bool = False) -> tuple[int, str]:
     argv = [a.replace("<droplet-ip>", host) for a in cmd.argv]
-    env = dict(os.environ, **dict(cmd.env))
+    env = child_env(dict(cmd.env))
     if "<droplet-ip>" in " ".join(cmd.argv) and not host:
         raise SystemExit("no droplet IP: create it first or pass --host")
     print("  $ " + cmd.shell(), flush=True)
@@ -259,7 +259,7 @@ def run_parallel(cmds: list[P.Cmd], host: str) -> int:
     procs = []
     for cmd in cmds:
         print("  $ " + cmd.shell() + " &", flush=True)
-        procs.append(subprocess.Popen(cmd.argv, env=dict(os.environ, **dict(cmd.env))))
+        procs.append(subprocess.Popen(cmd.argv, env=child_env(dict(cmd.env))))
     codes = [p.wait() for p in procs]
     return max(codes) if codes else 0
 
@@ -369,7 +369,7 @@ def run_steps(cfg: P.Config, steps: list[P.Step], api=None, only: str = "",
         elif step.name in ("tunnel", "probe-tunnel"):
             code = ensure_tunnel(cfg)
         elif step.name == "tunnel-down":
-            code = subprocess.call(list(step.cmds[0].argv)) and 0
+            code = subprocess.call(list(step.cmds[0].argv), env=child_env()) and 0
         elif len(step.cmds) > 1:
             code = run_parallel(step.cmds, cfg.host)
         else:
@@ -406,10 +406,10 @@ def do_create(cfg: P.Config, api, new_session: bool = False) -> int:
 
 def ensure_tunnel(cfg: P.Config) -> int:
     if subprocess.call(list(P.tunnel_check(cfg).argv), stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL) == 0:
+                       stderr=subprocess.DEVNULL, env=child_env()) == 0:
         print("  tunnel already up")
         return 0
-    return subprocess.call(list(P.tunnel_up(cfg).argv))
+    return subprocess.call(list(P.tunnel_up(cfg).argv), env=child_env())
 
 
 def sha_check(root: Path, sums_name: str = "SHA256SUMS.artifacts") -> list[str]:
@@ -574,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
     if c == "tunnel":
         if args.action == "down":
-            return subprocess.call(list(P.tunnel_down(cfg).argv))
+            return subprocess.call(list(P.tunnel_down(cfg).argv), env=child_env())
         return ensure_tunnel(cfg)
 
     if c in ("train", "go") and last_go(events) is not True:

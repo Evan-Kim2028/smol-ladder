@@ -19,9 +19,9 @@ Sleep = Callable[[float], None]
 
 def tagged(api, tag: str) -> list[dict]:
     status, body = api.get(f"/droplets?tag_name={tag}&per_page=200")
-    if status != 200:
+    if status != 200 or not isinstance(body.get("droplets"), list):
         raise SystemExit(f"listing droplets tagged {tag!r} failed ({status}): {body}")
-    return body.get("droplets", [])
+    return body["droplets"]
 
 
 def public_ip(droplet: dict) -> str:
