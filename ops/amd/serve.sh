@@ -170,11 +170,14 @@ declare -A PIDS=()
 # Memory per engine. Session 1 started five engines at once with --gpu-memory-utilization 0.17 and the
 # KV caches came out at 3 to 35 GiB, because each engine sized its cache from what the others had
 # taken by then. Engines now start ONE AT A TIME with an explicit, equal KV budget
-# (--kv-cache-memory-bytes, which vLLM 0.17 documents as ignoring gpu_memory_utilization):
+# (--kv-cache-memory-bytes, which sizes the cache but does not skip the startup free-memory check):
 # AMD_KV_CACHE_GIB per engine (default 16); 0 falls back to equal --gpu-memory-utilization shares.
 kv_args() {
   if (( AMD_KV_CACHE_GIB > 0 )); then
     printf '%s\n' "--kv-cache-memory-bytes" "$((AMD_KV_CACHE_GIB * 1024 * 1024 * 1024))"
+    # The KV budget does not skip vLLM's startup check that FREE memory covers the utilization
+    # share: at the default 0.9 the third engine fails with two already loaded (session 2).
+    printf '%s\n' "--gpu-memory-utilization" "${AMD_KV_STARTUP_UTIL:-0.3}"
   else
     printf '%s\n' "--gpu-memory-utilization" "$AMD_SERVER_UTIL"
   fi

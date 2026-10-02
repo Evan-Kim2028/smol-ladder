@@ -916,7 +916,9 @@ def test_serve_sh_sets_the_tool_call_parser_the_non_thinking_template_loopback_a
     assert json.loads(argv[argv.index("--default-chat-template-kwargs") + 1]) == {"enable_thinking": False}
     assert {a for i, a in enumerate(argv) if argv[i - 1] == "--host"} == {"127.0.0.1"}
     assert argv[argv.index("--kv-cache-memory-bytes") + 1] == str(16 * 1024 ** 3)
-    assert "--gpu-memory-utilization" not in argv and "--enable-prefix-caching" in argv
+    # the startup share stays small: vLLM checks FREE memory against it even with a KV budget
+    assert argv[argv.index("--gpu-memory-utilization") + 1] == "0.3"
+    assert "--enable-prefix-caching" in argv
     assert argv[argv.index("--dtype") + 1] == "bfloat16"
     assert {a for i, a in enumerate(argv) if argv[i - 1] == "--tokenizer"} == {serve_env["env"]["AMD_BASE_MODEL"]}
 
