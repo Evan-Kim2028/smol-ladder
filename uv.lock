@@ -2938,6 +2938,11 @@ train = [
     { name = "trl" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "jinja2" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'train'", specifier = ">=1.0" },
@@ -2962,6 +2967,9 @@ requires-dist = [
     { name = "trl", marker = "extra == 'train'", specifier = ">=1.13" },
 ]
 provides-extras = ["train"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "jinja2", specifier = ">=3.1" }]
 
 [[package]]
 name = "statsmodels"

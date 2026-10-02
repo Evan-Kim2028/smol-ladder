@@ -1,6 +1,6 @@
 """Build every input the droplet needs, on the laptop, before the droplet exists.
 
-    uv run --with tokenizers python ops/amd/stage.py --out /tmp/smol-ladder-stage --commit HEAD
+    uv run --extra train python ops/amd/stage.py --out /tmp/smol-ladder-stage --commit HEAD
 
 The droplet bills from the instant it is created, so everything that can be prepared beforehand is.
 The output directory is what `driver.py bootstrap` copies over; it contains
@@ -8,8 +8,10 @@ The output directory is what `driver.py bootstrap` copies over; it contains
     code.tar.gz       `git archive` of the pinned commit: no git, no GitHub, no clone on the droplet
     sft_a.tar.gz      arm A: upstream's SmolDataEnvs-sft export (train.jsonl + val.jsonl)
     sft_b.tar.gz      arm B: our ja3 traces + manifest
-    tokens.json       trained-token counts per arm at this --max-length (exact when the Qwen3.5
-                      tokenizer is in the local HF cache, else a labelled pessimistic estimate)
+    tokens.json       trained-token counts per arm at this --max-length: the chat template's
+                      rendering (tool calls and results included) through the Qwen3.5 tokenizer
+                      when `transformers` and the cached tokenizer exist (`--extra train`), else a
+                      labelled estimate
     repo.txt          the pinned commit sha
     SHA256SUMS        checksums of the three tarballs, verified on the droplet before unpacking
     entrypoint.sh     the ONE remote entry script, taken from the pinned commit
@@ -84,13 +86,19 @@ def row_tokens(row: dict, encode) -> int:
     return n
 
 
-def count_file(path: Path, max_length: int, encode) -> dict:
-    """Rows, raw tokens, and tokens actually trained on (each row cut at `max_length`)."""
+def count_file(path: Path, max_length: int, encode, render=None) -> dict:
+    """Rows, raw tokens, and tokens actually trained on (each row cut at `max_length`).
+
+    With `render` (row -> the text the trainer will see) the count is `encode(render(row))`: the
+    chat template's own output, tool calls and tool results included. Without it, `row_tokens`'s
+    per-message estimate.
+    """
     rows = raw = trained = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        n = row_tokens(json.loads(line), encode)
+        row = json.loads(line)
+        n = encode(render(row)) if render is not None else row_tokens(row, encode)
         rows += 1
         raw += n
         trained += min(n, max_length)
@@ -110,15 +118,46 @@ def find_tokenizer() -> object | None:
     return None
 
 
-def build_token_counts(a_files: list[Path], b_file: Path, max_length: int, encode=None) -> dict:
+def find_renderer() -> tuple | None:
+    """(render, encode) that count the text SFT really trains on, or None.
+
+    `render(row)` is `train.sft_lora.prepare`'s row through the Qwen3.5 chat template with tools
+    and `enable_thinking=False`; `encode(text)` is the tokenizer's token count of that text. Needs
+    `transformers` and the cached Qwen/Qwen3.5-2B tokenizer; without them the caller falls back to
+    the labelled estimate. Counting the *rendering* matters: before 2026-10-02 the trainer fed the
+    template messages with no tool calls, and any count of "the rows" says nothing about the text
+    that is trained on.
+    """
+    try:
+        from train.render import load_tokenizer, render_row, tokenizer_renderer
+        from train.sft_lora import prepare
+        tokenizer = load_tokenizer()
+    except Exception:  # noqa: BLE001 - no transformers or no cached tokenizer: estimate instead
+        return None
+    template = tokenizer_renderer(tokenizer)
+
+    def render(row: dict) -> str:
+        return render_row(prepare([row], "bash")[0], template)
+
+    def encode(text: str) -> int:
+        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    return render, encode
+
+
+def build_token_counts(a_files: list[Path], b_file: Path, max_length: int, encode=None,
+                       render=None) -> dict:
     """tokens.json content. `encode=None` falls back to bytes/3.0, and says so."""
     def one(files: list[Path]) -> dict:
         if encode is not None:
-            parts = [count_file(f, max_length, encode) for f in files]
+            parts = [count_file(f, max_length, encode, render) for f in files]
+            method = ("chat template rendered (tools, enable_thinking=False) + Qwen3.5-2B "
+                      "tokenizer, truncated at max_length" if render is not None else
+                      "tokenizers (Qwen3.5-2B) + 8/message overhead, truncated at max_length")
             return {"rows": sum(p["rows"] for p in parts),
                     "raw_tokens": sum(p["raw_tokens"] for p in parts),
                     "trained_tokens": sum(p["trained_tokens"] for p in parts),
-                    "method": "tokenizers (Qwen3.5-2B) + 8/message overhead, truncated at max_length"}
+                    "method": method}
         rows = sum(1 for f in files for line in f.read_text().splitlines() if line.strip())
         est = int(sum(f.stat().st_size for f in files) / FALLBACK_BYTES_PER_TOKEN)
         return {"rows": rows, "raw_tokens": est, "trained_tokens": est,
@@ -192,7 +231,7 @@ def write_remote_env(out: Path, namespace: str) -> None:
 
 
 def stage(out: Path, commit: str, max_length: int, data: Path, repo: Path = REPO_ROOT,
-          allow_dirty: bool = False, namespace: str = "", encode=None) -> dict:
+          allow_dirty: bool = False, namespace: str = "", encode=None, render=None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     sha = check_commit(repo, commit)
     dirty = dirty_paths(repo)
@@ -213,7 +252,7 @@ def stage(out: Path, commit: str, max_length: int, data: Path, repo: Path = REPO
                                      if (data / "train" / "ja3_sft.manifest.json").exists() else [])
     make_tarball(out / "sft_b.tar.gz", data / "train", members_b)
 
-    tokens = build_token_counts([a_dir / "train.jsonl"], b_file, max_length, encode)
+    tokens = build_token_counts([a_dir / "train.jsonl"], b_file, max_length, encode, render)
     (out / "tokens.json").write_text(json.dumps(tokens, indent=2))
     (out / "repo.txt").write_text(sha + "\n")
     names = ["code.tar.gz", "sft_a.tar.gz", "sft_b.tar.gz", "tokens.json", "repo.txt"]
@@ -237,13 +276,19 @@ def main() -> None:
     ap.add_argument("--hub-namespace", default="")
     args = ap.parse_args()
     load_dotenv(REPO_ROOT / ".env")
-    encode = find_tokenizer()
+    found = find_renderer()
+    render = None
+    if found is not None:
+        render, encode = found
+    else:
+        encode = find_tokenizer()
     if encode is None:
         print("note: no Qwen3.5 tokenizer in the HF cache (or `tokenizers` not installed): token "
-              "counts fall back to a pessimistic estimate. `uv run --with tokenizers` and a "
+              "counts fall back to a pessimistic estimate. `uv run --extra train` and a "
               "cached Qwen/Qwen3.5-2B give exact counts.", file=sys.stderr)
     info = stage(args.out, args.commit, args.max_length, args.data,
-                 allow_dirty=args.allow_dirty, namespace=args.hub_namespace, encode=encode)
+                 allow_dirty=args.allow_dirty, namespace=args.hub_namespace, encode=encode,
+                 render=render)
     print(json.dumps(info, indent=2))
     print(f"staged into {args.out}; next: python ops/amd/driver.py create --yes ...")
 

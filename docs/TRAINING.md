@@ -12,6 +12,67 @@ uv run --extra train python -m train.grpo     --adapter ... --rung-schedule ladd
 
 ---
 
+## 0. Correction, 2026-10-02: every adapter trained before this commit is invalid
+
+**What was wrong.** `train/sft_lora.py::prepare()` rebuilt each message as `{"role", "content"}`.
+That dropped the assistant's `tool_calls` and the tool messages' `tool_call_id`/`name`, so the chat
+template had nothing to render for a tool call: **38.1% of assistant turns rendered empty** (412 of
+1,081 in the validation split) and no adapter ever saw a tool-call target. Nothing errored; an empty
+turn is valid text and the loss still fell. **Adapters A, B and AB trained before this commit are
+invalid and are to be retrained.** Nothing was ever measured with them that should be reported.
+
+**What is fixed.** `prepare()` passes messages through intact and only normalises tool-call
+`arguments` to a dict (Qwen3.5's template iterates `arguments|items`; a JSON string raises in the
+template, so both datasets are normalised to the dict form they already carry). `train/render.py`
+renders rows through the model's chat template and parses the text back; `sft_lora.main` runs that
+audit on the exact rows the trainer will see (after the Arrow round trip) and **aborts** unless every
+source tool call is rendered once with its arguments, every tool result appears in order, and no
+assistant turn is empty where the source had a call.
+
+**Proof, rendering with `Qwen/Qwen3.5-2B`'s tokenizer, `enable_thinking=False`:**
+
+| rows | assistant tool calls rendered / in source | tool results rendered / in source | empty turns where the source had a call |
+|---|---|---|---|
+| `sft_upstream/train.jsonl` (4,439) | 16,273 / 16,273 | 16,273 / 16,273 | 0 |
+| `sft_upstream/val.jsonl` (234) | 826 / 826 | 826 / 826 | 0 |
+| `ja3_sft.jsonl` (2,029) | 17,173 / 17,173 | 17,173 / 17,173 | 0 |
+
+`python -m train.render FILE...` reproduces it; `tests/test_render.py` runs it on a committed
+fixture in the quick loop and on the whole files with `-m slow`.
+
+**Corrected token counts** (`ops/amd/stage.py` now counts the rendered text; `max_length` 8,192):
+**A 9,085,233 · B 6,390,852 · AB 15,476,085** trained tokens (raw 9,216,104 / 7,711,665 /
+16,927,769; at 4,096: 8,530,696 / 5,373,492 / 13,904,188). The previous estimate (8.70M / 6.20M /
+14.90M) counted per-message overhead, not the template's own output; a `tokens.json` staged before
+this commit must be re-staged or the cost projection is off by 4-5%.
+
+**What TRL does with labels, and how this differs from upstream.** `SFTConfig.assistant_only_loss`
+defaults to False and the Qwen3.5 template has no `{% generation %}` markers, so **both upstream's
+`train_sft.py` and ours train on every token** (system prompt, tool schema, user turn, tool results
+and assistant turns alike). Differences between our configuration and upstream's
+(`04-smoldataenvs/scripts/train_sft.py`):
+
+- `max_length`: upstream 8,192; ours **4,096 on the laptop path** (`sft_lora` default), 8,192 on the
+  droplet (`AMD_MAX_LENGTH`). At 8,192 7.9% of `ja3_sft` rows still truncate.
+- Micro-batch: upstream 1 x accum 8; the droplet takes the smoke benchmark's batch and keeps the
+  effective batch at 8.
+- Validation split: upstream `train_test_split(0.05, seed=42)` over all 4,677 rows; ours is the
+  firewalled 4,673 rows split by a deterministic hash (4,439 / 234), so the held-out rows differ.
+- Precision: upstream `bf16=True`; ours auto (bf16 where the card supports it) and optional QLoRA
+  on the 6 GB laptop only.
+- `enable_thinking=False` is passed per row (TRL 1.14 reads it there; upstream set it on the config
+  under TRL 1.13). Same rendering.
+- Same: lr 2e-5, 1 epoch, LoRA r=16 / alpha=32 / dropout 0.05, `target_modules="all-linear"`,
+  `exclude_modules="visual.*"`, gradient checkpointing, logging 5, eval/save cadence, seed 42.
+- Not the same by construction: arm B and AB data. **Arm B's rows use the ja3 sweep's own
+  conventions** -- a system prompt that says `./input` (and omits a full stop), the hard-wrapped
+  user template, `./input` paths, empty tool output as `""` (65 results) and a `--- stderr ---` divider in 1,605 results -- not
+  upstream's. The evaluation harness now speaks upstream's conventions exactly (LOCAL_MODELS.md
+  1e), so B and AB are evaluated in a format they were not trained in until the export is rewritten
+  to upstream's conventions. That is a decision for the owner and is not done here.
+
+---
+
 ## 1. The headline finding: our sweeps were throwing away the training data
 
 **Every sweep run before 2026-10-01 saved no transcripts.** Every trial wrote `turns.json` --

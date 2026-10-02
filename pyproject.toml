@@ -33,6 +33,11 @@ train = [
   "bitsandbytes>=0.45",
 ]
 
+# Installed by a plain `uv run`, so the quick test loop can render a chat template (tests/test_render.py)
+# without the multi-gigabyte `train` extra.
+[dependency-groups]
+dev = ["jinja2>=3.1"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 # Only our own tests. Left unset, pytest walks the `data` and `logs` symlinks into the shared

@@ -35,6 +35,8 @@ import os
 from pathlib import Path
 
 from train.format import read_jsonl
+from train.render import (NON_THINKING, assert_tool_calls_rendered, normalise_messages,
+                          tokenizer_renderer)
 
 # Upstream's defaults (scripts/train_sft.py), as of 2026-09-24.
 BASE_MODEL = "Qwen/Qwen3.5-2B"
@@ -69,17 +71,20 @@ def load_rows(path: Path) -> list[dict]:
     return train, val
 
 
-NON_THINKING = {"enable_thinking": False}
-
-
 def prepare(rows: list[dict], protocol: str) -> list[dict]:
     """Rows as `messages` + `tools`, with the tool list the protocol actually uses.
 
+    **Messages reach the chat template intact.** This function used to rebuild every message as
+    `{"role", "content"}`, which deleted the assistant's `tool_calls` and the tool messages'
+    `tool_call_id`/`name`: 38% of assistant turns rendered empty and no adapter ever saw a tool
+    call to imitate. The only change made to a message is `normalise_messages`'s: tool-call
+    `arguments` as a dict, which is the form Qwen3.5's template iterates (a JSON string raises in
+    the template). `train/render.py` audits the rendered text; `verify_rendering` below makes the
+    trainer refuse to start when it does not carry the source's tool calls.
+
     The `program` protocol sends **no** `tools` key (upstream's rollout passes `tools=None`, and
     `or_agent.call_model` treats that as a different request than `tools=[]`), so the key is dropped
-    rather than emptied. Everything else is passed through untouched: TRL renders `messages` and
-    `tools` through the chat template and nothing else, so any reshaping here would be a second
-    format to keep in sync with the first.
+    rather than emptied.
 
     `chat_template_kwargs` is attached **per row** because that is where TRL 1.14 reads it: its
     `SFTTrainer` builds `apply_chat_template_kwargs` from `example.get("chat_template_kwargs", {})`
@@ -93,12 +98,34 @@ def prepare(rows: list[dict], protocol: str) -> list[dict]:
     """
     out = []
     for row in rows:
-        messages = [{"role": m["role"], "content": m["content"]} for m in row["messages"]]
-        entry = {"messages": messages, "chat_template_kwargs": dict(NON_THINKING)}
+        entry = {"messages": normalise_messages(row["messages"]),
+                 "chat_template_kwargs": dict(NON_THINKING)}
         if protocol != "program":
             entry["tools"] = row.get("tools") or []
         out.append(entry)
     return out
+
+
+def verify_rendering(source: list[dict], fed: list[dict], tokenizer, label: str) -> dict:
+    """Abort unless the text the trainer will see carries the source's tool calls.
+
+    Renders what TRL will render (the rows after the Arrow round trip a `datasets.Dataset`
+    imposes, through the tokenizer's own chat template, non-thinking) and compares it with the
+    *source* rows: one tool call per source call with the same arguments, every tool result in
+    order, no empty assistant turn where the source had a call. Raises `RenderingError`.
+    """
+    from datasets import Dataset
+
+    if source and not any(m.get("tool_calls") for r in source for m in r["messages"]):
+        return {"rows": len(source), "calls_source": 0}  # a protocol with no tool calls (program)
+    arrow = Dataset.from_list(fed)
+    result = assert_tool_calls_rendered(source, tokenizer_renderer(tokenizer),
+                                        [arrow[i] for i in range(len(arrow))], label)
+    print(f"render check {label}: {result['rows']} rows, {result['calls_rendered']}/"
+          f"{result['calls_source']} tool calls and {result['tool_results_rendered']}/"
+          f"{result['tool_results_source']} tool results rendered, "
+          f"{result['empty_with_source_call']} empty turns with a source call")
+    return result
 
 
 def precision_flags(args) -> dict:
@@ -115,15 +142,13 @@ def precision_flags(args) -> dict:
     return {"bf16": choice == "bf16", "fp16": choice == "fp16"}
 
 
-def build(args, train_rows: list[dict], val_rows: list[dict]):
+def build(args, train_rows: list[dict], val_rows: list[dict], tokenizer):
     """The trainer. Imports are local so `--help` and the tests need no torch."""
     import torch
     from datasets import Dataset
     from peft import LoraConfig
-    from transformers import AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         # Qwen3.5 ships a pad token, but a null one makes SFTTrainer's collator fall back to the
         # eos, which then appears mid-sequence on right-padded batches and gets trained on.
@@ -222,14 +247,23 @@ def main() -> None:
                     help="save the adapter to the Hub under this id once training ends")
     args = ap.parse_args()
 
-    train_rows, val_rows = load_rows(args.data)
-    if not train_rows:
+    source_train, source_val = load_rows(args.data)
+    if not source_train:
         raise SystemExit(f"no training rows in {args.data}")
-    train_rows = prepare(train_rows, args.protocol)
-    val_rows = prepare(val_rows, args.protocol) if val_rows else []
+    train_rows = prepare(source_train, args.protocol)
+    val_rows = prepare(source_val, args.protocol) if source_val else []
     print(f"{len(train_rows)} train rows, {len(val_rows)} val rows, protocol={args.protocol}")
 
-    trainer = build(args, train_rows, val_rows)
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # Refuse to train on text that lost its tool calls. Cheap (under a minute for 4.7k rows) next
+    # to a multi-hour run, and the failure it catches is silent: the loss still falls.
+    verify_rendering(source_train, train_rows, tokenizer, "train")
+    if source_val:
+        verify_rendering(source_val, val_rows, tokenizer, "val")
+
+    trainer = build(args, train_rows, val_rows, tokenizer)
     if args.resume:
         # Latest-first: Trainer.train(resume_from_checkpoint=...) needs a concrete path, and on a
         # wiped Kaggle disk the newest one is the only one that is complete.
