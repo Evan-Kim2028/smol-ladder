@@ -108,3 +108,17 @@ is unchanged. The untested explanation that remains is the script itself: a 2B m
   The instance was destroyed and the account verified empty at 14:57.
 
 Run trees: `data/runs/amd2-{base,a,b,ab,r,b3}` (temperature 0) and `data/runs/amd2s-*` (sampled).
+
+## Pre-registered reading rules for the robustness additions (written 2026-10-02 19:10, before the runs)
+
+1. **Second training seed for native B.** Same data, recipe and step count as the first run, seed
+   changed. Metric: L1, temperature 0, all 250 test tasks. The claim "native B is below base" is
+   made only if BOTH seeds are below base on the paired gained/lost count; otherwise the result is
+   reported as seed-dependent.
+2. **Sampled repeats.** The 60 gate tasks (stratified by tier), 4 attempts each at temperature 0.7,
+   top-p 0.8, top-k 20, for base, A and native B. Metric: each task's pass rate over its 4 attempts;
+   the model's score is the mean over tasks. Comparisons are paired per task with a 95% bootstrap
+   interval over tasks; a difference counts only if the interval excludes 0. "Wrote any answer" and
+   loop rate are reported beside accuracy.
+3. Nothing is added to or removed from these sets after the run; attempts that fail in the harness
+   (not the model) are retried, and the count is reported per model.
