@@ -177,11 +177,14 @@ must not be quoted as pass rates.**
   per-trial `/workdir` after the jail exits and graded offline.
 - **Request.** `temperature` 0, `tool_choice` auto, the one `bash` tool (byte-equal to the rows'),
   `chat_template_kwargs {"enable_thinking": false}`, `max_tokens` 1,024 clamped to the context left.
-- **End of episode** (`--bash-stop`). `submit` (default, unchanged): the episode ends when
-  `answer.txt` exists or the model replies without a tool call. `model`: only the model ends it, as
-  the rows show (391 rows keep calling tools after their first write, 194 write the answer twice,
-  511 contain a tool-free turn mid-run). The two are different measurements; pick one per sweep and
-  record it (`result.json` carries `bash_stop`).
+- **End of episode** (`--bash-stop`). **`model` (default since 2026-10-02):** only the model ends the
+  episode, as the rows show (391 rows keep calling tools after their first write, 194 write the answer
+  twice, 511 contain a tool-free turn mid-run, and every row ends on a closing assistant message). It
+  is the loop the rows were made by, and the oracle replay scores 60 / 60 under it against 56 / 60
+  under `submit`. `submit` (the harness's behaviour before that date): the episode ends when
+  `answer.txt` exists or the model replies without a tool call. The two are different measurements;
+  pick one per sweep and record it (`result.json` carries `bash_stop`). A sweep started before
+  2026-10-02 without `--bash-stop` ran `submit`: pass `--bash-stop submit` to resume it as it began.
 - `program` and `tools` modes, and their prompts, are unchanged. (`program` still sends the generic
   ladder prompt rather than `upstream.program_prompt`; that is the same class of bug and was left
   alone.)

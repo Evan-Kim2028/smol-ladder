@@ -601,21 +601,23 @@ MAX_TEXT_ONLY_RUN = 1
 
 def bash_loop(messages: list[dict], run_shell, read_answer, model: str = MODEL,
               max_turns: int = 16, ep: Endpoint | None = None,
-              episode: Episode | None = None, stop: str = "submit") -> list[dict]:
+              episode: Episode | None = None, stop: str = "model") -> list[dict]:
     """The SFT protocol: one `bash` tool, and the loop ends when the answer is submitted.
 
     `stop` is the end-of-episode policy, and the two policies are different measurements:
 
-    - "submit" (default, what this harness has always done): the episode ends the moment answer.txt
-      exists, and on any reply without a tool call. Cheap, and immune to a model that keeps
-      working after it has answered.
-    - "model": the loop upstream's rows were made by, as far as they show it. 391 of the 4,673 rows
-      keep calling tools after the first write to answer.txt (and 194 write it more than once,
-      the later value being the graded one), and 511 contain a tool-free turn mid-run that the
-      loop did not treat as the end. So only the model ends the episode: a reply without a tool
-      call ends it once an answer exists (every row ends that way, with its closing message), or
-      when it is the second in a row; `max_turns` bounds the rest. `submitted` records the latest
-      content of answer.txt on the turn that wrote it.
+    - "model" (default since 2026-10-02): the loop upstream's rows were made by, as far as they show
+      it. 391 of the 4,673 rows keep calling tools after the first write to answer.txt (and 194
+      write it more than once, the later value being the graded one), and 511 contain a tool-free
+      turn mid-run that the loop did not treat as the end. So only the model ends the episode: a
+      reply without a tool call ends it once an answer exists (every row ends that way, with its
+      closing message), or when it is the second in a row; `max_turns` bounds the rest. `submitted`
+      records the latest content of answer.txt on the turn that wrote it. The oracle replay of 60
+      recorded trajectories grades 60/60 under this policy and 56/60 under "submit".
+    - "submit" (what this harness did before): the episode ends the moment answer.txt exists, and
+      on any reply without a tool call. Cheaper, and immune to a model that keeps working after it
+      has answered, but it ends episodes the rows continued (one rewrote its answer, three spoke
+      once before submitting), so it measures a different thing than the rows' own loop.
 
     Stopping on submission is upstream's "then stop" made executable. Without it a 2B model that
     has answered correctly keeps calling bash, sometimes overwriting its own answer, and the

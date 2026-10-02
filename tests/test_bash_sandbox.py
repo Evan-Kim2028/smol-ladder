@@ -70,6 +70,14 @@ def test_the_models_paths_work_as_typed_and_the_answer_is_graded(tmp_path, monke
     assert out[2] == "2\n"
     assert out[3] == "(empty output, rc=0)"
     assert result["agent_status"] == "exit 0" and result["prediction"] == "42"
+    assert result["reward"] == 1.0
+    # the default policy is the model's: the oracle's closing message, not the submission, ends it
+    assert result["stop_reason"] == "model_stopped" and result["bash_stop"] == "model"
+
+
+def test_the_submit_policy_ends_the_episode_at_the_submission(tmp_path, monkeypatch):
+    result, _ = run_commands(tmp_path, monkeypatch, ['echo -n "42" > /workdir/answer.txt',
+                                                      "ls /workdir"], bash_stop="submit")
     assert result["reward"] == 1.0 and result["stop_reason"] == "answer_submitted"
 
 
@@ -134,9 +142,9 @@ def test_the_tables_are_read_only_and_listed_as_plain_files(tmp_path, monkeypatc
     assert out[3] == "x\n1\n"
 
 
-def test_a_tool_free_reply_before_any_answer_ends_the_default_episode(tmp_path, monkeypatch):
-    """`submit` policy (the default) is unchanged: no answer file, graded 0, no crash."""
-    result, out = run_commands(tmp_path, monkeypatch, ["ls /home/user/input"])
+def test_a_tool_free_reply_before_any_answer_ends_a_submit_episode(tmp_path, monkeypatch):
+    """`submit` policy: the first tool-free reply ends it. No answer file, graded 0, no crash."""
+    result, out = run_commands(tmp_path, monkeypatch, ["ls /home/user/input"], bash_stop="submit")
     assert out == ["t.csv\n"]
     assert result["agent_status"] == "exit 0" and result["reward"] == 0.0
     assert result["stop_reason"] == "model_stopped" and result["bash_stop"] == "submit"

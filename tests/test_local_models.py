@@ -483,11 +483,11 @@ def test_the_bash_protocol_transcript_is_also_a_whole_conversation(tmp_path, mon
 
     assert result["reward"] == 1.0
     turns = json.loads((work / "transcript.json").read_text())
-    # system, user, then the bash turn and its result, then the submitting turn and its result.
-    # The loop stops *on* submission rather than letting the model speak again, so there is no
-    # trailing assistant turn -- which is the contract upstream's own rows follow.
+    # system, user, then the bash turn and its result, the submitting turn and its result, and the
+    # model's closing message: the default `model` policy lets only the model end the episode, and
+    # every one of upstream's rows ends on that closing assistant message.
     assert [m["role"] for m in turns] == ["system", "user", "assistant", "tool",
-                                          "assistant", "tool"], [m["role"] for m in turns]
+                                          "assistant", "tool", "assistant"], [m["role"] for m in turns]
     # The submission is a bash call in the transcript, which is exactly how upstream's own rows
     # end. It is in the transcript, not only in answer.txt.
     submission = [c for m in turns for c in (m.get("tool_calls") or [])
@@ -496,7 +496,7 @@ def test_the_bash_protocol_transcript_is_also_a_whole_conversation(tmp_path, mon
     # The submitted value is recorded on the turn that made it, so an exporter can build the
     # final row without re-running the trial -- and without reading answer.txt, which the bash
     # protocol's own harness calls a side channel.
-    assert turns[-2]["submitted"] == "42", turns[-2]
+    assert turns[-3]["submitted"] == "42", turns[-3]
 
 
 # ── the upstream bash mode, end to end through once() ─────────────────────────
@@ -539,9 +539,10 @@ def test_once_in_bash_mode_grades_the_answer_file(tmp_path, monkeypatch):
     assert not (work / "solution.py").exists()
 
 
-def test_a_submitted_answer_ends_the_bash_loop(tmp_path, monkeypatch):
-    """"then stop" is part of the protocol: three more turns after submitting are not a
-    measurement of anything, and on a 2B model they are 3 turns of rambling."""
+def test_a_submitted_answer_ends_the_bash_loop_under_the_submit_policy(tmp_path, monkeypatch):
+    """`--bash-stop submit`: "then stop" made executable. Three more turns after submitting are
+    not a measurement of anything, and on a 2B model they are 3 turns of rambling. (The default
+    policy is `model`; see test_the_default_stop_policy_is_the_model_s.)"""
     import smol_ladder.run_ladder as runner
 
     inputs = tmp_path / "in"
@@ -558,9 +559,44 @@ def test_a_submitted_answer_ends_the_bash_loop(tmp_path, monkeypatch):
         result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
                               "answer": "42", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
                              runner_bash_prompt(), tmp_path / "w", Path(sys.prefix), "m", 8,
-                             inputs_of=lambda r: inputs, agent="bash")
+                             inputs_of=lambda r: inputs, agent="bash", bash_stop="submit")
     assert result["reward"] == 1.0
     assert len(stub.requests) == 1, "the loop kept going after the answer was submitted"
+
+
+def test_the_default_stop_policy_is_the_model_s(tmp_path, monkeypatch, capsys):
+    """The rows were made by a loop that only the model ended (391 keep calling tools after the
+    first write, 511 speak mid-run), and the oracle replay scores 60/60 under it against 56/60 under
+    `submit`. So `model` is the default everywhere the policy is chosen -- and a submission does not
+    end the episode: the model's next, tool-free reply does."""
+    import inspect
+
+    import smol_ladder.run_ladder as runner
+    from smol_ladder.or_agent import bash_loop
+
+    assert inspect.signature(bash_loop).parameters["stop"].default == "model"
+    for fn in (runner.once, runner.task_trials, runner._agent_script):
+        assert inspect.signature(fn).parameters["bash_stop"].default == "model"
+    assert "stop='model'" in runner._agent_script("bash", "m", 4)
+    monkeypatch.setattr(sys, "argv", ["run_ladder", "--help"])
+    with pytest.raises(SystemExit):
+        runner.main()
+    assert "'model' (default)" in " ".join(capsys.readouterr().out.split())
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "t.csv").write_text("a\n1\n")
+    replies = [assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})]),
+               assistant("Submitted 42.")]
+    with Stub(replies) as stub:
+        monkeypatch.setenv("SMOL_LADDER_BASE_URL", stub.base_url)
+        monkeypatch.delenv("SMOL_LADDER_API_KEY_ENV", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = runner.once({"task_id": "t1", "question": "Q?", "files": ["t.csv"],
+                              "answer": "42", "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0},
+                             runner_bash_prompt(), tmp_path / "w", Path(sys.prefix), "m", 8,
+                             inputs_of=lambda r: inputs, agent="bash")
+    assert result["reward"] == 1.0 and result["bash_stop"] == "model"
+    assert (result["stop_reason"], len(stub.requests)) == ("model_stopped", 2)
 
 
 def test_the_bash_mode_refuses_to_credit_an_answer_that_is_just_a_command(tmp_path, monkeypatch):
@@ -749,14 +785,17 @@ def _endpoint_for(monkeypatch, stub, ctx=None):
 
 def _run_bash_loop(monkeypatch, replies, ctx=None, shell=lambda c: CommandResult("ok", 0),
                    answer=lambda: None,
-                   max_turns=16, models=None):
+                   max_turns=16, models=None, stop="submit"):
+    """`stop` is explicit: bash_loop's default is "model" (2026-10-02), and the tests that use this
+    helper are about truncation, context overflow and the stop reasons, not about that default
+    (see test_the_default_stop_policy_is_the_model_s)."""
     from smol_ladder.or_agent import Episode, bash_loop, context_length
     with flaky_stub(replies) as stub:
         stub.models = models
         ep = _endpoint_for(monkeypatch, stub, ctx)
         episode = Episode(context_length(ep, "m"))
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
-        bash_loop(messages, shell, answer, "m", max_turns, ep, episode)
+        bash_loop(messages, shell, answer, "m", max_turns, ep, episode, stop=stop)
     return messages, episode, stub
 
 
@@ -862,7 +901,7 @@ _ROW = {"task_id": "t1", "question": "Q?", "files": ["t.csv"], "answer": "42",
         "reward_mode": "numeric", "atol": 0.0, "rtol": 0.0}
 
 
-def _once(tmp_path, monkeypatch, replies, agent, prompt=None):
+def _once(tmp_path, monkeypatch, replies, agent, prompt=None, **kw):
     import smol_ladder.run_ladder as runner
     inputs = _inputs_outside_tmp(tmp_path)
     work = tmp_path / "trial" / "L1"
@@ -870,7 +909,7 @@ def _once(tmp_path, monkeypatch, replies, agent, prompt=None):
         _stub_env(monkeypatch, stub)
         monkeypatch.delenv("SMOL_LADDER_MAX_MODEL_LEN", raising=False)
         result = runner.once(_ROW, prompt or runner_bash_prompt(), work, Path(sys.prefix), "m", 8,
-                             inputs_of=lambda r: inputs, rung_label="L1", agent=agent)
+                             inputs_of=lambda r: inputs, rung_label="L1", agent=agent, **kw)
     return result, work
 
 
@@ -889,7 +928,7 @@ def test_a_context_exhausted_bash_trial_is_a_finished_model_failure_with_a_trans
 def test_a_submitted_answer_records_stop_reason_turns_and_prompt_tokens(tmp_path, monkeypatch):
     submit = assistant(calls=[("bash", {"command": 'echo -n "42" > /workdir/answer.txt'})])
     submit["usage"] = {"prompt_tokens": 777, "completion_tokens": 20}
-    result, _ = _once(tmp_path, monkeypatch, [submit], "bash")
+    result, _ = _once(tmp_path, monkeypatch, [submit], "bash", bash_stop="submit")
     assert result["reward"] == 1.0
     assert (result["stop_reason"], result["turns_used"], result["last_prompt_tokens"]) == (
         "answer_submitted", 1, 777)

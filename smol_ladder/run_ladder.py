@@ -368,7 +368,7 @@ def scratch_label(rung_label: str, run_tag: str, sample: int) -> str:
 def once(row: dict, prompt: str, work: Path, venv: Path, model: str, max_turns: int,
          retry_failed: bool = False, inputs_of=input_dir, rung_label: str = "run",
          provenance: dict | None = None, was_run: list | None = None,
-         agent: str = "tools", save_transcript: bool = True, bash_stop: str = "submit") -> dict:
+         agent: str = "tools", save_transcript: bool = True, bash_stop: str = "model") -> dict:
     """One attempt at one rung: run the solver in the jail, then grade its solution offline.
 
     Resumable: a result.json from a clean run is reused. A crashed trial is only retried when
@@ -707,7 +707,7 @@ def sample_dir(rung_dir: Path, k: int) -> Path:
 
 
 def _agent_script(agent: str, model: str, max_turns: int, pkg_root: str | None = None,
-                  bash_stop: str = "submit") -> str:
+                  bash_stop: str = "model") -> str:
     """The program that runs *inside* the jail, one per protocol.
 
     argv[1] is the user turn of the conversation, which for the upstream protocols is built by
@@ -857,7 +857,7 @@ def task_trials(row: dict, split: str, rungs: list[str], venv: Path, model: str,
                 runs_root: Path | None = None, samples: int = 1,
                 climb: bool = True, agent: str = "tools",
                 save_transcript: bool = True, run_tag: str = "",
-                bash_stop: str = "submit") -> list[dict]:
+                bash_stop: str = "model") -> list[dict]:
     """Run the ladder for one task: `samples` trials per rung, optionally climbing.
 
     Rung names are given as on the command line. "L1_schema" is the filesystem-safe spelling of
@@ -1086,11 +1086,12 @@ def main() -> None:
                          "agent; 'tools' is ours. A released 2B model must be run under its own "
                          "protocol or the number is about the protocol, not the model.")
     ap.add_argument("--max-turns", type=int, default=40)
-    ap.add_argument("--bash-stop", choices=["submit", "model"], default="submit",
-                    help="--agent bash only. 'submit' ends the episode when answer.txt exists or the "
-                         "model replies without a tool call (this harness's behaviour so far); "
-                         "'model' lets only the model end it, as the SFT rows show (see "
-                         "or_agent.bash_loop)")
+    ap.add_argument("--bash-stop", choices=["submit", "model"], default="model",
+                    help="--agent bash only. 'model' (default) lets only the model end the episode, "
+                         "as the SFT rows show: the rows were made that way, and the oracle replay "
+                         "scores 60/60 under it against 56/60 under 'submit'. 'submit' ends it when "
+                         "answer.txt exists or the model replies without a tool call (the harness's "
+                         "behaviour before 2026-10-02). See or_agent.bash_loop")
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run trials whose agent crashed; a clean pass is never re-rolled")
     ap.add_argument("--samples", type=int, default=1,
