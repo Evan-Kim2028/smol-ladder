@@ -203,8 +203,9 @@ many rows it refused and why. Full reasoning and the measured rows: `docs/TRAINI
 **Reference generation** is needed for 5 and 6 but **[non-blocking]** for the first training run. Run it
 early anyway: it is the long pole for the ladder and it is what validates a task's gold.
 
-- [ ] 1. SFT (LoRA) on SmolDataEnvs-sft, **arm A**, 4,673 exported traces (4,677 minus 4 leaked
-      questions) — first training run
+- [x] 1. SFT (LoRA) on SmolDataEnvs-sft, **arm A** — **done 2026-10-02** (4,439 training rows, 555
+      steps). L1 at temperature 0: A 25.6% against the base model's 24.0%, not a detectable
+      difference. Results and caveats: `docs/SFT_RESULTS.md`
 - [ ] 2. Converter: upstream `bash` traces and our traces → one tool format + chat template
 - [ ] 3. Reference solutions for the training split (`gen_refs` / `gen_solutions`), verified offline
 - [ ] 4. Plain-language L2/L3 hints for the training split (`gen_hints`), validated and cached
@@ -221,7 +222,11 @@ early anyway: it is the long pole for the ladder and it is what validates a task
       trials** (`data/train/ja3_sft.manifest.json`; 0 rows dropped by the widest-key firewall). This
       item was open only because the old tree could not yield conversations; the `ja3` sweep is what
       closed it. The training run itself is item 6b below
-- [ ] 6b. Train **arm B** on `data/train/ja3_sft_v2.jsonl` (**1,122 rows**: the same traces re-expressed
+- [x] 6b. **Done 2026-10-02**: A+B 24.8% (same as base), **B 9.6% (far below base)**; a leaner
+      rewrite of B (`ja3_sft_v3`, arm B3) scored 10.8%. `docs/SFT_RESULTS.md` has the failure
+      analysis. **This is the agreed stop point: no GRPO or hint-rung run before the owner has read
+      it.** Harbor packaging and publishing are deferred until after that. The item as planned:
+      train **arm B** on `data/train/ja3_sft_v2.jsonl` (**1,122 rows**: the same traces re-expressed
       in the conversation `--agent bash` builds, every row replayed through the harness; the 2,029-row
       `ja3_sft.jsonl` is v1 and was in the sweep's format, so adapters trained on it are invalid --
       `docs/TRAINING.md` §0, §5), then **arm A+B** on 4,673 + 1,122, in that order
