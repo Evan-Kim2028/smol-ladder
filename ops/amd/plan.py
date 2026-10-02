@@ -416,6 +416,7 @@ class Measured:
     probe_models: int = 0            # models that drove the probe concurrently (0 = not measured)
     probe_start_s: float = 0.0       # vLLM start time with base + adapter
     tool_calls_ok: bool | None = None
+    adapter_differs: bool | None = None   # the adapter's temperature-0 output differs from the base's
     checks_ok: bool | None = None
     resume_ok: bool | None = None
 
@@ -431,7 +432,8 @@ def measured_from_ledger(events: list[dict], key: tuple | None = None) -> Measur
         if key is not None and (e.get("droplet_id"), e.get("hardware")) != tuple(key):
             continue
         for key_ in ("tokens_per_s", "batch_size", "grad_accum", "sec_per_trial", "probe_models",
-                     "probe_start_s", "tool_calls_ok", "checks_ok", "resume_ok"):
+                     "probe_start_s", "tool_calls_ok", "adapter_differs", "checks_ok",
+                     "resume_ok"):
             if e.get(key_) is not None:
                 setattr(m, key_, e[key_])
     return m

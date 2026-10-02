@@ -59,7 +59,7 @@ def tokens() -> dict[str, P.SetTokens]:
 
 def measured(**over) -> P.Measured:
     m = P.Measured(tokens_per_s=9000.0, batch_size=8, grad_accum=1, sec_per_trial=6.0,
-                   probe_start_s=240.0, tool_calls_ok=True, checks_ok=True, resume_ok=True)
+                   probe_start_s=240.0, tool_calls_ok=True, adapter_differs=True, checks_ok=True, resume_ok=True)
     for k, v in over.items():
         setattr(m, k, v)
     return m
@@ -1043,7 +1043,7 @@ def events_for(tmp_path, **meas) -> tuple[P.Config, list[dict]]:
         "max_length": 8192, "sets": {k: {"rows": v.rows, "trained_tokens": v.trained_tokens}
                                      for k, v in tokens().items()}}))
     fields = {"tokens_per_s": 9000.0, "batch_size": 8, "grad_accum": 1, "sec_per_trial": 6.0,
-              "probe_start_s": 240.0, "tool_calls_ok": True, "checks_ok": True, "resume_ok": True}
+              "probe_start_s": 240.0, "tool_calls_ok": True, "adapter_differs": True, "checks_ok": True, "resume_ok": True}
     fields.update(meas)
     # a live droplet, and measurements stamped with ITS id and hardware (the only ones that count)
     L.append(c.ledger, L.CREATED, now=T0 - 60, price_per_hour=2.46, droplet_id=DROPLET)
@@ -2996,3 +2996,120 @@ def test_every_command_the_runbook_block_shows_is_one_the_driver_parses(tmp_path
         argv = m.group(1).split()
         out = run_driver(tmp_path, *argv)
         assert "invalid choice" not in out.stderr and "unrecognized" not in out.stderr, m.group(0)
+
+
+# ═══ serve.sh --merged serves only a verified merge ════════════════════════════════════
+
+def _merged_serve_env(fake_remote, tmp_path, *, zero_b=False, prebuilt_stale=False):
+    """fake_remote plus a tiny real base checkpoint and a tiny real adapter for arm A."""
+    import test_merge_adapter as TM
+    env, rec = fake_remote
+    root = Path(env["AMD_REMOTE_ROOT"])
+    (root / "ops").symlink_to(REPO_ROOT / "ops")
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    base_dir = tmp_path / "tinybase"
+    base = TM.make_base(base_dir)
+    adapter = root / "runs" / "sft_a"
+    shutil.rmtree(adapter)
+    TM.make_adapter(adapter, base, TM.TARGETS, zero_b=zero_b)
+    if prebuilt_stale:    # what the old merge left: config + the BASE's weights and index
+        shutil.copytree(base_dir, root / "runs" / "merged_amd-a-2b")
+    return {**env, "AMD_VENV": str(tmp_path / "venv"), "AMD_BASE_MODEL": str(base_dir)}, rec, root
+
+
+def _serve_merged(env):
+    return subprocess.run(["bash", str(OPS / "serve.sh"), "--all", "--merged", "--arms", "A"], env=env,
+                          capture_output=True, text=True, timeout=120)
+
+
+def test_serve_merged_merges_checks_and_then_serves_the_merged_directory(fake_remote, tmp_path):
+    env, rec, root = _merged_serve_env(fake_remote, tmp_path)
+    out = _serve_merged(env)
+    assert out.returncode == 0, out.stderr
+    report = json.loads((root / "runs" / "merged_amd-a-2b" / "merge_report.json").read_text())
+    assert report["ok"] and report["modules_applied"] == 3
+    merged = str(root / "runs" / "merged_amd-a-2b")
+    for _ in range(50):      # the stub overwrites its record per server; the merged one starts last
+        if rec.exists() and merged in rec.read_text().splitlines():
+            break
+        subprocess.run(["sleep", "0.1"])
+    assert merged in rec.read_text().splitlines()
+
+
+def test_serve_merged_refuses_an_adapter_whose_merge_is_a_no_op_and_starts_no_server(fake_remote, tmp_path):
+    env, rec, root = _merged_serve_env(fake_remote, tmp_path, zero_b=True)
+    out = _serve_merged(env)
+    assert out.returncode != 0
+    assert "failed its checks" in out.stderr and "no-op" in out.stderr
+    assert not rec.exists()                                   # no server was started
+
+
+def test_serve_merged_does_not_trust_a_stale_directory_that_holds_the_bases_weights(fake_remote, tmp_path):
+    env, rec, root = _merged_serve_env(fake_remote, tmp_path, prebuilt_stale=True)
+    merged = root / "runs" / "merged_amd-a-2b"
+    assert (merged / "config.json").exists()                  # the old "is it merged?" test passed here
+    out = _serve_merged(env)
+    assert out.returncode == 0, out.stderr
+    from ops.amd import merge_adapter as M
+    assert M.check(merged) == [] and json.loads((merged / "merge_report.json").read_text())["tensors_changed"] == 3
+
+
+# ═══ the probe must see the adapter change the model's output ══════════════════════════
+
+def test_an_adapter_whose_output_equals_the_bases_is_a_no_go(tmp_path):
+    c, ev = events_for(tmp_path, adapter_differs=False)
+    ok, reasons, _ = driver.go_no_go(c, ev, T0)
+    assert not ok and any("differs from the base" in r and "FAILED" in r for r in reasons)
+
+
+def test_an_unmeasured_adapter_check_is_a_no_go(tmp_path):
+    c, ev = events_for(tmp_path, adapter_differs=None)
+    ok, reasons, _ = driver.go_no_go(c, ev, T0)
+    assert not ok and any("differs from the base" in r and "not measured" in r for r in reasons)
+
+
+def test_parse_probe_serve_reads_the_adapter_check():
+    out = driver.parse_probe_serve("TOOL_CALLS_OK=1\nADAPTER_DIFFERS_FROM_BASE=0\n"
+                                   "ADAPTER_TARGET_AGREEMENT=0.4100\nBASE_TARGET_AGREEMENT=0.2500\n")
+    assert out == {"tool_calls_ok": True, "adapter_differs": False,
+                   "adapter_target_agreement": 0.41, "base_target_agreement": 0.25}
+
+
+def _rows_file(tmp_path):
+    row = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"},
+                        {"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": "bash", "arguments": {"command": "ls -la /home/user/input"}}}]},
+                        {"role": "tool", "content": "x"}],
+           "tools": [{"type": "function", "function": {"name": "bash"}}]}
+    p = tmp_path / "train.jsonl"
+    p.write_text(json.dumps(row) + "\n")
+    return p
+
+
+def test_the_fixed_prompt_is_the_first_training_row_up_to_its_first_assistant_turn(tmp_path):
+    prompt, tools, target = probe_tools.first_training_prompt(_rows_file(tmp_path))
+    assert [m["role"] for m in prompt] == ["system", "user"] and tools[0]["function"]["name"] == "bash"
+    assert target == "ls -la /home/user/input"
+
+
+def test_token_agreement_is_positional_over_the_targets_tokens():
+    assert probe_tools.token_agreement("ls -la /home/user/input", "ls -la /home/user/input") == 1.0
+    assert probe_tools.token_agreement("ls /home/user/input", "ls -la /home/user/input") < 0.5
+    assert probe_tools.token_agreement("", "ls -la") == 0.0
+
+
+def test_adapter_check_flags_identical_output_and_reports_agreement(tmp_path, monkeypatch):
+    def reply(text):
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "bash", "arguments": json.dumps({"command": text})}}]},
+            "logprobs": {"content": [{"logprob": -0.5}]}}]}
+    outs = {"adapter": "ls -la /home/user/input", "base": "head -5 data.csv"}
+    monkeypatch.setattr(probe_tools, "chat", lambda port, body, timeout=120.0: reply(outs[body["model"]]))
+    rows = _rows_file(tmp_path)
+    res = probe_tools.adapter_check(1, "adapter", 1, "base", rows)
+    assert res["differs"] and res["adapter_agreement"] == 1.0 and res["base_agreement"] < 1.0
+    outs["adapter"] = outs["base"]
+    assert probe_tools.adapter_check(1, "adapter", 1, "base", rows)["differs"] is False

@@ -221,8 +221,9 @@ def test_each_sample_of_one_rung_gets_its_own_scratch(tmp_path, monkeypatch):
 
     assert len(homes) == 3
     assert len(set(homes)) == 3, f"two samples shared a HOME: {homes}"
-    assert sorted(Path(h).relative_to(tmp_path / "scratch" / "trials" / "t1").as_posix()
-                  for h in homes) == ["L1", "L1s1", "L1s2"]
+    names = [Path(h).relative_to(tmp_path / "scratch" / "trials" / "t1").as_posix() for h in homes]
+    # rung, run tag, sample index, then pid and a random suffix (see scratch_label)
+    assert sorted(n.split(".")[:3] for n in names) == [[f"L1{'s' + str(k) if k else ''}", "untagged", f"s{k}"] for k in range(3)]
 
 
 # --- provenance ----------------------------------------------------------------------------

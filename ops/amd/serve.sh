@@ -25,6 +25,7 @@
 #   --host 127.0.0.1                         NOT 0.0.0.0: an unauthenticated model server on a
 #                                            public IP is an open GPU; the laptop reaches it
 #                                            through ssh -L
+# `--merged` serves only directories that carry a passing merge_report.json (merge_adapter.py --check).
 # `--tokenizer` is always the base's: a merged model is saved by the training venv's transformers 5,
 # whose tokenizer files vLLM's transformers 4.x cannot read.
 # `HIP_VISIBLE_DEVICES`, not `CUDA_VISIBLE_DEVICES`, is the ROCm spelling, and one GPU needs neither.
@@ -154,13 +155,27 @@ wait_ready() { # wait_ready <port> <expected name>...
 
 BASE="$(amd_served_name base)"
 if (( MERGED )); then
+  # Every merge is made and checked BEFORE any server starts, so a refused one leaves no server.
+  for k in "${!NAMES[@]}"; do
+    merged="$AMD_REMOTE_ROOT/runs/merged_${NAMES[$k]}"
+    # A merged directory is served only with a passing merge_report.json for the weight files it
+    # holds now. One that fails the check (no report, a no-op merge, files changed since) is
+    # re-merged, and the merge exits non-zero if it still is not a real one. The first merge
+    # script copied the base's own weight files over its output and every "merged" model was the
+    # base; a config.json on disk proved nothing about that.
+    if ! "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" >/dev/null 2>&1; then
+      "$AMD_VENV/bin/python" ops/amd/merge_adapter.py \
+        --base "$AMD_BASE_MODEL" --adapter "${PATHS[$k]}" --out "$merged" \
+        || amd_die "merging ${NAMES[$k]} failed its checks (see merge_report.json in $merged); not serving it"
+    fi
+    "$AMD_VENV/bin/python" ops/amd/merge_adapter.py --check "$merged" \
+      || amd_die "refusing to serve $merged: no passing merge_report.json"
+  done
   i=0; ports=("$PORT")
   start_server "$PORT" "$AMD_BASE_MODEL" "$BASE" 0.2
   for k in "${!NAMES[@]}"; do
     i=$((i + 1)); p=$((PORT + i)); ports+=("$p")
     merged="$AMD_REMOTE_ROOT/runs/merged_${NAMES[$k]}"
-    [[ -f "$merged/config.json" ]] || "$AMD_VENV/bin/python" ops/amd/merge_adapter.py \
-      --base "$AMD_BASE_MODEL" --adapter "${PATHS[$k]}" --out "$merged"
     start_server "$p" "$merged" "${NAMES[$k]}" 0.2
   done
   (( WAIT )) && { wait_ready "$PORT" "$BASE"; for k in "${!NAMES[@]}"; do wait_ready "${ports[$((k + 1))]}" "${NAMES[$k]}"; done; }
@@ -173,10 +188,14 @@ else
 fi
 
 if (( WAIT )) && [[ "$MODE" == "probe" ]]; then
-  if (( MERGED )); then   # the adapter's server first: the driver reads the first TOOL_CALLS_OK line
-    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$((PORT + 1))" --models "${NAMES[0]}"
-    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$PORT" --models "$BASE"
+  # The adapter's tool calls, then its temperature-0 output on a fixed training prompt against the
+  # base's: identical output means the adapter is not applied (probe_tools prints
+  # ADAPTER_DIFFERS_FROM_BASE, which the go/no-go requires).
+  ROWS="$AMD_DATA_ROOT/train/sft_upstream/train.jsonl"
+  if (( MERGED )); then   # the adapter and the base are on different ports
+    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$((PORT + 1))" --models "${NAMES[0]}" \
+      --base-port "$PORT" --base-model "$BASE" --train-rows "$ROWS"
   else
-    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$PORT" --models "${NAMES[0]}" "$BASE"
+    "$AMD_VENV/bin/python" -m ops.amd.probe_tools --port "$PORT" --models "${NAMES[0]}" "$BASE" --train-rows "$ROWS"
   fi
 fi

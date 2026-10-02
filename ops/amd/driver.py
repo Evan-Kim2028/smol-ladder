@@ -437,6 +437,14 @@ def parse_probe_serve(text: str) -> dict:
     m = re.search(r"TOOL_CALLS_OK=([01])", text)
     if m:
         out["tool_calls_ok"] = m.group(1) == "1"
+    m = re.search(r"ADAPTER_DIFFERS_FROM_BASE=([01])", text)
+    if m:
+        out["adapter_differs"] = m.group(1) == "1"
+    for key, name in (("adapter_target_agreement", "ADAPTER_TARGET_AGREEMENT"),
+                      ("base_target_agreement", "BASE_TARGET_AGREEMENT")):
+        m = re.search(name + r"=([0-9.]+)", text)
+        if m:
+            out[key] = float(m.group(1))
     return out
 
 
@@ -458,7 +466,9 @@ def go_no_go(cfg: P.Config, events: list[dict], now: float) -> tuple[bool, list[
     rem_dollars = P.total_dollars(remaining, cfg.price)
     reasons = []
     for label, val in (("ROCm/stack checklist", meas.checks_ok), ("kill-and-resume", meas.resume_ok),
-                       ("LoRA serving + tool calls", meas.tool_calls_ok)):
+                       ("LoRA serving + tool calls", meas.tool_calls_ok),
+                       ("adapter output differs from the base's on a training prompt",
+                        meas.adapter_differs)):
         if val is not True:
             reasons.append(f"{label}: {'FAILED' if val is False else 'not measured'}")
     if not meas.tokens_per_s:
