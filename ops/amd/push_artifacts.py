@@ -5,7 +5,7 @@
 
 Runs on the teardown path, possibly while racing a shutdown, so it is written to be re-runnable: a
 file the Hub already has at the same size is skipped. Adapters and checkpoints do not go through
-here: the trainer pushes those to each arm's own private model repo (hub_strategy="every_save")
+here: the trainer pushes those to each arm's own private model repo (hub_strategy="checkpoint")
 and run_sft.sh pushes the final adapter, so this only carries what the trainer does not: logs,
 the smoke's measurements, the checksum list.
 

@@ -320,8 +320,13 @@ so `accept-new` would refuse a second session's droplet at an old IP.
 
 Checkpoint cadence: `train/sft_lora.py` has no flag for it (it saves every 100 steps), so
 `ops/amd/sft_run.py` takes `--save-steps` and forces it into the trainer's `SFTConfig`;
-`hub_strategy="every_save"` pushes each checkpoint to the arm's private repo. A reclaim or a reset
-costs one interval. The kill-and-resume in the smoke exercises exactly this path once.
+`hub_strategy="checkpoint"` pushes each checkpoint folder to the arm's private repo as
+`last-checkpoint/`. (Session 1 had `every_save`, which in transformers 5.18 pushes only the adapter
+files, so a fresh droplet would have restarted every arm from step 0; `sft_run.py` now refuses a
+pushing config whose strategy cannot resume, and `tests/test_hub_layout.py` pins the layouts
+captured from a real Trainer.) A reclaim or a reset costs one interval. The kill-and-resume in the
+smoke exercises the on-disk path once; the restore from the Hub is the same `resume.py` code run
+against the captured layout in the tests, and has never run against the real Hub.
 
 Knobs `train/sft_lora.py` does not expose, and that would cut cost if it did: `--packing`, turning
 gradient checkpointing off (288 GB can afford it). They are outside this change's scope.
@@ -491,7 +496,7 @@ Ranked by how likely each is to fail on the real instance; none can be verified 
 6. **The checkpoint file names the restart logic treats as "complete"** (`optimizer.pt`,
    `scheduler.pt`, `rng_state*.pth`) under transformers 5. If they differ, the smoke's kill-and-resume
    reports FAIL (it would otherwise restart from zero silently) and the projection is NO-GO.
-7. **Hub push of checkpoints** (`hub_strategy="every_save"`, private repos, `last-checkpoint/`) working
+7. **Hub push of checkpoints** (`hub_strategy="checkpoint"`, private repos, `last-checkpoint/`) working
    with these library versions and a token with write scope. The entrypoint checks write access by
    creating the repos; the first checkpoint push is only exercised in the real arm.
 8. **Spot capacity at the moment of creation**, and the two-hour notice actually being given.

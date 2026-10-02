@@ -634,7 +634,7 @@ check the first 10 steps against the logged rate. One epoch at batch 1 x accum 8
 ~555 optimizer steps.
 
 **The 12 h Kaggle session cap is the binding constraint, not throughput.** 4,439 rows at 8192
-tokens is close to one session on one T4. `--resume` plus `hub_strategy="every_save"` is the
+tokens is close to one session on one T4. `--resume` plus `hub_strategy="checkpoint"` is the
 safety net; on a wiped disk the checkpoint has to come back *from the Hub*, so `HUB_MODEL_ID` must
 be set on the first run or an interrupted run loses everything.
 

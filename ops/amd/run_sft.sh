@@ -11,7 +11,7 @@
 #
 # What makes a spot reclaim, or a GPU reset, cost minutes:
 #   * a checkpoint every --save-steps steps (default 50; train/sft_lora.py has no flag for the
-#     cadence, so ops/amd/sft_run.py supplies it) and hub_strategy="every_save" pushes the newest to
+#     cadence, so ops/amd/sft_run.py supplies it) and hub_strategy="checkpoint" pushes the newest to
 #     the private Hub repo as `last-checkpoint/`;
 #   * a bounded resume loop: if the trainer dies (a "device wedged" GPU reset killed one in session
 #     1), up to --max-attempts runs are made, each after the card has recovered and each from the

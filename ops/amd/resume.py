@@ -9,7 +9,8 @@ have to be true and none of them is established by reading the trainer:
   1. a checkpoint that was half-written when the process died must not be resumed from (the
      trainer's own `--resume` takes the highest-numbered directory without looking inside it);
   2. on a fresh droplet the disk is gone, so the newest checkpoint is restored from the Hub's
-     `last-checkpoint/` folder, which `hub_strategy="every_save"` keeps current;
+     `last-checkpoint/` folder, which `hub_strategy="checkpoint"` keeps current (transformers 5.18
+     pushes that folder for no other strategy: "every_save" pushes the adapter files alone);
   3. a finished arm is not trained again.
 
 Everything below takes the Hub as an injected object so the tests run it against a stub.
@@ -29,7 +30,7 @@ DONE = ".done"
 CKPT = re.compile(r"^checkpoint-(\d+)$")
 ADAPTER = "adapter_model.safetensors"
 # Pushed by run_sft.sh LAST, after the adapter and its config: "this is the final adapter". The
-# adapter files alone prove nothing, because hub_strategy="every_save" also leaves a checkpoint's
+# adapter files alone prove nothing, because hub_strategy="checkpoint" also leaves a checkpoint's
 # model files in the repo.
 HUB_DONE = "final.done"
 # Files a resumable checkpoint must have. rng_state is written last by the trainer, so its

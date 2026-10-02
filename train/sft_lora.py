@@ -40,6 +40,10 @@ from train.render import (NON_THINKING, assert_tool_calls_rendered, normalise_me
 
 # Upstream's defaults (scripts/train_sft.py), as of 2026-09-24.
 BASE_MODEL = "Qwen/Qwen3.5-2B"
+# transformers 5.18 pushes the checkpoint folder (optimizer, scheduler, rng, trainer_state) as
+# `last-checkpoint/` only for "checkpoint"; "every_save" pushes the adapter files alone, so a
+# fresh machine could not resume (tests/test_hub_layout.py has the captured layouts).
+HUB_STRATEGY = "checkpoint"
 UPSTREAM = {
     "epochs": 1.0,
     "max_length": 8192,
@@ -197,7 +201,7 @@ def build(args, train_rows: list[dict], val_rows: list[dict], tokenizer):
         report_to=[] if not args.report_to else [args.report_to],
         push_to_hub=bool(args.hub_model_id),
         hub_model_id=args.hub_model_id or None,
-        hub_strategy="every_save",
+        hub_strategy=args.hub_strategy,
         seed=args.seed,
         **precision_flags(args),
     )
@@ -239,6 +243,12 @@ def main() -> None:
     ap.add_argument("--bf16-compute", action="store_true", default=True,
                     help="4-bit matmuls accumulate in bf16; --no-bf16-compute for fp16")
     ap.add_argument("--hub-model-id", default=os.environ.get("HUB_MODEL_ID", ""))
+    ap.add_argument("--hub-strategy", default=HUB_STRATEGY,
+                    choices=["checkpoint", "all_checkpoints", "every_save", "end"],
+                    help="what the Trainer pushes at each save. Only checkpoint/all_checkpoints "
+                         "upload the checkpoint folder (as last-checkpoint/ or checkpoint-N/), "
+                         "which a fresh machine needs to resume; every_save pushes just the "
+                         "adapter files")
     ap.add_argument("--report-to", default=os.environ.get("REPORT_TO", ""))
     ap.add_argument("--resume", action="store_true",
                     help="resume from the newest checkpoint under --out")

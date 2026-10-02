@@ -3113,7 +3113,7 @@ def test_an_arm_whose_final_adapter_is_on_the_hub_is_skipped_on_a_fresh_droplet(
 
 
 def test_adapter_files_on_the_hub_without_the_final_marker_are_just_a_checkpoint_and_training_resumes(tmp_path):
-    # hub_strategy="every_save" leaves a checkpoint's model files in the repo: not proof of "finished"
+    # an adapter pushed by any strategy leaves a checkpoint's model files in the repo: not proof of "finished"
     hub = FinalHub(["adapter_config.json", "adapter_model.safetensors"], tmp_path)
     assert resume.status(tmp_path / "d", "ns/sft-a", hub)["state"] == "fresh"
 

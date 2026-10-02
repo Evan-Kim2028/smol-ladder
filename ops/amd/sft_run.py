@@ -7,13 +7,16 @@
 The trainer is not ours to change from here, so this wrapper takes the one flag the trainer lacks,
 forces it into the `SFTConfig` the trainer builds (it imports the class inside `build()`, at call
 time, so replacing the name on the `trl` module is enough), and hands everything else through
-untouched. A checkpoint is pushed to the arm's private Hub repo each time it is saved.
+untouched. A checkpoint folder is pushed to the arm's private Hub repo as `last-checkpoint/` each
+time it is saved (hub_strategy="checkpoint"; see tests/test_hub_layout.py).
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+
+RESUMABLE = ("checkpoint",)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -29,6 +32,13 @@ def main(argv: list[str] | None = None) -> None:
 
     def sft_config(*args, **kwargs):
         kwargs["save_steps"] = ns.save_steps
+        # `last-checkpoint/` is what a fresh droplet resumes from (ops/amd/resume.py), and the
+        # Trainer writes it only for this strategy. "every_save" pushed the adapter files
+        # alone, so every arm restarted from step 0 after a reclaim: refuse that config here too.
+        if kwargs.get("push_to_hub") and kwargs.get("hub_strategy") not in RESUMABLE:
+            raise SystemExit(f"hub_strategy={kwargs.get('hub_strategy')!r} does not push "
+                             "last-checkpoint/, so a fresh droplet could not resume: use "
+                             "'checkpoint' (train/sft_lora.py --hub-strategy)")
         return real(*args, **kwargs)
 
     trl.SFTConfig = sft_config

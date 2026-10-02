@@ -30,7 +30,7 @@ AMD_LORA_R="${AMD_LORA_R:-16}"
 # to the published recipe; the smoke picks how that 8 is split into batch x accumulation.
 AMD_EFFECTIVE_BATCH="${AMD_EFFECTIVE_BATCH:-8}"
 # Checkpoints: run_sft.sh --save-steps (default 50) through ops/amd/sft_run.py, because
-# train/sft_lora.py has no flag for it. Each save is pushed to the Hub by hub_strategy="every_save".
+# train/sft_lora.py has no flag for it. Each save is pushed to the Hub by hub_strategy="checkpoint" (as `last-checkpoint/`).
 
 # ── the Hub: the only copy of anything that outlives the droplet ─────────────────
 AMD_HUB_NAMESPACE="${AMD_HUB_NAMESPACE:-}"
