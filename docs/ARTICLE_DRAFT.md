@@ -84,12 +84,15 @@ interaction, not evidence that the trajectories taught anything wrong. We leave 
 | L3: + method in words | 34.7% | 36.1% |
 | L4: + reference program | 68.5% | 72.8% |
 
-(213 tasks with a verified reference for L2–L4; intervals are about ±6 points.)
+(213 tasks with a verified reference for L2–L4; intervals are about ±6 points. Task by task against
+L1, the base model gained 19 and lost 28 at L2 (churn), gained 34 and lost 19 at L3 (p = 0.05), and
+gained 95 and lost 8 at L4. The large step is beyond doubt; the method step is real but its size is
+uncertain by about its own magnitude at one attempt.)
 
 Three things stand out.
 
-**Columns alone do nothing for the base model.** It already finds the right columns; L2 is flat.
-The method in words is worth 11 points, and the program is worth 44. The failures are concentrated
+**Columns alone are indistinguishable from nothing for the base model.** It already finds the right columns; L2 is flat.
+The method in words is worth roughly 5 to 15 points, and the program is worth about 44. The failures are concentrated
 in *deciding what to do*, then in *writing the code for it*, and only last in running it.
 
 **With the program in hand, difficulty stops mattering.** At L4 the base model passes 73% of
