@@ -105,6 +105,30 @@ those are the wrong *kind* of answer (a number where a label was asked for, or "
 control: reading the question's answer format, not re-printing the data, stopping once the value
 is on screen.
 
+### Where the failures go as information is added
+
+The same classifier over the base model's failed episodes at each rung (213 tasks with a reference
+for L3 and L4):
+
+| How the failed episodes ended | L1 (190 failures) | L3 (139) | L4 (67) |
+|---|---|---|---|
+| wrong answer: a different number | 18 | 8 | 2 |
+| wrong answer: different text | 10 | 7 | 4 |
+| wrong answer: wrong *kind* (a number for a label, or "Not Applicable") | 28 | 14 | 25 |
+| no answer: repeat loop | 85 | 49 | 16 |
+| no answer: wandered 16 turns | 26 | 29 | 8 |
+| no answer: ran out of context | 21 | 31 | 11 |
+| unanswered, but the correct value was already printed | 36 of 132 | 39 of 109 | 13 of 35 |
+
+**L3 fixes knowledge and leaves control alone.** The method hint halves the wrong answers
+("different number" falls from 18 to 8), but 109 of its 139 failures still end with no answer, about
+the same as at L1, and in 39 of them the right value had been printed. Context exhaustion rises,
+because a model that knows the method writes longer scripts and prints more.
+
+**L4 leaves only control.** With the program in hand the computation is essentially right (2 wrong
+numbers in 213 tasks). What remains is reporting the wrong kind of value after running the code, and
+not committing at all.
+
 ## Result 3: control is the wall, and it is not promptable
 
 We classified every L1 episode of the base model by how it ended:
