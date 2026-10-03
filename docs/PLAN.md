@@ -222,14 +222,11 @@ early anyway: it is the long pole for the ladder and it is what validates a task
       trials** (`data/train/ja3_sft.manifest.json`; 0 rows dropped by the widest-key firewall). This
       item was open only because the old tree could not yield conversations; the `ja3` sweep is what
       closed it. The training run itself is item 6b below
-- [x] 6b. **Done 2026-10-02**: A+B 24.8% (same as base), **B 9.6% (far below base)**; a leaner
-      rewrite of B (`ja3_sft_v3`, arm B3) scored 10.8%. `docs/SFT_RESULTS.md` has the failure
-      analysis. **This is the agreed stop point: no GRPO or hint-rung run before the owner has read
-      it.** Harbor packaging and publishing are deferred until after that. The item as planned:
-      train **arm B** on `data/train/ja3_sft_v2.jsonl` (**1,122 rows**: the same traces re-expressed
-      in the conversation `--agent bash` builds, every row replayed through the harness; the 2,029-row
-      `ja3_sft.jsonl` is v1 and was in the sweep's format, so adapters trained on it are invalid --
-      `docs/TRAINING.md` §0, §5), then **arm A+B** on 4,673 + 1,122, in that order
+- [x] 6b. **Done 2026-10-02**: arm B is now our trajectories collected inside the shell harness
+      itself (`ja4_sft`, 1,897 rows). L1 at temperature 0: base 24.0%, A 25.6%, B 10.8% / 13.6%
+      (two seeds); sampled (4 attempts, 60 tasks): 20.0 / 22.5 / 18.8%, no difference. The ladder
+      on base: L3 34.7%, L4 68.5%. `docs/SFT_RESULTS.md`. **GRPO is pinned, not dropped**: the next
+      step is the write-up, not a run.
 - [ ] 7. GRPO (LoRA) on SmolDataEnvs `train` from the best SFT arm — arm C
 - [ ] 8. Hint-curriculum GRPO: hints on at low pass rate, withdrawn as per-task pass rate rises — arm D
 - [ ] 9. jupyter-agent references at scale (the 4,217 ladder-grade tasks in `jtasks_v3`).

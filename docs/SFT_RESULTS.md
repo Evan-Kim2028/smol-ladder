@@ -1,124 +1,140 @@
-# SFT checkpoint: GPU session 2 (2026-10-02)
+# SFT and ladder results on Qwen3.5-2B (2026-10-02)
 
-This is the stop point agreed before any GRPO run: what the three SFT arms did to Qwen3.5-2B, measured
-at L1 (question only) on the 250 held-out SmolDataEnvs test tasks. Session 1's adapters and numbers
-are void (see `TRAINING.md` §0); nothing here uses them.
+The checkpoint agreed before any GRPO run. Three models on the 250 held-out SmolDataEnvs test
+tasks, then the information ladder on two of them. Every comparison is paired on the common task
+set (`smol_ladder.report_runs`); intervals are 95% bootstrap over tasks; "vs base" is the number of
+tasks gained and lost against the base model with a sign test.
 
-## The short version
-
-- SFT on upstream's trajectories (A) or on A plus ours (A+B) is **not detectably different from the
-  untrained base model**, at temperature 0 or sampled.
-- SFT on our own trajectories alone (B) **makes the model much worse**, and a mechanical lean
-  rewrite of those trajectories (B3) does not fix it.
-- The adapter upstream released (R) scores **below** the base model on this harness.
-
-## What was trained
+## The models
 
 LoRA r=16, alpha=32, bf16, max length 8,192, effective batch 8, one pass over the data.
 
-| Arm | Data | Rows | Steps | Loss at the end |
+| Model | Trained on | Rows | Steps | Adapter |
 |---|---|---|---|---|
-| A | `sft_upstream` (SmolDataEnvs-sft through the firewall) | 4,439 | 555 | validation 0.378 |
-| B | `ja3_sft_v2` (space-bunny on jupyter-agent tasks, verified) | 1,122 | 141 | training ~0.49 (no validation set) |
-| A+B | both | 5,561 | 696 | validation 0.369 |
-| B3 | `ja3_sft_v3` (B rewritten leaner, `train/export_ja3_v3.py`) | 989 | 124 | training ~0.50 |
+| base | nothing (Qwen3.5-2B as released) | | | |
+| A | SmolDataEnvs-sft, upstream's verified trajectories, through the firewall (`sft_upstream`) | 4,439 | 555 | `evandekim/smol-ladder-sft-a-s2` |
+| B | our trajectories: space-bunny solving jupyter-agent tasks inside the same shell harness the student runs in, kept when the grader passed (`ja4_sft`) | 1,897 | 238 | seed 1 `…-sft-b4-s2`, seed 2 `…-sft-b5-s2` |
 
-Adapters: `evandekim/smol-ladder-sft-{a,b,ab,b3}-s2` (private), each with `final.done`.
-R is `AdithyaSK/smoldataenvs-sft-2b-v0` at the pinned revision.
+A's validation loss flattened (0.489 → 0.378). B has no validation split; its training loss sat
+near 0.5 for the last third of the run. B's rows look like A's: median command 150 characters
+against A's 126, the same 90th percentile (~540), half shell and half multi-line Python, no
+`solution.py`, every row replays byte-identically through the harness.
 
-## L1, temperature 0, 250 test tasks, one attempt
+## L1 (question only), temperature 0, 250 tasks, one attempt
 
-| Model | Correct | Accuracy | Without the 27 notebook-overlap tasks | vs base, task by task (gained / lost) |
-|---|---|---|---|---|
-| base | 60 / 250 | 24.0% | 57 / 223 (25.6%) | |
-| A | 64 / 250 | 25.6% | 60 / 223 (26.9%) | 28 / 24 (sign test p = 0.68) |
-| A+B | 62 / 250 | 24.8% | 60 / 223 (26.9%) | 33 / 31 (p = 0.90) |
-| R | 48 / 250 | 19.2% | 46 / 223 (20.6%) | 19 / 31 (p = 0.12) |
-| B | 24 / 249 | 9.6% | 24 / 222 (10.8%) | 9 / 45 (p < 0.001) |
-| B3 | 27 / 249 | 10.8% | | 8 / 41; against B: 12 / 9 |
+| Model | Pass | 95% CI | Wrote any answer | Ended in a repeat loop | vs base |
+|---|---|---|---|---|---|
+| base | 24.0% | 18.8 – 29.2 | 47% | 37% | |
+| A | 25.6% | 20.4 – 31.2 | 51% | 39% | +28 / −24, p = 0.68 |
+| B seed 1 | 10.8% | 7.2 – 14.8 | 23% | 42% | +10 / −43, p < 0.001 |
+| B seed 2 | 13.6% | 9.6 – 18.0 | 24% | 39% | +12 / −38, p < 0.001 |
 
-Zero harness failures. B and B3 each have one task that never returned (a different one each).
-With 250 tasks near 25%, a difference under about 7 points is noise.
+Without the 27 tasks whose notebook overlaps A's training data: base 25.6%, A 26.9%, same picture.
+By tier (base / A / B seed 1): easy 64 / 64 / 33%, medium 29 / 27 / 10%, hard 5 / 11 / 4%.
 
-How the episodes ended:
+## L1, sampled: 4 attempts per task, 60 tasks stratified by tier
 
-| Model | Stopped by itself | Hit 16 turns | Ran out of context |
-|---|---|---|---|
-| base | 111 | 118 | 21 |
-| A | 129 | 100 | 21 |
-| A+B | 116 | 113 | 21 |
-| R | 88 | 142 | 20 |
-| B | 36 | 157 | 56 |
-| B3 | 42 | 166 | 41 |
+Temperature 0.7, top-p 0.8, top-k 20. Score = mean over tasks of each task's pass rate.
 
-## L1, sampled (temperature 0.7, top-p 0.8, top-k 20), one attempt
+| Model | Pass | 95% CI | Wrote any answer | Ended in a repeat loop | vs base |
+|---|---|---|---|---|---|
+| base | 20.0% | 12.5 – 27.9 | 43% | 18% | |
+| A | 22.5% | 15.0 – 31.7 | 45% | 39% | +14 / −11, p = 0.69 |
+| B seed 1 | 18.8% | 11.7 – 26.2 | 37% | 14% | +12 / −15, p = 0.70 |
 
-The 60 gate tasks, all five models: base 9, A 20, A+B 15, R 11, B 6. A against base was 15 gained,
-4 lost (p = 0.02), so the setting was extended to all 250 tasks for base, A and A+B. The servers hung
-repeatedly under sampled decoding and the extension stopped at the 174 tasks all three had finished
-(the easier ones finish first, so the rates are above the full-set figures):
+## Reading
 
-| Model | Sampled | Temperature 0, same 174 | vs base (gained / lost) |
-|---|---|---|---|
-| base | 51 (29.3%) | 57 | |
-| A | 58 (33.3%) | 58 | 26 / 19 (p = 0.37) |
-| A+B | 62 (35.6%) | 57 | 28 / 17 (p = 0.14) |
+- **A does not change L1 accuracy** under either decoding mode. Its one consistent effect is
+  behavioural: it writes an answer a little more often (51% vs 47%).
+- **B is harmful at greedy decoding and neutral when sampled.** Both seeds land 10 to 13 points
+  below base at temperature 0, so that is the data and not one run. With sampling the gap closes
+  entirely and B loops least of the three. At temperature 0, B's generations run away: median
+  command 686 characters against 150 in its training rows, 64% of lines are `print`, a quarter of
+  its multi-line commands repeat themselves, 1,050 commands over 250 tasks were cut off with an
+  unclosed quote. The training rows have none of this (0% repetitive commands); it is what greedy
+  decoding does to a 2B model trained on a somewhat print-heavy exploratory style (43% `print`
+  lines in B's rows against 30% in A's). An aside, not a headline.
+- **The upstream released adapter** (`AdithyaSK/smoldataenvs-sft-2b-v0`, 100 steps) scored 19.2%
+  on the same 250 tasks at temperature 0 (+19 / −31 vs base, p = 0.12).
 
-The 60-task lead did not hold. Single-attempt sampled scores on 60 tasks are too noisy to rank arms.
+## The ladder: base and A, temperature 0, one attempt
 
-## Why B fails
+L1+control appends seven behaviour rules (no task information) to the L1 prompt; L1+schema is the
+tables' schema. L2 adds the files, columns and filters the reference used; L3 adds the method in
+words; L4 adds the verified reference program (without its final print). L2–L4 exist for the 213
+tasks with a verified reference.
 
-B's commands are cut off mid-script. The model starts a long Python script, falls into repeating
-near-identical lines, reaches the per-turn output limit, and the shell rejects the command because a
-quote or heredoc was never closed. It then retries the same command until the turn limit.
+| Rung | Tasks | base | A | A vs base | base: wrote any answer | base: loop |
+|---|---|---|---|---|---|---|
+| L1 | 250 | 24.0% [18.8, 29.2] | 25.6% [20.4, 31.2] | +28 / −24, p = 0.68 | 47% | 37% |
+| L1+control | 250 | 16.8% [12.4, 21.6] | 24.8% [20.0, 30.4] | +30 / −10, p = 0.002 | 37% | 47% |
+| L2 | 213 | 23.5% [17.8, 29.6] | 31.0% [24.9, 37.6] | +32 / −16, p = 0.03 | 49% | 31% |
+| L3 | 213 | 34.7% [28.6, 41.3] | 36.1% [29.6, 42.7] | +31 / −28, p = 0.79 | 49% | 25% |
+| L4 | 213 | 68.5% [62.0, 75.1] | 72.8% [66.7, 78.9] | +31 / −22, p = 0.27 | 84% | 8% |
 
-| Over 250 tasks | base | A | B | B3 |
-|---|---|---|---|---|
-| "unexpected EOF" shell errors | 18 | 135 | 783 | 437 |
-| Episodes that wrote an answer at all | 118 | 128 | 36 | 43 |
-| Episodes ending in four identical commands | 93 | 98 | 121 | 124 |
+By tier at L4 (base): easy 73%, medium 69%, hard 65%: with the program in hand, difficulty
+nearly stops mattering.
 
-The training rows are not malformed (3 of 2,600 `python3 -c` commands in v2 have unbalanced quotes).
-What differs is the style: v2 rows run 7.2 commands against A's 3.7 and carry about twice the command
-text, because our sweep required every answer to come with a `solution.py`. About 230 steps were also
-a failed `cd /app`, provoked by our write tool reporting the script at `/app/solution.py`.
+- **Information lifts the base model, and more lifts it more**: +11 points for the method in
+  words, +44 for the program. Execution is not the wall; knowing what to compute is.
+- **Telling it how to behave hurts.** The control rules cost base 7 points and raised its loop
+  rate from 37% to 47%; A was unaffected. Control is not promptable at this size; it has to be
+  trained.
+- **A uses information slightly better than base** at every rung, but only the L1+control and L2
+  differences clear the noise, and both are single-attempt.
+- **The L4 ceiling is a control ceiling.** Given working code the model still fails a third of
+  tasks, by not running it cleanly or not committing to the answer, and at L4 it stops by itself
+  in 84% of episodes against 47% at L1. Given a plan, it behaves better. That ceiling should move
+  with training that fixes control, which is the case for RL and the reason GRPO is pinned, not
+  dropped.
 
-B3 removes the failed and redundant steps (5.4 commands a row) but keeps the script, and the result
-is unchanged. The untested explanation that remains is the script itself: a 2B model trained for
-~130 steps learns to start a long script and cannot finish one.
+## How the base model fails at L1 (250 episodes, temperature 0)
 
-## What this does and does not show
+| Outcome | Episodes |
+|---|---|
+| correct | 60 |
+| never wrote an answer | 132 |
+| – repeating a command that worked | 59 |
+| – repeating a command that errored | 26 |
+| – 16 turns, no loop | 25 |
+| – ran out of context (printed whole tables) | 21 |
+| – stopped without answering | 1 |
+| wrote a wrong answer | 58 |
+| – wrong text answer (often the wrong kind: a number for a column name, "Not Applicable") | 30 |
+| – wrong number (2 within 5% of the reference) | 28 |
 
-- It shows that one pass of LoRA SFT on these datasets does not move L1 accuracy for this model on
-  this harness, and that R does not reproduce an improvement here.
-- It does not show SFT cannot help. Not tried: more than one pass, a higher rank, several sampled
-  attempts per task, B without the script (inline work only), or rungs above L1.
-- All figures are one attempt per task. Temperature-0 runs are deterministic per model; the sampled
-  ones are not, and were not repeated.
+In about 36 of the 132 unanswered episodes, one of the model's own commands had already printed
+the correct value (crude string match). Easy 21/33 correct, medium 34/118, hard 5/99.
 
-## Operations
+## Pre-registered reading rules (written 19:10, before the robustness runs) and what happened
 
-- Serving: vLLM 0.17.1 on ROCm, one merged model per engine. All engines stop generating at once,
-  roughly every ten minutes, under sampled decoding with 18 to 40 concurrent requests; the
-  temperature-0 pass ran 65 minutes without it. Partial results from the first hung attempt are in
-  `data/runs/_void/`.
-- A KV-cache budget does not exempt an engine from vLLM's startup free-memory check, so each engine
-  now passes `--gpu-memory-utilization 0.3` (commit `fdb0989`).
-- Cost: session 1 $14.87 (nothing usable), session 2 $16.09; **total $30.96** of the $100 credit.
-  The instance was destroyed and the account verified empty at 14:57.
+1. **Second seed for B**: the claim "B is below base" only if both seeds are below base on the
+   paired count. Outcome: seed 1 +10/−43, seed 2 +12/−38. The claim stands, for temperature 0.
+2. **Sampled repeats**: 60 gate tasks x 4 attempts, three models, paired per task, a difference
+   counts only if its 95% interval excludes 0. Outcome: no difference excludes 0 (A +2.5
+   [−5.4, +11.7]; B −1.2 [−8.8, +6.7]).
+3. Harness-error attempts were retried; after retries every set is complete except B seed 2 at
+   L1 (249/250; one episode never returned) and sampled B (237/240).
 
-Run trees: `data/runs/amd2-{base,a,b,ab,r,b3}` (temperature 0) and `data/runs/amd2s-*` (sampled).
+## What this does not show
 
-## Pre-registered reading rules for the robustness additions (written 2026-10-02 19:10, before the runs)
+One recipe (one pass, rank 16). Not tried: more passes, a higher rank, A+B mixes with the native
+B, rungs above L1 for B, several seeds for A, SFT as a warm start for GRPO (the role upstream gives
+it; their pages publish no SFT-alone number). All ladder figures are single-attempt.
 
-1. **Second training seed for native B.** Same data, recipe and step count as the first run, seed
-   changed. Metric: L1, temperature 0, all 250 test tasks. The claim "native B is below base" is
-   made only if BOTH seeds are below base on the paired gained/lost count; otherwise the result is
-   reported as seed-dependent.
-2. **Sampled repeats.** The 60 gate tasks (stratified by tier), 4 attempts each at temperature 0.7,
-   top-p 0.8, top-k 20, for base, A and native B. Metric: each task's pass rate over its 4 attempts;
-   the model's score is the mean over tasks. Comparisons are paired per task with a 95% bootstrap
-   interval over tasks; a difference counts only if the interval excludes 0. "Wrote any answer" and
-   loop rate are reported beside accuracy.
-3. Nothing is added to or removed from these sets after the run; attempts that fail in the harness
-   (not the model) are retried, and the count is reported per model.
+## Operations and cost
+
+- Serving: vLLM 0.17.1 on ROCm, one merged model per engine (LoRA mode does not work for this
+  model). Engines freeze together under sampled decoding at 18–40 concurrent requests, roughly
+  every ten minutes; 12 concurrent ran for hours. Temperature-0 runs never froze. Each engine
+  needs `--gpu-memory-utilization 0.3` beside its KV budget or the third one fails to start.
+- A spot instance was pre-empted mid-run (powered off by the provider; the dead-man destroyed it);
+  one tunnel/server outage produced error episodes that were retried. Watch results by
+  `stop_reason`, not by count: an unreachable server fills the tree with `error` records fast.
+- Cost: four sessions, $44.02 by the ledger ($14.87 of it a first session that produced nothing
+  usable; about $4 to hangs, the pre-emption and the outage). Provider's own figure lags by a day.
+
+Run trees: `data/runs/amd2-{base,a}` (L1 temperature 0), `data/runs/amd3-{base,a}` (the ladder),
+`data/runs/amd3-b4`, `amd3-b5` (B, two seeds), `data/runs/amd3s-*` (sampled repeats). Teacher
+trajectories: `data/runs/ja4` (2,111 tasks; 1,897 exported) and `ja4r` (the tasks the teacher had
+failed before, in progress).
