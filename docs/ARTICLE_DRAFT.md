@@ -57,8 +57,7 @@ that produced nothing usable.
 A is indistinguishable from the untrained model. Its validation loss had flattened (0.49 → 0.38),
 so this is not an under-trained run; it learned to imitate the trajectories and that did not
 translate into more correct answers. Upstream's own released SFT adapter scores 19.2% on the same
-tasks, also no better than base. (Upstream never claimed otherwise: their published result is a
-GRPO curve, and SFT is described as a warm start.)
+tasks, also no better than base.
 
 B is worse than base, on both seeds. Not because the data is wrong: every row is a verified
 solution, and in style the rows are as short as A's. The 2B model trained on them degenerates at
@@ -161,9 +160,8 @@ difference counts only if its interval excludes zero), and we report what happen
 ## What's next
 
 GRPO with the L3 rung as a curriculum, withdrawn as per-task pass rates rise, starting from the
-base model rather than an SFT warm start. Not because SFT is useless as a warm start (we did not
-test that), but because nothing we measured says it is needed, and the thing that is needed is a
-reward for finishing.
+base model. The thing the ladder says is missing is a reward for finishing, and that is what RL
+supplies.
 
 *Code, prompts, run trees and the per-episode classifier are in the repository; the two trained
 adapters and our native trajectories are on the Hub.*
