@@ -132,9 +132,11 @@ it; their pages publish no SFT-alone number). All ladder figures are single-atte
   one tunnel/server outage produced error episodes that were retried. Watch results by
   `stop_reason`, not by count: an unreachable server fills the tree with `error` records fast.
 - Cost: four sessions, $44.02 by the ledger ($14.87 of it a first session that produced nothing
-  usable; about $4 to hangs, the pre-emption and the outage). Provider's own figure lags by a day.
+  usable; about $4 to hangs, the pre-emption and the outage). The provider billed **$46.65** for the
+  same usage (read 2026-10-03), $2.63 above the ledger; its figure is the one that counts against the
+  $100 credit, which leaves about $53.
 
 Run trees: `data/runs/amd2-{base,a}` (L1 temperature 0), `data/runs/amd3-{base,a}` (the ladder),
 `data/runs/amd3-b4`, `amd3-b5` (B, two seeds), `data/runs/amd3s-*` (sampled repeats). Teacher
-trajectories: `data/runs/ja4` (2,111 tasks; 1,897 exported) and `ja4r` (the tasks the teacher had
-failed before, in progress).
+trajectories: `data/runs/ja4` (2,111 tasks; 1,897 exported) and `ja4r` (the 1,769 tasks the
+teacher had failed before: 136 graded correct in the shell harness, not exported).
